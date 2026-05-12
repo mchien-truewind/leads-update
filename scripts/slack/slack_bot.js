@@ -90,17 +90,28 @@ const HUBSPOT_ACTIVITY_PROPERTIES = {
   tasks: ['hs_task_subject', 'hs_task_body', 'hs_task_status', 'hs_task_priority', 'hs_timestamp', 'hubspot_owner_id'],
 };
 const DEFAULT_NO_SHOW_KEYWORDS = ['no-show', 'no show', "didn't show", 'missed', 'did not attend'];
-const HUBSPOT_OBJECT_TYPE_IDS = {
+const HUBSPOT_OBJECT_TYPE_IDS = Object.freeze({
+  contact: '0-1',
   contacts: '0-1',
+  company: '0-2',
   companies: '0-2',
+  deal: '0-3',
   deals: '0-3',
+  ticket: '0-5',
   tickets: '0-5',
+  call: '0-48',
   calls: '0-48',
+  email: '0-49',
   emails: '0-49',
+  meeting: '0-47',
   meetings: '0-47',
+  note: '0-46',
   notes: '0-46',
+  task: '0-27',
   tasks: '0-27',
-};
+  lead: '0-136',
+  leads: '0-136',
+});
 
 const TRUEWIND_HUBSPOT = {
   pipeline: '105321581',
@@ -563,20 +574,31 @@ function requireHubSpotObjectId(response, operation) {
   return String(response.id);
 }
 
-function formatHubSpotObjectResponse(response, objectTypeId) {
+function normalizeHubSpotObjectTypeId(objectType) {
+  const key = String(objectType || '').trim().toLowerCase();
+  if (!key) return '';
+  if (/^\d+-\d+$/.test(key)) return key;
+  return HUBSPOT_OBJECT_TYPE_IDS[key] || '';
+}
+
+function hubspotRecordUrl(objectType, recordId) {
+  const objectTypeId = normalizeHubSpotObjectTypeId(objectType);
+  const id = String(recordId || '').trim();
+  if (!objectTypeId || !id) return '';
+  return `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/${objectTypeId}/${id}`;
+}
+
+function formatHubSpotObjectResponse(response, objectType) {
   const id = requireHubSpotObjectId(response, 'HubSpot object write');
   const properties = response.properties || {};
+  const url = hubspotRecordUrl(objectType, id);
   return {
     ...properties,
     id,
     hubspot_id: id,
-    url: hubspotRecordUrl(objectTypeId, id),
+    ...(url ? { url } : {}),
     properties,
   };
-}
-
-function hubspotRecordUrl(objectTypeId, objectId) {
-  return `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/${objectTypeId}/${objectId}`;
 }
 
 function hubspotPrimaryAssociatedRecordUrl({ dealId, contactId, companyId } = {}) {
@@ -3144,12 +3166,23 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
       }
       if (input.sorts) body.sorts = input.sorts;
       const res = await hubspotRequest(`/crm/v3/objects/${input.object_type}/search`, 'POST', body);
-      return JSON.stringify({ total: res.total, results: (res.results || []).map(r => ({ id: r.id, ...r.properties })) });
+      return JSON.stringify({
+        total: res.total,
+        results: (res.results || []).map(r => ({
+          id: r.id,
+          ...r.properties,
+          url: hubspotRecordUrl(input.object_type, r.id),
+        })),
+      });
     }
     if (name === 'hubspot_get') {
       const props = input.properties.join(',');
       const res = await hubspotRequest(`/crm/v3/objects/${input.object_type}/${input.object_id}?properties=${props}`);
-      return JSON.stringify({ id: res.id, ...res.properties });
+      return JSON.stringify({
+        id: res.id,
+        ...res.properties,
+        url: hubspotRecordUrl(input.object_type, res.id),
+      });
     }
     if (name === 'hubspot_list_owners') {
       const res = await hubspotRequest('/crm/v3/owners/?limit=100');
@@ -3188,13 +3221,13 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
       if (input.properties) Object.assign(props, input.properties);
       const validatedProps = await validateHubSpotProperties('contacts', props);
       const res = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: validatedProps });
-      return JSON.stringify(formatHubSpotObjectResponse(res, '0-1'));
+      return JSON.stringify(formatHubSpotObjectResponse(res, 'contacts'));
     }
     if (name === 'hubspot_update_contact') {
       const contactId = encodeURIComponent(input.contact_id);
       const validatedProps = await validateHubSpotProperties('contacts', input.properties || {});
       const res = await hubspotRequest(`/crm/v3/objects/contacts/${contactId}`, 'PATCH', { properties: validatedProps });
-      return JSON.stringify(formatHubSpotObjectResponse(res, '0-1'));
+      return JSON.stringify(formatHubSpotObjectResponse(res, 'contacts'));
     }
     if (name === 'hubspot_create_deal') {
       const dealSource = normalizeExplicitDealSource(input);
@@ -3207,13 +3240,13 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
       props.deal_source = dealSource;
       const validatedProps = await validateHubSpotProperties('deals', props);
       const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedProps });
-      return JSON.stringify(formatHubSpotObjectResponse(res, '0-3'));
+      return JSON.stringify(formatHubSpotObjectResponse(res, 'deals'));
     }
     if (name === 'hubspot_update_deal') {
       const dealId = encodeURIComponent(input.deal_id);
       const validatedProps = await validateHubSpotProperties('deals', input.properties || {});
       const res = await hubspotRequest(`/crm/v3/objects/deals/${dealId}`, 'PATCH', { properties: validatedProps });
-      return JSON.stringify(formatHubSpotObjectResponse(res, '0-3'));
+      return JSON.stringify(formatHubSpotObjectResponse(res, 'deals'));
     }
     if (name === 'hubspot_create_association') {
       const res = await hubspotRequest(
@@ -3391,6 +3424,20 @@ For historical stage cohort questions like "how many SQLs did we have in January
 For true cohort conversion questions like "of the 26 SQLs from January, how many later moved to Won or Closed/Lost?", use the same hubspot_count_deals_entered_stage tool with track_outcomes.stages set to the exact Won/Lost stage IDs from hubspot_get_pipeline. Interpret cohort_outcomes.outcomes.still_active as deals that have not entered any tracked outcome stage by the as_of_date cutoff, not as deals currently in the SQL stage.
 
 For no-show, ghosted, missed meeting, or prospect-did-not-attend questions across deals, call hubspot_analyze_deal_activities. Use the default Active Pipeline 105321581 unless the user specifies another pipeline. The tool scans associated meetings, calls, notes, and emails for no-show language and returns coverage metadata; mention coverage.warning if present.
+
+### HubSpot record links
+Use exact HubSpot record links in this format: https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/{objectTypeId}/{recordId}. The common object type IDs are contacts=0-1, companies=0-2, deals=0-3, tickets=0-5, tasks=0-27, notes=0-46, meetings=0-47, calls=0-48, emails=0-49, leads=0-136. For example, deal ID 60016351576 is https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/0-3/60016351576. Do not invent a HubSpot URL if you do not have the record ID and object type.
+
+### Deal disambiguation
+When multiple deals match a search query, automatically select the deal with the most recent activity unless a specific deal ID is provided. Use this priority order:
+1. Open deals over closed deals
+2. Most recent hs_lastmodifieddate
+3. Deals in Active Pipeline (105321581) over default pipeline
+4. Deals with associations (contacts, meetings) over orphaned deals
+
+When searching deals to apply this rule, always include dealname, dealstage, hs_is_closed, hs_lastmodifieddate, pipeline, and hubspot_owner_id in the properties array. To evaluate whether a deal has contacts or meetings, use hubspot_get_associations for the candidate deal IDs; do not infer associations from the search result alone.
+
+Only ask for clarification if multiple open deals have similar recent activity.
 
 ### Critical HubSpot data freshness
 You MUST call the relevant HubSpot API for every HubSpot question, even if you just answered a similar question moments ago. Never say "as I mentioned" or "based on what we just discussed" for HubSpot data. Configuration, stages, owners, records, counts, and associations change constantly. Always fetch fresh data before answering or acting. No exceptions.
@@ -5205,6 +5252,7 @@ module.exports = {
   notionPropValue,
   recruitingCalendarTitleFromCandidate,
   recruitingNotionPropertyMap,
+  normalizeHubSpotObjectTypeId,
   normalizeHubSpotPropertyValue,
   normalizeHubSpotOutcomeTracking,
   parseHubSpotAsOfBoundary,

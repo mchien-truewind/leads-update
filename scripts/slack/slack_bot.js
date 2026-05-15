@@ -2584,29 +2584,10 @@ function scheduleDailyProgress() {
   scheduleNext();
 }
 
-async function startSlackBot() {
-  const shouldRunDigestCli = process.argv.includes('--run-digest');
-  if (shouldRunDigestCli) {
-    await runDiscoveryDigest();
-    return;
-  }
-
-  await app.start();
-  console.log('Slack bot is running in socket mode');
-  console.log(`  Google Sheets: ready`);
-  console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
-  console.log(`  Firecrawl: ${FIRECRAWL_API_KEY ? 'ready' : 'NOT CONFIGURED'}`);
-  console.log(`  Grain: ${GRAIN_API_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
-
-  // Schedule daily discovery digest
-  scheduleDiscoveryDigest();
-
-  // Schedule daily HubSpot deal progress
-  scheduleDailyProgress();
-
+function startHttpServer() {
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = process.env.PORT || 3000;
-  http.createServer(async (req, res) => {
+  const server = http.createServer(async (req, res) => {
     if (req.url.split('?')[0] === '/webhooks/instantly/positive-reply') {
       try {
         await handleInstantlyPositiveReplyWebhook(req, res, {
@@ -2662,11 +2643,45 @@ async function startSlackBot() {
   }).listen(PORT, () => {
     console.log(`  Health check on port ${PORT}`);
   });
+  return server;
+}
+
+async function startSlackBot() {
+  const shouldRunDigestCli = process.argv.includes('--run-digest');
+  if (shouldRunDigestCli) {
+    await runDiscoveryDigest();
+    return;
+  }
+
+  startHttpServer();
+
+  let slackStarted = false;
+  try {
+    await app.start();
+    slackStarted = true;
+    console.log('Slack bot is running in socket mode');
+  } catch (err) {
+    console.error('Slack socket mode failed to start; HTTP webhook routes remain available:', err.message);
+  }
+  console.log(`  Google Sheets: ready`);
+  console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
+  console.log(`  Firecrawl: ${FIRECRAWL_API_KEY ? 'ready' : 'NOT CONFIGURED'}`);
+  console.log(`  Grain: ${GRAIN_API_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
+
+  if (!slackStarted) return;
+
+  // Schedule daily discovery digest and HubSpot deal progress only after Slack is connected.
+  scheduleDiscoveryDigest();
+  scheduleDailyProgress();
 
   // Manual CLI trigger is handled before socket mode starts so it posts once and exits.
 }
 
 if (require.main === module) {
+  process.on('unhandledRejection', (err) => {
+    console.error('Unhandled async error:', err?.message || err);
+  });
+
   startSlackBot().catch((err) => {
     console.error(err);
     process.exit(1);

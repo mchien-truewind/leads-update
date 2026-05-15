@@ -23,6 +23,10 @@ const CONFIG = {
     ['https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01', '84547076'],
     ['https://api.calendly.com/users/ac8a0acf-71b8-4db8-b74d-31ea6eaef11d', '89305622'],
   ]),
+  organizerNameByCalendlyUserUri: new Map([
+    ['https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01', 'Sarah Elix'],
+    ['https://api.calendly.com/users/ac8a0acf-71b8-4db8-b74d-31ea6eaef11d', 'Xavier Marco'],
+  ]),
 };
 
 function readRequestBody(req, maxBytes = 1024 * 1024) {
@@ -223,6 +227,40 @@ function getEventEnd(scheduledEvent) {
   return clean(event.end_time);
 }
 
+function getCompanyNameFromPayload(payload) {
+  const direct = clean(
+    payload?.company
+    || payload?.company_name
+    || payload?.invitee?.company
+    || payload?.invitee?.company_name,
+  );
+  if (direct) return direct;
+
+  const questions = payload?.questions_and_answers || payload?.invitee?.questions_and_answers || [];
+  for (const item of questions) {
+    const question = lower(item?.question || item?.name || item?.label);
+    if (!question) continue;
+    if (question === 'company' || question === 'company name' || question.includes('company')) {
+      const answer = clean(item?.answer || item?.value);
+      if (answer) return answer;
+    }
+  }
+  return '';
+}
+
+function getOrganizerName(hostUserUri, scheduledEvent, config = CONFIG) {
+  const mapped = clean(config.organizerNameByCalendlyUserUri?.get(hostUserUri));
+  if (mapped) return mapped;
+
+  const event = scheduledEvent?.resource || scheduledEvent || {};
+  const memberships = event.event_memberships || [];
+  const match = memberships.find(member => {
+    const userUri = typeof member.user === 'string' ? clean(member.user) : clean(member.user_uri || member?.user?.uri);
+    return userUri === hostUserUri;
+  });
+  return clean(match?.user_name || match?.name || match?.user_email || match?.email) || 'Unknown Organizer';
+}
+
 function isRescheduled(payload) {
   return payload?.rescheduled === true || payload?.invitee?.rescheduled === true || Boolean(getNewInviteeUri(payload));
 }
@@ -238,10 +276,11 @@ function shouldProcessScheduledEvent(scheduledEvent, config = CONFIG) {
   };
 }
 
-function buildDealName({ inviteeName, inviteeEmail, eventName, startTime }) {
-  const who = clean(inviteeName) || clean(inviteeEmail) || 'Calendly invitee';
+function buildDealName({ companyName, organizerName, startTime }) {
+  const company = clean(companyName) || 'Unknown Company';
+  const organizer = clean(organizerName) || 'Unknown Organizer';
   const date = startTime ? new Date(startTime).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-  return `${who} - ${eventName || 'Calendly meeting'} - ${date}`;
+  return `${company} - ${organizer} - ${date}`;
 }
 
 function hubspotDateMs(date = new Date()) {
@@ -441,9 +480,8 @@ async function createDeal({ payload, scheduledEvent, contactId, ownerId, hostUse
     body: {
       properties: {
         dealname: buildDealName({
-          inviteeName: payload.name,
-          inviteeEmail: payload.email,
-          eventName: getEventName(scheduledEvent),
+          companyName: getCompanyNameFromPayload(payload),
+          organizerName: getOrganizerName(hostUserUri, scheduledEvent),
           startTime,
         }),
         pipeline: CONFIG.pipelineId,
@@ -700,8 +738,10 @@ module.exports = {
   CONFIG,
   buildDealName,
   findAllowedHostUserUri,
+  getCompanyNameFromPayload,
   getEventMembershipUserUris,
   getEventTypeUri,
+  getOrganizerName,
   handleCalendlyHubSpotWebhook,
   hubspotDateMs,
   idempotencyRoot,

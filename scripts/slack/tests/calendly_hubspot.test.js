@@ -8,7 +8,9 @@ const {
   CONFIG,
   buildDealName,
   findAllowedHostUserUri,
+  getCompanyNameFromPayload,
   getEventTypeUri,
+  getOrganizerName,
   hubspotDateMs,
   idempotencyRoot,
   isCalendlyApiUri,
@@ -122,11 +124,57 @@ function testIdempotencyRootUsesEnvOverride() {
 function testDealName() {
   assert.strictEqual(
     buildDealName({
-      inviteeName: 'Ada Lovelace',
-      eventName: 'Intro to Truewind',
+      companyName: 'Acme Finance',
+      organizerName: 'Sarah Elix',
       startTime: '2026-05-06T16:00:00.000Z',
     }),
-    'Ada Lovelace - Intro to Truewind - 2026-05-06',
+    'Acme Finance - Sarah Elix - 2026-05-06',
+  );
+  assert.strictEqual(
+    buildDealName({
+      startTime: '2026-05-06T16:00:00.000Z',
+    }),
+    'Unknown Company - Unknown Organizer - 2026-05-06',
+  );
+}
+
+function testCompanyNameExtraction() {
+  assert.strictEqual(getCompanyNameFromPayload({ company: 'Direct Co' }), 'Direct Co');
+  assert.strictEqual(
+    getCompanyNameFromPayload({
+      questions_and_answers: [
+        { question: 'What is your company name?', answer: 'Question Co' },
+      ],
+    }),
+    'Question Co',
+  );
+  assert.strictEqual(
+    getCompanyNameFromPayload({
+      invitee: {
+        questions_and_answers: [
+          { question: 'Company', answer: 'Nested Co' },
+        ],
+      },
+    }),
+    'Nested Co',
+  );
+  assert.strictEqual(getCompanyNameFromPayload({ questions_and_answers: [] }), '');
+}
+
+function testOrganizerName() {
+  assert.strictEqual(
+    getOrganizerName('https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01'),
+    'Sarah Elix',
+  );
+  assert.strictEqual(
+    getOrganizerName('https://api.calendly.com/users/unknown', {
+      resource: {
+        event_memberships: [
+          { user: 'https://api.calendly.com/users/unknown', user_name: 'Fallback Host' },
+        ],
+      },
+    }),
+    'Fallback Host',
   );
 }
 
@@ -145,6 +193,8 @@ async function run() {
   testHubSpotDateMs();
   testIdempotencyRootUsesEnvOverride();
   testDealName();
+  testCompanyNameExtraction();
+  testOrganizerName();
   testConfigHasExpectedCloseLostStage();
 }
 

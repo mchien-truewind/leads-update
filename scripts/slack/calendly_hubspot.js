@@ -5,6 +5,19 @@ const path = require('path');
 
 const DEFAULT_HTTP_TIMEOUT_MS = Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 30000);
 const inFlightWebhookKeys = new Set();
+const FREE_EMAIL_DOMAINS = new Set([
+  'aol.com',
+  'gmail.com',
+  'hotmail.com',
+  'icloud.com',
+  'live.com',
+  'me.com',
+  'msn.com',
+  'outlook.com',
+  'proton.me',
+  'protonmail.com',
+  'yahoo.com',
+]);
 
 const CONFIG = {
   hubSpotPortalId: '43974586',
@@ -248,6 +261,34 @@ function getCompanyNameFromPayload(payload) {
   return '';
 }
 
+function getEmailDomain(email) {
+  const parts = lower(email).split('@');
+  if (parts.length !== 2) return '';
+  return parts[1].replace(/^www\./, '');
+}
+
+function isUsableCompanyDomain(domain) {
+  const value = lower(domain);
+  return Boolean(value && value.includes('.') && !FREE_EMAIL_DOMAINS.has(value));
+}
+
+function inferCompanyNameFromDomain(domain) {
+  const label = clean(domain).split('.')[0] || '';
+  return label
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function getCompanyIdentityFromPayload(payload) {
+  const companyName = getCompanyNameFromPayload(payload);
+  const emailDomain = getEmailDomain(payload?.email || payload?.invitee?.email);
+  const domain = isUsableCompanyDomain(emailDomain) ? emailDomain : '';
+  const name = companyName || (domain ? inferCompanyNameFromDomain(domain) : '');
+  return { name, domain };
+}
+
 function getOrganizerName(hostUserUri, scheduledEvent, config = CONFIG) {
   const mapped = clean(config.organizerNameByCalendlyUserUri?.get(hostUserUri));
   if (mapped) return mapped;
@@ -354,6 +395,7 @@ function markDurableProcessingSucceeded(record, result) {
       status: 'succeeded',
       completedAt: new Date().toISOString(),
       action: result?.action,
+      companyId: result?.companyId,
       dealId: result?.dealId,
       meetingId: result?.meetingId,
     }),
@@ -386,6 +428,53 @@ async function findContactByEmail(email) {
     1,
   );
   return (result.results || [])[0] || null;
+}
+
+async function findCompanyByDomain(domain) {
+  if (!isUsableCompanyDomain(domain)) return null;
+  const result = await searchObjects(
+    'companies',
+    [{ propertyName: 'domain', operator: 'EQ', value: clean(domain) }],
+    ['name', 'domain'],
+    1,
+  );
+  return (result.results || [])[0] || null;
+}
+
+async function findCompanyByName(name) {
+  if (!clean(name)) return null;
+  const result = await searchObjects(
+    'companies',
+    [{ propertyName: 'name', operator: 'EQ', value: clean(name) }],
+    ['name', 'domain'],
+    1,
+  );
+  return (result.results || [])[0] || null;
+}
+
+async function createCompany({ name, domain }) {
+  const properties = {};
+  if (clean(name)) properties.name = clean(name);
+  if (isUsableCompanyDomain(domain)) properties.domain = clean(domain);
+  if (!Object.keys(properties).length) return null;
+
+  return hubspotRequest('/crm/v3/objects/companies', {
+    method: 'POST',
+    body: { properties },
+  });
+}
+
+async function ensureCompany({ payload }) {
+  const identity = getCompanyIdentityFromPayload(payload);
+  if (!identity.name && !identity.domain) return null;
+
+  const byDomain = identity.domain ? await findCompanyByDomain(identity.domain) : null;
+  if (byDomain) return byDomain;
+
+  const byName = identity.name ? await findCompanyByName(identity.name) : null;
+  if (byName) return byName;
+
+  return createCompany(identity);
 }
 
 async function createContact({ name, email }) {
@@ -471,7 +560,7 @@ async function createNote({ body, dealId, contactId }) {
   return note;
 }
 
-async function createDeal({ payload, scheduledEvent, contactId, ownerId, hostUserUri, eventTypeUri }) {
+async function createDeal({ payload, scheduledEvent, contactId, companyId, companyName, ownerId, hostUserUri, eventTypeUri }) {
   const eventUri = getScheduledEventUri(payload);
   const inviteeUri = getInviteeUri(payload);
   const startTime = getEventStart(scheduledEvent);
@@ -480,7 +569,7 @@ async function createDeal({ payload, scheduledEvent, contactId, ownerId, hostUse
     body: {
       properties: {
         dealname: buildDealName({
-          companyName: getCompanyNameFromPayload(payload),
+          companyName,
           organizerName: getOrganizerName(hostUserUri, scheduledEvent),
           startTime,
         }),
@@ -495,11 +584,14 @@ async function createDeal({ payload, scheduledEvent, contactId, ownerId, hostUse
       },
     },
   });
-  await associate('deals', deal.id, 'contacts', contactId);
+  await Promise.all([
+    associate('deals', deal.id, 'contacts', contactId),
+    companyId ? associate('deals', deal.id, 'companies', companyId) : null,
+  ].filter(Boolean));
   return deal;
 }
 
-async function createMeeting({ payload, scheduledEvent, contactId, dealId, ownerId, hostUserUri, eventTypeUri }) {
+async function createMeeting({ payload, scheduledEvent, contactId, companyId, dealId, ownerId, hostUserUri, eventTypeUri }) {
   const eventUri = getScheduledEventUri(payload);
   const inviteeUri = getInviteeUri(payload);
   const startTime = getEventStart(scheduledEvent) || new Date().toISOString();
@@ -524,8 +616,9 @@ async function createMeeting({ payload, scheduledEvent, contactId, dealId, owner
   });
   await Promise.all([
     associate('meetings', meeting.id, 'contacts', contactId),
+    companyId ? associate('meetings', meeting.id, 'companies', companyId) : null,
     associate('meetings', meeting.id, 'deals', dealId),
-  ]);
+  ].filter(Boolean));
   return meeting;
 }
 
@@ -539,6 +632,9 @@ async function ensureContact({ payload }) {
 
 async function handleInviteeCreated(payload, scheduledEvent, filter) {
   const contact = await ensureContact({ payload });
+  const company = await ensureCompany({ payload });
+  const companyName = company?.properties?.name || getCompanyIdentityFromPayload(payload).name;
+  if (company) await associate('companies', company.id, 'contacts', contact.id);
   const eventUri = getScheduledEventUri(payload);
   const inviteeUri = getInviteeUri(payload);
   const oldInviteeUri = getOldInviteeUri(payload);
@@ -566,7 +662,10 @@ async function handleInviteeCreated(payload, scheduledEvent, filter) {
       method: 'PATCH',
       body: { properties },
     });
-    await associate('deals', deal.id, 'contacts', contact.id);
+    await Promise.all([
+      associate('deals', deal.id, 'contacts', contact.id),
+      company ? associate('deals', deal.id, 'companies', company.id) : null,
+    ].filter(Boolean));
     if (foundByOldInvitee) {
       await createNote({ body: 'Meeting Rescheduled', dealId: deal.id, contactId: contact.id });
     }
@@ -575,6 +674,8 @@ async function handleInviteeCreated(payload, scheduledEvent, filter) {
       payload,
       scheduledEvent,
       contactId: contact.id,
+      companyId: company?.id,
+      companyName,
       ownerId: filter.ownerId,
       hostUserUri: filter.hostUserUri,
       eventTypeUri: filter.eventTypeUri,
@@ -608,6 +709,7 @@ async function handleInviteeCreated(payload, scheduledEvent, filter) {
       payload,
       scheduledEvent,
       contactId: contact.id,
+      companyId: company?.id,
       dealId: deal.id,
       ownerId: filter.ownerId,
       hostUserUri: filter.hostUserUri,
@@ -616,11 +718,12 @@ async function handleInviteeCreated(payload, scheduledEvent, filter) {
   } else {
     await Promise.all([
       associate('meetings', meeting.id, 'contacts', contact.id),
+      company ? associate('meetings', meeting.id, 'companies', company.id) : null,
       associate('meetings', meeting.id, 'deals', deal.id),
-    ]);
+    ].filter(Boolean));
   }
 
-  return { action: 'created_or_updated', contactId: contact.id, dealId: deal.id, meetingId: meeting.id };
+  return { action: 'created_or_updated', contactId: contact.id, companyId: company?.id, dealId: deal.id, meetingId: meeting.id };
 }
 
 async function handleInviteeCanceled(payload, scheduledEvent, filter) {
@@ -739,13 +842,17 @@ module.exports = {
   buildDealName,
   findAllowedHostUserUri,
   getCompanyNameFromPayload,
+  getCompanyIdentityFromPayload,
+  getEmailDomain,
   getEventMembershipUserUris,
   getEventTypeUri,
   getOrganizerName,
   handleCalendlyHubSpotWebhook,
   hubspotDateMs,
+  inferCompanyNameFromDomain,
   idempotencyRoot,
   isCalendlyApiUri,
+  isUsableCompanyDomain,
   isRescheduled,
   parseSignatureHeader,
   processCalendlyWebhook,

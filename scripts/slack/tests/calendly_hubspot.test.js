@@ -8,13 +8,17 @@ const {
   CONFIG,
   buildDealName,
   findAllowedHostUserUri,
+  getCompanyIdentityFromPayload,
   getCompanyNameFromPayload,
+  getEmailDomain,
   getEventTypeUri,
   getOrganizerName,
   hubspotDateMs,
+  inferCompanyNameFromDomain,
   idempotencyRoot,
   isCalendlyApiUri,
   isRescheduled,
+  isUsableCompanyDomain,
   shouldProcessScheduledEvent,
   validateCalendlySignature,
 } = require('../calendly_hubspot');
@@ -161,6 +165,28 @@ function testCompanyNameExtraction() {
   assert.strictEqual(getCompanyNameFromPayload({ questions_and_answers: [] }), '');
 }
 
+function testCompanyIdentityExtraction() {
+  assert.strictEqual(getEmailDomain('ada@acme-finance.com'), 'acme-finance.com');
+  assert.strictEqual(isUsableCompanyDomain('acme-finance.com'), true);
+  assert.strictEqual(isUsableCompanyDomain('gmail.com'), false);
+  assert.strictEqual(inferCompanyNameFromDomain('acme-finance.com'), 'Acme Finance');
+  assert.deepStrictEqual(
+    getCompanyIdentityFromPayload({
+      email: 'ada@acme-finance.com',
+      questions_and_answers: [{ question: 'Company', answer: 'Acme CFO Services' }],
+    }),
+    { name: 'Acme CFO Services', domain: 'acme-finance.com' },
+  );
+  assert.deepStrictEqual(
+    getCompanyIdentityFromPayload({ email: 'ada@acme-finance.com' }),
+    { name: 'Acme Finance', domain: 'acme-finance.com' },
+  );
+  assert.deepStrictEqual(
+    getCompanyIdentityFromPayload({ email: 'ada@gmail.com' }),
+    { name: '', domain: '' },
+  );
+}
+
 function testOrganizerName() {
   assert.strictEqual(
     getOrganizerName('https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01'),
@@ -194,6 +220,7 @@ async function run() {
   testIdempotencyRootUsesEnvOverride();
   testDealName();
   testCompanyNameExtraction();
+  testCompanyIdentityExtraction();
   testOrganizerName();
   testConfigHasExpectedCloseLostStage();
 }

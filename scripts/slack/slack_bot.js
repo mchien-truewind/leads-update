@@ -585,7 +585,6 @@ function isReadOnlyHubSpotProperty(property) {
     property?.readOnlyValue
     || property?.calculated
     || metadata.readOnlyValue
-    || metadata.readOnlyDefinition
   );
 }
 
@@ -717,6 +716,174 @@ function formatWorkflowError(err, partial) {
     lines.push(...partialLines);
   }
   return lines.join('\n');
+}
+
+function extractStructuredField(text, label) {
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = String(text || '').match(new RegExp(`^\\s*${escaped}\\s*:?\\s+(.+)$`, 'im'));
+  return match ? match[1].trim() : '';
+}
+
+function extractStructuredEmail(text) {
+  const field = extractStructuredField(text, 'Email');
+  const source = field || text;
+  const mailtoMatch = source.match(/<mailto:([^|>]+)(?:\|[^>]+)?>/i);
+  if (mailtoMatch) return normalizeEmail(mailtoMatch[1]);
+  const emailMatch = source.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return emailMatch ? normalizeEmail(emailMatch[0]) : '';
+}
+
+function parseStructuredDealRequest(text) {
+  const clean = stripMention(text);
+  if (!/\b(create|add|push)\b[\s\S]{0,80}\bdeal\b/i.test(clean)) return null;
+
+  const company = extractStructuredField(clean, 'Company');
+  const contact = extractStructuredField(clean, 'Contact');
+  const email = extractStructuredEmail(clean);
+  const ownerName = extractStructuredField(clean, 'Deal owner') || extractStructuredField(clean, 'Owner');
+  const source = extractStructuredField(clean, 'Source');
+  const type = extractStructuredField(clean, 'Type');
+  const meetingBooked = extractStructuredField(clean, 'Meeting booked for') || extractStructuredField(clean, 'Meeting');
+  const notes = extractStructuredField(clean, 'Notes');
+
+  if (!company && !contact && !email) return null;
+
+  return {
+    company,
+    contact,
+    email,
+    owner_name: ownerName,
+    lead_source: source,
+    type,
+    meeting_booked: meetingBooked,
+    notes,
+    dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
+  };
+}
+
+function splitFullName(name, email = '') {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return parseNameFromEmail(email);
+  if (parts.length === 1) return { firstname: titleCase(parts[0]), lastname: '' };
+  return { firstname: titleCase(parts[0]), lastname: titleCase(parts.slice(1).join(' ')) };
+}
+
+async function createDefaultHubSpotAssociation(fromType, fromId, toType, toId) {
+  if (!fromId || !toId) return null;
+  return hubspotRequest(
+    `/crm/v4/objects/${fromType}/${encodeURIComponent(fromId)}/associations/default/${toType}/${encodeURIComponent(toId)}`,
+    'PUT'
+  );
+}
+
+async function createStructuredDealNote({ dealId, contactId, companyId, body }) {
+  if (!String(body || '').trim()) return null;
+  const note = await hubspotRequest('/crm/v3/objects/notes', 'POST', {
+    properties: {
+      hs_timestamp: new Date().toISOString(),
+      hs_note_body: body,
+    },
+  });
+  const noteId = requireHubSpotObjectId(note, 'HubSpot note create');
+  await Promise.all([
+    createDefaultHubSpotAssociation('notes', noteId, 'deals', dealId),
+    contactId ? createDefaultHubSpotAssociation('notes', noteId, 'contacts', contactId) : null,
+    companyId ? createDefaultHubSpotAssociation('notes', noteId, 'companies', companyId) : null,
+  ].filter(Boolean));
+  return note;
+}
+
+async function runStructuredDealCreateWorkflow(input) {
+  const email = normalizeEmail(input.email);
+  if (!isValidEmail(email)) {
+    return 'Error: missing valid Email. No HubSpot deal was created.';
+  }
+  if (!String(input.company || '').trim()) {
+    return 'Error: missing Company. No HubSpot deal was created.';
+  }
+
+  const owner = resolveHubSpotOwner({ owner_name: input.owner_name, context: input.context, slack_user_id: input.slack_user_id, channel_id: input.channel_id });
+  const authorization = isHubSpotWriteAuthorized(input, owner);
+  if (!authorization.authorized) {
+    return `Error: not authorized to write to HubSpot: ${authorization.reason}. No HubSpot deal was created.`;
+  }
+
+  const partial = {};
+  try {
+    const nameParts = splitFullName(input.contact, email);
+    const companyName = String(input.company || '').trim();
+    const inferred = inferCompanyFromEmail(email);
+    const leadSource = input.lead_source || deduceLeadSource(input.context || input.notes || '');
+
+    const existingContact = await findContactByEmail(email);
+    let contactRes = existingContact;
+    if (!contactRes) {
+      const contactProps = await validateHubSpotProperties('contacts', compactProperties({
+        email,
+        firstname: nameParts.firstname,
+        lastname: nameParts.lastname,
+        company: companyName,
+        lead_source: leadSource,
+        hubspot_owner_id: owner.id,
+      }));
+      contactRes = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: contactProps });
+    }
+    const contactId = requireHubSpotObjectId(contactRes, existingContact ? 'HubSpot contact search' : 'HubSpot contact create');
+    partial.contactId = contactId;
+
+    const companyResult = await findOrCreateCompany(companyName, inferred.domain);
+    const companyId = requireHubSpotObjectId(companyResult.record, companyResult.created ? 'HubSpot company create' : 'HubSpot company search');
+    partial.companyId = companyId;
+
+    const dealName = input.dealname || `${companyName} - New Deal`;
+    const dealProps = await validateHubSpotProperties('deals', compactProperties({
+      dealname: dealName,
+      pipeline: TRUEWIND_HUBSPOT.pipeline,
+      dealstage: input.dealstage || TRUEWIND_HUBSPOT.mqlDealStage,
+      hubspot_owner_id: owner.id,
+      deal_source: leadSource,
+    }));
+    const dealRes = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: dealProps });
+    const dealId = requireHubSpotObjectId(dealRes, 'HubSpot deal create');
+    partial.dealId = dealId;
+
+    await Promise.all([
+      createHubSpotAssociation('contacts', contactId, 'companies', companyId, TRUEWIND_HUBSPOT.contactToCompanyAssociationTypeId),
+      createHubSpotAssociation('deals', dealId, 'contacts', contactId, TRUEWIND_HUBSPOT.dealToContactAssociationTypeId),
+      createHubSpotAssociation('deals', dealId, 'companies', companyId, TRUEWIND_HUBSPOT.dealToCompanyAssociationTypeId),
+    ]);
+
+    const noteLines = [
+      input.type ? `Type: ${input.type}` : '',
+      input.meeting_booked ? `Meeting booked for: ${input.meeting_booked}` : '',
+      input.notes ? `Notes: ${input.notes}` : '',
+    ].filter(Boolean);
+    if (noteLines.length) {
+      await createStructuredDealNote({
+        dealId,
+        contactId,
+        companyId,
+        body: noteLines.join('<br>'),
+      }).catch((err) => {
+        console.error(`Structured deal note create failed: ${err.message}`);
+      });
+    }
+
+    const dealUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/0-3/${dealId}`;
+    const contactUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/0-1/${contactId}`;
+    const companyUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/0-2/${companyId}`;
+    return [
+      `:white_check_mark: Deal created: ${dealName}`,
+      `Deal ID: ${dealId}`,
+      `Deal link: ${dealUrl}`,
+      `Contact ID: ${contactId}`,
+      `Contact link: ${contactUrl}`,
+      `Company ID: ${companyId}`,
+      `Company link: ${companyUrl}`,
+    ].join('\n');
+  } catch (err) {
+    return `Error: ${err.message}\nNo completion claimed.${partial.dealId ? `\nDeal ID: ${partial.dealId}` : ''}${partial.contactId ? `\nContact ID: ${partial.contactId}` : ''}${partial.companyId ? `\nCompany ID: ${partial.companyId}` : ''}`;
+  }
 }
 
 function shouldSetLifecycleToOpportunity(currentLifecycleStage) {
@@ -1357,6 +1524,8 @@ After successfully appending, respond with EXACTLY this and nothing else:
 You have access to HubSpot CRM. You can search contacts, companies, deals, meetings, and other objects. You can also look up owners (team members) by ID. Use hubspot_list_owners to map owner IDs to names when reporting.
 
 ### Truewind prospect push workflow
+When the current message itself is a structured request to create a new deal with fields like Company, Contact, Email, Deal owner, Source, Meeting booked, and Notes, the backend handles it directly before Claude runs. If you are responding after that flow, only relay the tool's concrete ID/link result. Do not add unrelated thread summaries.
+
 When someone asks you to add, push, create, or update a prospect/lead/opportunity/deal in HubSpot, use hubspot_push_truewind_prospect. Do not manually chain the low-level HubSpot write tools unless the user asks for a custom one-off update.
 
 Rules enforced by the backend tool:
@@ -1530,6 +1699,17 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
   if (!cleanText) return;
 
   console.log(`handleMessage: channel=${channel}, threadTs=${threadTs}, isThread=${isThread}, text="${cleanText}"`);
+
+  const structuredDeal = parseStructuredDealRequest(cleanText);
+  if (structuredDeal) {
+    const threadDate = new Date(parseFloat(threadTs) * 1000).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+    structuredDeal.context = `${cleanText}\n\n[Slack metadata: channel_id=${channel}, thread_ts=${threadTs}, thread_date=${threadDate}${slackUserId ? `, slack_user_id=${slackUserId}` : ''}]`;
+    structuredDeal.channel_id = channel;
+    structuredDeal.slack_user_id = slackUserId;
+    const reply = await runStructuredDealCreateWorkflow(structuredDeal);
+    await say({ text: reply, thread_ts: threadTs });
+    return;
+  }
 
   const fetched = await fetchThreadHistory(channel, threadTs, isThread);
   let messages = fetched.messages;
@@ -2699,8 +2879,10 @@ module.exports = {
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   normalizeHubSpotPropertyValue,
+  parseStructuredDealRequest,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
+  runStructuredDealCreateWorkflow,
   shouldSetLifecycleToOpportunity,
   startSlackBot,
   validateHubSpotProperties,

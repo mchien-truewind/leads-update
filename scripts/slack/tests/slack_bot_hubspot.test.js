@@ -18,6 +18,7 @@ const {
   hubspotPropertyCache,
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
+  parseStructuredDealRequest,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
   validateHubSpotProperties,
@@ -66,6 +67,59 @@ async function testReadOnlyDealPropertiesAreRejectedBeforeWrite() {
   assert.match(result, /hs_deal_stage_probability_shadow/);
 }
 
+async function testReadOnlyDefinitionDoesNotBlockWritableStandardFields() {
+  seedHubSpotProperty('deals', 'dealname', {
+    modificationMetadata: { readOnlyDefinition: true, readOnlyValue: false },
+  });
+  seedHubSpotProperty('contacts', 'firstname', {
+    modificationMetadata: { readOnlyDefinition: true, readOnlyValue: false },
+  });
+
+  assert.strictEqual(
+    isReadOnlyHubSpotProperty({ modificationMetadata: { readOnlyDefinition: true, readOnlyValue: false } }),
+    false,
+  );
+  assert.deepStrictEqual(
+    await validateHubSpotProperties('deals', { dealname: 'ThinkScan - New Deal' }),
+    { dealname: 'ThinkScan - New Deal' },
+  );
+  assert.deepStrictEqual(
+    await validateHubSpotProperties('contacts', { firstname: 'Deepak' }),
+    { firstname: 'Deepak' },
+  );
+}
+
+function testStructuredDealRequestParser() {
+  const parsed = parseStructuredDealRequest(`create a new deal in S1
+Company: ThinkScan
+Type: direct services
+Contact: Deepak Rana
+Email: <drana@thinkscan.ai>
+Deal owner: Xavier Marco
+Source: Referral
+Meeting booked for Monday May 18
+Notes: referred by Mike Ricci`);
+
+  assert.strictEqual(parsed.company, 'ThinkScan');
+  assert.strictEqual(parsed.type, 'direct services');
+  assert.strictEqual(parsed.contact, 'Deepak Rana');
+  assert.strictEqual(parsed.email, 'drana@thinkscan.ai');
+  assert.strictEqual(parsed.owner_name, 'Xavier Marco');
+  assert.strictEqual(parsed.lead_source, 'Referral');
+  assert.strictEqual(parsed.meeting_booked, 'Monday May 18');
+  assert.strictEqual(parsed.notes, 'referred by Mike Ricci');
+  assert.strictEqual(parsed.dealstage, TRUEWIND_HUBSPOT.mqlDealStage);
+
+  const mailtoParsed = parseStructuredDealRequest(`add deal
+Company: ThinkScan
+Contact: Deepak Rana
+Email: <mailto:drana@thinkscan.ai|drana@thinkscan.ai>`);
+  assert.strictEqual(mailtoParsed.email, 'drana@thinkscan.ai');
+
+  assert.strictEqual(parseStructuredDealRequest('please summarize the ThinkScan account'), null);
+  assert.strictEqual(parseStructuredDealRequest('create a new deal once we have details'), null);
+}
+
 async function testExplicitOwnerOverridesSlackMapping() {
   const owner = resolveHubSpotOwner({ slack_user_id: 'U_TEST', owner_name: 'Mercedes' });
   assert.deepStrictEqual(owner, { id: '87811681', name: 'Mercedes Chien', source: 'explicit owner' });
@@ -91,6 +145,8 @@ function testLeadSourceDefaultsToOutbound() {
 async function run() {
   await testConvertedLeadStatusUsesInternalValue();
   await testReadOnlyDealPropertiesAreRejectedBeforeWrite();
+  await testReadOnlyDefinitionDoesNotBlockWritableStandardFields();
+  testStructuredDealRequestParser();
   await testExplicitOwnerOverridesSlackMapping();
   testLeadSourceDefaultsToOutbound();
 }

@@ -15,7 +15,9 @@ const {
   TRUEWIND_HUBSPOT,
   deduceLeadSource,
   executeTool,
+  formatProspectWorkflowResponse,
   hubspotPropertyCache,
+  hubspotRecordUrl,
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   parseStructuredDealRequest,
@@ -152,6 +154,26 @@ function testLeadSourceDefaultsToOutbound() {
   assert.strictEqual(deduceLeadSource(''), 'Outbound - Sales Sourced List');
 }
 
+function testProspectWorkflowResponseIncludesHubSpotLinks() {
+  assert.strictEqual(
+    hubspotRecordUrl('0-3', '60316278406'),
+    'https://app.hubspot.com/contacts/43974586/record/0-3/60316278406',
+  );
+
+  const response = formatProspectWorkflowResponse({
+    linkedinUrl: '',
+    contact: { id: '221459934275', name: 'Deepak Rana', jobtitle: '' },
+    company: { id: '54941778205', name: 'ThinkScan', created: false },
+    deal: { id: '60316278406', name: 'ThinkScan - New Deal', created: true },
+    owner: { name: 'Xavier Marco', source: 'explicit owner' },
+    leadSource: 'Referral',
+  });
+
+  assert.match(response, /Deal link: https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-3\/60316278406/);
+  assert.match(response, /Contact link: https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-1\/221459934275/);
+  assert.match(response, /Company link: https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-2\/54941778205/);
+}
+
 async function run() {
   await testConvertedLeadStatusUsesInternalValue();
   await testReadOnlyDealPropertiesAreRejectedBeforeWrite();
@@ -160,6 +182,7 @@ async function run() {
   testStructuredDealRequestParser();
   await testExplicitOwnerOverridesSlackMapping();
   testLeadSourceDefaultsToOutbound();
+  testProspectWorkflowResponseIncludesHubSpotLinks();
 }
 
 run()

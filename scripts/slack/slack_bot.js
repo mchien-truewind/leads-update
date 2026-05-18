@@ -205,9 +205,13 @@ function formatHubSpotObjectResponse(response, objectTypeId) {
     ...properties,
     id,
     hubspot_id: id,
-    url: `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/${objectTypeId}/${id}`,
+    url: hubspotRecordUrl(objectTypeId, id),
     properties,
   };
+}
+
+function hubspotRecordUrl(objectTypeId, objectId) {
+  return `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/${objectTypeId}/${objectId}`;
 }
 
 async function httpRequest(url, options = {}) {
@@ -869,9 +873,9 @@ async function runStructuredDealCreateWorkflow(input) {
       });
     }
 
-    const dealUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/0-3/${dealId}`;
-    const contactUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/0-1/${contactId}`;
-    const companyUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/0-2/${companyId}`;
+    const dealUrl = hubspotRecordUrl('0-3', dealId);
+    const contactUrl = hubspotRecordUrl('0-1', contactId);
+    const companyUrl = hubspotRecordUrl('0-2', companyId);
     return [
       `:white_check_mark: Deal created: ${dealName}`,
       `Deal ID: ${dealId}`,
@@ -900,11 +904,17 @@ function formatProspectWorkflowResponse(summary) {
     ? `✓ LinkedIn found: ${summary.linkedinUrl}`
     : `✓ LinkedIn found: not found; used email/company fallback${summary.linkedinError ? ` (${summary.linkedinError})` : ''}`;
   const title = summary.contact.jobtitle ? `, ${summary.contact.jobtitle}` : '';
+  const contactUrl = hubspotRecordUrl('0-1', summary.contact.id);
+  const dealUrl = hubspotRecordUrl('0-3', summary.deal.id);
+  const companyUrl = hubspotRecordUrl('0-2', summary.company.id);
   return [
     linkedinLine,
     `✓ Contact created/updated: ${summary.contact.name}${title} at ${summary.company.name} (ID: ${summary.contact.id})`,
+    `Contact link: ${contactUrl}`,
     `✓ Deal ${summary.deal.created ? 'created' : 'matched'}: ${summary.deal.name} (ID: ${summary.deal.id})`,
+    `Deal link: ${dealUrl}`,
     `✓ Company ${summary.company.created ? 'created' : 'matched'}: ${summary.company.name} (ID: ${summary.company.id})`,
+    `Company link: ${companyUrl}`,
     `✓ Owner: ${summary.owner.name} (${summary.owner.source})`,
     `✓ Lead source: ${summary.leadSource}`,
   ].join('\n');
@@ -2904,9 +2914,11 @@ module.exports = {
   compactProperties,
   deduceLeadSource,
   executeTool,
+  formatProspectWorkflowResponse,
   formatWorkflowError,
   getSlackMetadata,
   hubspotPropertyCache,
+  hubspotRecordUrl,
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   normalizeHubSpotPropertyValue,

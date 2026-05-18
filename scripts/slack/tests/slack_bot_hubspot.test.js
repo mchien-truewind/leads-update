@@ -14,6 +14,7 @@ process.env.SLACK_TO_HUBSPOT_OWNER_JSON = JSON.stringify({
 const {
   TRUEWIND_HUBSPOT,
   buildDealNoteBody,
+  classifyProgressDealSource,
   deduceLeadSource,
   executeTool,
   extractStructuredBlockField,
@@ -23,6 +24,7 @@ const {
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   parseStructuredDealRequest,
+  parseProgressDealSourceProperty,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
   validateHubSpotProperties,
@@ -79,6 +81,13 @@ async function testLowLevelHubSpotWritesRequireAuthorization() {
   });
 
   assert.match(result, /not authorized to write to HubSpot/);
+
+  const noteResult = await executeTool('hubspot_create_note', {
+    body: 'Referral note',
+    deal_id: '60316278406',
+  });
+
+  assert.match(noteResult, /not authorized to write to HubSpot/);
 }
 
 async function testReadOnlyDefinitionDoesNotBlockWritableStandardFields() {
@@ -185,6 +194,15 @@ function testLeadSourceDefaultsToOutbound() {
   assert.strictEqual(deduceLeadSource(''), 'Outbound - Sales Sourced List');
 }
 
+function testDailyProgressUsesDealSourceProperty() {
+  assert.strictEqual(parseProgressDealSourceProperty(''), 'deal_source');
+  assert.strictEqual(parseProgressDealSourceProperty('lead_source'), 'deal_source');
+  assert.strictEqual(parseProgressDealSourceProperty('custom_deal_source'), 'custom_deal_source');
+  assert.strictEqual(classifyProgressDealSource('Inbound - Website'), 'inbound');
+  assert.strictEqual(classifyProgressDealSource('Outbound - Sales Sourced List'), 'outbound');
+  assert.strictEqual(classifyProgressDealSource('Referral'), 'unknown');
+}
+
 function testProspectWorkflowResponseIncludesHubSpotLinks() {
   assert.strictEqual(
     hubspotRecordUrl('0-3', '60316278406'),
@@ -228,6 +246,7 @@ async function run() {
   testDealNoteBodyEscapesAndIncludesFields();
   await testExplicitOwnerOverridesSlackMapping();
   testLeadSourceDefaultsToOutbound();
+  testDailyProgressUsesDealSourceProperty();
   testProspectWorkflowResponseIncludesHubSpotLinks();
 }
 

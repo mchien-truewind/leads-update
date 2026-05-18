@@ -1401,6 +1401,23 @@ const TOOLS = [
     },
   },
   {
+    name: 'hubspot_create_note',
+    description: 'Create a HubSpot note and associate it to an existing deal, contact, and/or company. Use this when the user asks to add notes to an existing HubSpot record.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        body: { type: 'string', description: 'Full note text to write to HubSpot.' },
+        deal_id: { type: 'string', description: 'Optional HubSpot deal ID to attach the note to.' },
+        contact_id: { type: 'string', description: 'Optional HubSpot contact ID to attach the note to.' },
+        company_id: { type: 'string', description: 'Optional HubSpot company ID to attach the note to.' },
+        context: { type: 'string', description: 'Original Slack request/context for write authorization.' },
+        channel_id: { type: 'string', description: 'Slack channel ID for write authorization.' },
+        slack_user_id: { type: 'string', description: 'Slack user ID for write authorization.' },
+      },
+      required: ['body'],
+    },
+  },
+  {
     name: 'hubspot_get_associations',
     description: 'Get associations for a HubSpot record (e.g. find all deals for a contact).',
     input_schema: {
@@ -1448,6 +1465,7 @@ async function executeTool(name, input = {}) {
       'hubspot_create_deal',
       'hubspot_update_deal',
       'hubspot_create_association',
+      'hubspot_create_note',
     ]);
     if (hubspotWriteTools.has(name)) {
       const authorization = isHubSpotWriteAuthorized(input, resolveHubSpotOwner(input));
@@ -1551,6 +1569,27 @@ async function executeTool(name, input = {}) {
       );
       return JSON.stringify(res);
     }
+    if (name === 'hubspot_create_note') {
+      if (!String(input.body || '').trim()) return 'Error: note body is required';
+      if (!input.deal_id && !input.contact_id && !input.company_id) {
+        return 'Error: provide at least one of deal_id, contact_id, or company_id';
+      }
+      const note = await createStructuredDealNote({
+        dealId: input.deal_id,
+        contactId: input.contact_id,
+        companyId: input.company_id,
+        body: escapeHubSpotNoteText(input.body).replace(/\r?\n/g, '<br>'),
+      });
+      const noteId = requireHubSpotObjectId(note, 'HubSpot note create');
+      return JSON.stringify({
+        id: noteId,
+        hubspot_id: noteId,
+        url: hubspotRecordUrl('0-46', noteId),
+        deal_id: input.deal_id || '',
+        contact_id: input.contact_id || '',
+        company_id: input.company_id || '',
+      });
+    }
     if (name === 'hubspot_get_associations') {
       const res = await hubspotRequest(`/crm/v4/objects/${input.from_type}/${input.from_id}/associations/${input.to_type}`);
       return JSON.stringify(res.results || []);
@@ -1647,10 +1686,14 @@ After successfully appending, respond with EXACTLY this and nothing else:
 ## HubSpot
 You have access to HubSpot CRM. You can search contacts, companies, deals, meetings, and other objects. You can also look up owners (team members) by ID. Use hubspot_list_owners to map owner IDs to names when reporting.
 
+### Daily progress notifications
+Daily progress notification counts are based on HubSpot deal records in pipeline ${PROGRESS_PIPELINE_ID} using the deal property ${PROGRESS_DEAL_SOURCE_PROPERTY}. Do not diagnose the progress report from contact lead_source; if a report shows Unknown, it means the counted deal records are missing an Inbound/Outbound value in ${PROGRESS_DEAL_SOURCE_PROPERTY}.
+
 ### Truewind prospect push workflow
 When the current message itself is a structured request to create a new deal with fields like Company, Contact, Email, Deal owner, Source, Meeting booked, and Notes, the backend handles it directly before Claude runs. If you are responding after that flow, only relay the tool's concrete ID/link result. Do not add unrelated thread summaries.
 
 When someone asks you to add, push, create, or update a prospect/lead/opportunity/deal in HubSpot, use hubspot_push_truewind_prospect. Do not manually chain the low-level HubSpot write tools unless the user asks for a custom one-off update.
+When someone asks you to add a note to an existing HubSpot deal/contact/company, use hubspot_create_note. If they give a company or deal name instead of an ID, search HubSpot first, choose the unambiguous matching record, then call hubspot_create_note with the matching record ID. Never say you lack a note tool; hubspot_create_note is available.
 
 Rules enforced by the backend tool:
 - Contact first, deal second. Contact is the anchor record.
@@ -2397,6 +2440,8 @@ function scheduleDiscoveryDigest() {
 // ============================================================
 const DEFAULT_PROGRESS_WEEKLY_GOAL = 30;
 const LEGACY_PROGRESS_WEEKLY_GOAL = 10;
+const DEFAULT_PROGRESS_DEAL_SOURCE_PROPERTY = 'deal_source';
+const LEGACY_PROGRESS_LEAD_SOURCE_PROPERTY = 'lead_source';
 
 function parseProgressWeeklyGoal(rawValue) {
   if (rawValue == null || String(rawValue).trim() === '') {
@@ -2414,8 +2459,18 @@ function parseProgressWeeklyGoal(rawValue) {
   return weeklyGoal;
 }
 
+function parseProgressDealSourceProperty(rawValue) {
+  const configured = String(rawValue || '').trim();
+  if (!configured) return DEFAULT_PROGRESS_DEAL_SOURCE_PROPERTY;
+  if (configured === LEGACY_PROGRESS_LEAD_SOURCE_PROPERTY) {
+    console.warn('Ignoring legacy LEAD_REPORT_DEAL_SOURCE_PROPERTY=lead_source override; using deal_source');
+    return DEFAULT_PROGRESS_DEAL_SOURCE_PROPERTY;
+  }
+  return configured;
+}
+
 const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'gtm-general';
-const PROGRESS_DEAL_SOURCE_PROPERTY = process.env.LEAD_REPORT_DEAL_SOURCE_PROPERTY || 'deal_source';
+const PROGRESS_DEAL_SOURCE_PROPERTY = parseProgressDealSourceProperty(process.env.LEAD_REPORT_DEAL_SOURCE_PROPERTY);
 const PROGRESS_PIPELINE_ID = process.env.LEAD_REPORT_PIPELINE_ID || '105321581';
 const PROGRESS_TRIGGER_SECRET = process.env.LEAD_REPORT_TRIGGER_SECRET || '';
 const PROGRESS_WEEKLY_GOAL = parseProgressWeeklyGoal(process.env.LEAD_REPORT_WEEKLY_GOAL);
@@ -2998,6 +3053,7 @@ if (require.main === module) {
 module.exports = {
   TRUEWIND_HUBSPOT,
   buildDealNoteBody,
+  classifyProgressDealSource,
   compactProperties,
   deduceLeadSource,
   executeTool,
@@ -3011,6 +3067,7 @@ module.exports = {
   isReadOnlyHubSpotProperty,
   normalizeHubSpotPropertyValue,
   parseStructuredDealRequest,
+  parseProgressDealSourceProperty,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
   runStructuredDealCreateWorkflow,

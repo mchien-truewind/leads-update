@@ -1219,6 +1219,9 @@ const TOOLS = [
         company: { type: 'string', description: 'Company name' },
         jobtitle: { type: 'string', description: 'Job title' },
         phone: { type: 'string', description: 'Phone number' },
+        context: { type: 'string', description: 'Original Slack request/context for write authorization.' },
+        channel_id: { type: 'string', description: 'Slack channel ID for write authorization.' },
+        slack_user_id: { type: 'string', description: 'Slack user ID for write authorization.' },
         properties: {
           type: 'object',
           description: 'Writable contact properties as key-value pairs (e.g. lifecyclestage, contact_type, hubspot_owner_id, linkedin___profile, lead_source, enterprise_smb_industry). Do not include HubSpot read-only/system fields.',
@@ -1234,6 +1237,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         contact_id: { type: 'string', description: 'The contact ID to update' },
+        context: { type: 'string', description: 'Original Slack request/context for write authorization.' },
+        channel_id: { type: 'string', description: 'Slack channel ID for write authorization.' },
+        slack_user_id: { type: 'string', description: 'Slack user ID for write authorization.' },
         properties: {
           type: 'object',
           description: 'Properties to update as key-value pairs',
@@ -1252,6 +1258,9 @@ const TOOLS = [
         pipeline: { type: 'string', description: 'Pipeline ID (default: Active Pipeline 105321581)' },
         dealstage: { type: 'string', description: 'Stage ID' },
         amount: { type: 'number', description: 'Deal amount' },
+        context: { type: 'string', description: 'Original Slack request/context for write authorization.' },
+        channel_id: { type: 'string', description: 'Slack channel ID for write authorization.' },
+        slack_user_id: { type: 'string', description: 'Slack user ID for write authorization.' },
         properties: {
           type: 'object',
           description: 'Writable deal properties (e.g. hubspot_owner_id, closedate). Do not include HubSpot read-only/system fields such as hs_deal_stage_probability_shadow, notes_last_updated, or hs_object_source_detail_1.',
@@ -1267,6 +1276,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         deal_id: { type: 'string', description: 'The deal ID to update' },
+        context: { type: 'string', description: 'Original Slack request/context for write authorization.' },
+        channel_id: { type: 'string', description: 'Slack channel ID for write authorization.' },
+        slack_user_id: { type: 'string', description: 'Slack user ID for write authorization.' },
         properties: {
           type: 'object',
           description: 'Properties to update as key-value pairs',
@@ -1286,6 +1298,9 @@ const TOOLS = [
         to_type: { type: 'string', description: 'Target object type (contacts, companies, deals)' },
         to_id: { type: 'string', description: 'Target object ID' },
         association_type_id: { type: 'number', description: 'Association type ID (e.g. 279 for contact_to_company)' },
+        context: { type: 'string', description: 'Original Slack request/context for write authorization.' },
+        channel_id: { type: 'string', description: 'Slack channel ID for write authorization.' },
+        slack_user_id: { type: 'string', description: 'Slack user ID for write authorization.' },
       },
       required: ['from_type', 'from_id', 'to_type', 'to_id', 'association_type_id'],
     },
@@ -1330,8 +1345,22 @@ const TOOLS = [
 // ============================================================
 // Tool execution
 // ============================================================
-async function executeTool(name, input) {
+async function executeTool(name, input = {}) {
   try {
+    const hubspotWriteTools = new Set([
+      'hubspot_create_contact',
+      'hubspot_update_contact',
+      'hubspot_create_deal',
+      'hubspot_update_deal',
+      'hubspot_create_association',
+    ]);
+    if (hubspotWriteTools.has(name)) {
+      const authorization = isHubSpotWriteAuthorized(input, resolveHubSpotOwner(input));
+      if (!authorization.authorized) {
+        return `Error: not authorized to write to HubSpot: ${authorization.reason}`;
+      }
+    }
+
     // --- Google Sheets ---
     if (name === 'read_spreadsheet') {
       const res = await sheets.spreadsheets.values.get({
@@ -1492,7 +1521,7 @@ const PRIORITY_SHEET_ID = '1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI';
 
 function getSystemPrompt() {
   const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-  return `You are Truewind's internal AI assistant in Slack. You have tools for Google Sheets, HubSpot CRM, and Grain meeting transcripts. You MUST use them when asked to take actions. NEVER say you can't do something -- you have the tools, use them.
+  return `You are Truewind's internal AI assistant in Slack. You have tools for Google Sheets, HubSpot CRM, and Grain meeting transcripts. Use tools for action requests. If a tool is missing, unavailable, unauthorized, or returns an error, say exactly that.
 
 ## Accuracy
 NEVER fabricate, hallucinate, or invent information. If you do not have real data from a tool call or explicit context to support a claim, say "I don't know" or "I don't have that information." Do not fill gaps with plausible-sounding details. Do not summarize, list, or describe things you cannot verify. If a question requires data you don't have access to, say exactly what is missing and why. Accuracy over completeness, always.
@@ -1534,9 +1563,9 @@ Rules enforced by the backend tool:
 - Company is required, but the tool can infer it from LinkedIn or a non-generic email domain. Only ask if the tool says company is unclear.
 - The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to lifecycle opportunity and lead status internal value MQL (HubSpot label Converted).
 - Pass the full Slack request/thread in the context field so the backend can deduce lead source.
-- Pass channel_id and slack_user_id from Slack metadata when present. The backend uses them for HubSpot write authorization and owner mapping. If the user explicitly names an owner, pass owner_name; explicit owner_name overrides Slack owner mapping. Otherwise it looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
+- Pass channel_id and slack_user_id from Slack metadata on every HubSpot write tool call. The backend uses them for HubSpot write authorization and owner mapping. If the user explicitly names an owner, pass owner_name; explicit owner_name overrides Slack owner mapping. Otherwise it looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
 - Never ask for deal stage, owner, ERP, name/title, or lead source unless the backend tool explicitly needs clarification.
-- Never say done without actual contact and deal IDs from the tool result. If the tool fails, show the exact error.
+- Never say done without actual record IDs from the tool result. If the tool fails, show the exact error. Do not summarize unrelated earlier thread or channel messages as completed work.
 - Do not pass read-only HubSpot properties into low-level write tools. The backend validates properties before write and will reject system-managed fields such as hs_deal_stage_probability_shadow, notes_last_updated, and hs_object_source_detail_1.
 
 Lead source deduction:
@@ -1711,7 +1740,9 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
     return;
   }
 
-  const fetched = await fetchThreadHistory(channel, threadTs, isThread);
+  const fetched = isThread
+    ? await fetchThreadHistory(channel, threadTs, isThread)
+    : { messages: [{ role: 'user', content: cleanText }], parentTs: threadTs };
   let messages = fetched.messages;
   const parentTs = fetched.parentTs || threadTs;
 
@@ -1783,7 +1814,7 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
     await say({ text: reply, thread_ts: threadTs });
   } catch (err) {
     console.error('Claude API error:', err.message);
-    await say({ text: `My brain suddenly fried. :cry: Please try again in a few seconds.`, thread_ts: threadTs });
+    await say({ text: `Error: Claude request failed: ${err.message}. No action completed by this response.`, thread_ts: threadTs });
   }
 }
 

@@ -60,11 +60,21 @@ async function testReadOnlyDealPropertiesAreRejectedBeforeWrite() {
 
   const result = await executeTool('hubspot_update_deal', {
     deal_id: '123',
+    slack_user_id: 'U_TEST',
     properties: { hs_deal_stage_probability_shadow: '0.5' },
   });
 
   assert.match(result, /read-only/);
   assert.match(result, /hs_deal_stage_probability_shadow/);
+}
+
+async function testLowLevelHubSpotWritesRequireAuthorization() {
+  const result = await executeTool('hubspot_create_deal', {
+    dealname: 'Unauthorized Deal',
+    dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
+  });
+
+  assert.match(result, /not authorized to write to HubSpot/);
 }
 
 async function testReadOnlyDefinitionDoesNotBlockWritableStandardFields() {
@@ -145,6 +155,7 @@ function testLeadSourceDefaultsToOutbound() {
 async function run() {
   await testConvertedLeadStatusUsesInternalValue();
   await testReadOnlyDealPropertiesAreRejectedBeforeWrite();
+  await testLowLevelHubSpotWritesRequireAuthorization();
   await testReadOnlyDefinitionDoesNotBlockWritableStandardFields();
   testStructuredDealRequestParser();
   await testExplicitOwnerOverridesSlackMapping();

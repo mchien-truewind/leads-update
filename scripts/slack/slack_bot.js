@@ -728,6 +728,26 @@ function extractStructuredField(text, label) {
   return match ? match[1].trim() : '';
 }
 
+function extractStructuredBlockField(text, label, stopLabels = []) {
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const source = String(text || '');
+  const match = source.match(new RegExp(`^\\s*${escaped}\\s*:?\\s*(.*)$`, 'im'));
+  if (!match) return '';
+
+  const startIndex = match.index + match[0].length;
+  const firstLine = match[1] || '';
+  const rest = source.slice(startIndex).replace(/^\r?\n/, '');
+  const stopPattern = stopLabels.length
+    ? new RegExp(`^\\s*(?:${stopLabels.map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\s*:`, 'i')
+    : null;
+  const continuation = [];
+  for (const line of rest.split(/\r?\n/)) {
+    if (stopPattern && stopPattern.test(line)) break;
+    continuation.push(line);
+  }
+  return [firstLine, ...continuation].join('\n').trim();
+}
+
 function extractStructuredEmail(text) {
   const field = extractStructuredField(text, 'Email');
   const source = field || text;
@@ -748,7 +768,20 @@ function parseStructuredDealRequest(text) {
   const source = extractStructuredField(clean, 'Source');
   const type = extractStructuredField(clean, 'Type');
   const meetingBooked = extractStructuredField(clean, 'Meeting booked for') || extractStructuredField(clean, 'Meeting');
-  const notes = extractStructuredField(clean, 'Notes');
+  const notes = extractStructuredBlockField(clean, 'Notes', [
+    'Company',
+    'Type',
+    'Contact',
+    'Email',
+    'LinkedIn',
+    'Amount',
+    'Close date',
+    'Deal owner',
+    'Owner',
+    'Source',
+    'Meeting booked for',
+    'Meeting',
+  ]);
 
   if (!company && !contact && !email) return null;
 
@@ -778,6 +811,24 @@ async function createDefaultHubSpotAssociation(fromType, fromId, toType, toId) {
     `/crm/v4/objects/${fromType}/${encodeURIComponent(fromId)}/associations/default/${toType}/${encodeURIComponent(toId)}`,
     'PUT'
   );
+}
+
+function escapeHubSpotNoteText(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildDealNoteBody(input = {}) {
+  const lines = [
+    input.type ? `Type: ${input.type}` : '',
+    input.meeting_booked ? `Meeting booked for: ${input.meeting_booked}` : '',
+    input.notes ? `Notes: ${input.notes}` : '',
+  ].filter(Boolean);
+  return lines.map((line) => escapeHubSpotNoteText(line).replace(/\r?\n/g, '<br>')).join('<br>');
 }
 
 async function createStructuredDealNote({ dealId, contactId, companyId, body }) {
@@ -857,26 +908,27 @@ async function runStructuredDealCreateWorkflow(input) {
       createHubSpotAssociation('deals', dealId, 'companies', companyId, TRUEWIND_HUBSPOT.dealToCompanyAssociationTypeId),
     ]);
 
-    const noteLines = [
-      input.type ? `Type: ${input.type}` : '',
-      input.meeting_booked ? `Meeting booked for: ${input.meeting_booked}` : '',
-      input.notes ? `Notes: ${input.notes}` : '',
-    ].filter(Boolean);
-    if (noteLines.length) {
-      await createStructuredDealNote({
-        dealId,
-        contactId,
-        companyId,
-        body: noteLines.join('<br>'),
-      }).catch((err) => {
+    let noteSummary = null;
+    const noteBody = buildDealNoteBody(input);
+    if (noteBody) {
+      try {
+        const note = await createStructuredDealNote({
+          dealId,
+          contactId,
+          companyId,
+          body: noteBody,
+        });
+        noteSummary = note?.id ? { id: String(note.id) } : { error: 'HubSpot note create succeeded but did not return a note ID' };
+      } catch (err) {
         console.error(`Structured deal note create failed: ${err.message}`);
-      });
+        noteSummary = { error: err.message };
+      }
     }
 
     const dealUrl = hubspotRecordUrl('0-3', dealId);
     const contactUrl = hubspotRecordUrl('0-1', contactId);
     const companyUrl = hubspotRecordUrl('0-2', companyId);
-    return [
+    const lines = [
       `:white_check_mark: Deal created: ${dealName}`,
       `Deal ID: ${dealId}`,
       `Deal link: ${dealUrl}`,
@@ -884,7 +936,13 @@ async function runStructuredDealCreateWorkflow(input) {
       `Contact link: ${contactUrl}`,
       `Company ID: ${companyId}`,
       `Company link: ${companyUrl}`,
-    ].join('\n');
+    ];
+    if (noteSummary?.id) {
+      lines.push(`Note added to deal: ${noteSummary.id}`);
+    } else if (noteSummary?.error) {
+      lines.push(`! Note was not added: ${noteSummary.error}`);
+    }
+    return lines.join('\n');
   } catch (err) {
     return `Error: ${err.message}\nNo completion claimed.${partial.dealId ? `\nDeal ID: ${partial.dealId}` : ''}${partial.contactId ? `\nContact ID: ${partial.contactId}` : ''}${partial.companyId ? `\nCompany ID: ${partial.companyId}` : ''}`;
   }
@@ -907,7 +965,7 @@ function formatProspectWorkflowResponse(summary) {
   const contactUrl = hubspotRecordUrl('0-1', summary.contact.id);
   const dealUrl = hubspotRecordUrl('0-3', summary.deal.id);
   const companyUrl = hubspotRecordUrl('0-2', summary.company.id);
-  return [
+  const lines = [
     linkedinLine,
     `✓ Contact created/updated: ${summary.contact.name}${title} at ${summary.company.name} (ID: ${summary.contact.id})`,
     `Contact link: ${contactUrl}`,
@@ -917,7 +975,13 @@ function formatProspectWorkflowResponse(summary) {
     `Company link: ${companyUrl}`,
     `✓ Owner: ${summary.owner.name} (${summary.owner.source})`,
     `✓ Lead source: ${summary.leadSource}`,
-  ].join('\n');
+  ];
+  if (summary.note?.id) {
+    lines.push(`✓ Note added to deal: ${summary.note.id}`);
+  } else if (summary.note?.error) {
+    lines.push(`! Note was not added: ${summary.note.error}`);
+  }
+  return lines.join('\n');
 }
 
 async function runTruewindHubSpotProspectWorkflow(input) {
@@ -936,6 +1000,7 @@ async function runTruewindHubSpotProspectWorkflow(input) {
   }
   const leadSource = input.lead_source || deduceLeadSource(context);
   const erp = input.erp || '';
+  const noteBody = buildDealNoteBody(input);
 
   let linkedin = { found: false, candidates: [] };
   if (input.linkedin_url) {
@@ -1040,6 +1105,22 @@ async function runTruewindHubSpotProspectWorkflow(input) {
     await createHubSpotAssociation('deals', dealId, 'contacts', contactId, TRUEWIND_HUBSPOT.dealToContactAssociationTypeId);
     await createHubSpotAssociation('deals', dealId, 'companies', companyId, TRUEWIND_HUBSPOT.dealToCompanyAssociationTypeId);
 
+    let noteSummary = null;
+    if (noteBody) {
+      try {
+        const note = await createStructuredDealNote({
+          dealId,
+          contactId,
+          companyId,
+          body: noteBody,
+        });
+        noteSummary = note?.id ? { id: String(note.id) } : { error: 'HubSpot note create succeeded but did not return a note ID' };
+      } catch (err) {
+        console.error(`Prospect deal note create failed: ${err.message}`);
+        noteSummary = { error: err.message };
+      }
+    }
+
     const conversionProps = { hs_lead_status: TRUEWIND_HUBSPOT.convertedLeadStatus };
     if (shouldSetLifecycleToOpportunity(existingContact?.properties?.lifecyclestage)) {
       conversionProps.lifecyclestage = 'opportunity';
@@ -1069,6 +1150,7 @@ async function runTruewindHubSpotProspectWorkflow(input) {
       },
       owner,
       leadSource,
+      note: noteSummary,
     });
   } catch (err) {
     return formatWorkflowError(err, partial);
@@ -1194,7 +1276,7 @@ const TOOLS = [
   },
   {
     name: 'hubspot_push_truewind_prospect',
-    description: 'End-to-end Truewind HubSpot workflow. Use this when asked to push/add/create a prospect, lead, opportunity, or new deal in HubSpot. It requires email, enriches LinkedIn via Firecrawl, creates/updates contact first, creates the MQL deal, creates all required associations, sets contact lifecycle to opportunity and lead status internal value MQL, and returns exact IDs.',
+    description: 'End-to-end Truewind HubSpot workflow. Use this when asked to push/add/create a prospect, lead, opportunity, or new deal in HubSpot. It requires email, enriches LinkedIn via Firecrawl, creates/updates contact first, creates the MQL deal, creates all required associations, creates a HubSpot note associated to the deal/contact/company when notes are supplied, sets contact lifecycle to opportunity and lead status internal value MQL, and returns exact IDs.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1210,6 +1292,9 @@ const TOOLS = [
         linkedin_url: { type: 'string', description: 'Optional LinkedIn profile URL if the user already supplied it or selected a disambiguated match.' },
         erp: { type: 'string', description: 'Optional ERP value. Leave unset unless specified.' },
         lead_source: { type: 'string', description: 'Optional lead source only if explicitly known. Otherwise the tool deduces it from context.' },
+        type: { type: 'string', description: 'Optional deal/prospect type if specified by the user. Included in the HubSpot note when present.' },
+        meeting_booked: { type: 'string', description: 'Optional meeting booked date/time text if specified by the user. Included in the HubSpot note when present.' },
+        notes: { type: 'string', description: 'Optional notes from the user request. Pass the full note text exactly; the workflow creates a HubSpot note associated to the deal, contact, and company.' },
         amount: { type: 'number', description: 'Optional deal amount if specified.' },
         closedate: { type: 'string', description: 'Optional close date if specified, in HubSpot-compatible date format.' },
       },
@@ -1573,6 +1658,7 @@ Rules enforced by the backend tool:
 - Company is required, but the tool can infer it from LinkedIn or a non-generic email domain. Only ask if the tool says company is unclear.
 - The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to lifecycle opportunity and lead status internal value MQL (HubSpot label Converted).
 - Pass the full Slack request/thread in the context field so the backend can deduce lead source.
+- If the request includes notes, referral context, meeting-booked text, or deal/prospect type, pass notes, meeting_booked, and type into hubspot_push_truewind_prospect. The backend creates a HubSpot note object associated to the deal, contact, and company and reports the note ID or exact note error.
 - Pass channel_id and slack_user_id from Slack metadata on every HubSpot write tool call. The backend uses them for HubSpot write authorization and owner mapping. If the user explicitly names an owner, pass owner_name; explicit owner_name overrides Slack owner mapping. Otherwise it looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
 - Never ask for deal stage, owner, ERP, name/title, or lead source unless the backend tool explicitly needs clarification.
 - Never say done without actual record IDs from the tool result. If the tool fails, show the exact error. Do not summarize unrelated earlier thread or channel messages as completed work.
@@ -2911,9 +2997,11 @@ if (require.main === module) {
 
 module.exports = {
   TRUEWIND_HUBSPOT,
+  buildDealNoteBody,
   compactProperties,
   deduceLeadSource,
   executeTool,
+  extractStructuredBlockField,
   formatProspectWorkflowResponse,
   formatWorkflowError,
   getSlackMetadata,

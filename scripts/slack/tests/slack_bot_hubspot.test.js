@@ -13,8 +13,10 @@ process.env.SLACK_TO_HUBSPOT_OWNER_JSON = JSON.stringify({
 
 const {
   TRUEWIND_HUBSPOT,
+  buildDealNoteBody,
   deduceLeadSource,
   executeTool,
+  extractStructuredBlockField,
   formatProspectWorkflowResponse,
   hubspotPropertyCache,
   hubspotRecordUrl,
@@ -132,6 +134,35 @@ Email: <mailto:drana@thinkscan.ai|drana@thinkscan.ai>`);
   assert.strictEqual(parseStructuredDealRequest('create a new deal once we have details'), null);
 }
 
+function testStructuredNotesCanBeMultiline() {
+  const parsed = parseStructuredDealRequest(`create a new deal in S1
+Company: ThinkScan
+Contact: Deepak Rana
+Email: drana@thinkscan.ai
+Notes:
+a former customer Mike Ricci at Spect is an advisor.
+He referred them to Truewind.
+Source: Referral`);
+
+  assert.strictEqual(parsed.notes, 'a former customer Mike Ricci at Spect is an advisor.\nHe referred them to Truewind.');
+  assert.strictEqual(parsed.lead_source, 'Referral');
+  assert.strictEqual(
+    extractStructuredBlockField('Notes: first line\nsecond line\nLinkedIn: https://linkedin.com/in/example', 'Notes', ['Company', 'LinkedIn']),
+    'first line\nsecond line',
+  );
+}
+
+function testDealNoteBodyEscapesAndIncludesFields() {
+  assert.strictEqual(
+    buildDealNoteBody({
+      type: 'direct services',
+      meeting_booked: 'Monday May 18',
+      notes: 'Mike said "use <Truewind>"\nSecond line & detail',
+    }),
+    'Type: direct services<br>Meeting booked for: Monday May 18<br>Notes: Mike said &quot;use &lt;Truewind&gt;&quot;<br>Second line &amp; detail',
+  );
+}
+
 async function testExplicitOwnerOverridesSlackMapping() {
   const owner = resolveHubSpotOwner({ slack_user_id: 'U_TEST', owner_name: 'Mercedes' });
   assert.deepStrictEqual(owner, { id: '87811681', name: 'Mercedes Chien', source: 'explicit owner' });
@@ -167,11 +198,24 @@ function testProspectWorkflowResponseIncludesHubSpotLinks() {
     deal: { id: '60316278406', name: 'ThinkScan - New Deal', created: true },
     owner: { name: 'Xavier Marco', source: 'explicit owner' },
     leadSource: 'Referral',
+    note: { id: '12345' },
   });
 
   assert.match(response, /Deal link: https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-3\/60316278406/);
   assert.match(response, /Contact link: https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-1\/221459934275/);
   assert.match(response, /Company link: https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-2\/54941778205/);
+  assert.match(response, /Note added to deal: 12345/);
+
+  const failedNoteResponse = formatProspectWorkflowResponse({
+    linkedinUrl: '',
+    contact: { id: '221459934275', name: 'Deepak Rana', jobtitle: '' },
+    company: { id: '54941778205', name: 'ThinkScan', created: false },
+    deal: { id: '60316278406', name: 'ThinkScan - New Deal', created: true },
+    owner: { name: 'Xavier Marco', source: 'explicit owner' },
+    leadSource: 'Referral',
+    note: { error: 'HubSpot 403: missing scope' },
+  });
+  assert.match(failedNoteResponse, /! Note was not added: HubSpot 403: missing scope/);
 }
 
 async function run() {
@@ -180,6 +224,8 @@ async function run() {
   await testLowLevelHubSpotWritesRequireAuthorization();
   await testReadOnlyDefinitionDoesNotBlockWritableStandardFields();
   testStructuredDealRequestParser();
+  testStructuredNotesCanBeMultiline();
+  testDealNoteBodyEscapesAndIncludesFields();
   await testExplicitOwnerOverridesSlackMapping();
   testLeadSourceDefaultsToOutbound();
   testProspectWorkflowResponseIncludesHubSpotLinks();

@@ -19,6 +19,7 @@ const {
   executeTool,
   extractStructuredBlockField,
   formatProspectWorkflowResponse,
+  hubspotPrimaryAssociatedRecordUrl,
   hubspotPropertyCache,
   hubspotRecordUrl,
   isHubSpotWriteAuthorized,
@@ -208,6 +209,19 @@ function testProspectWorkflowResponseIncludesHubSpotLinks() {
     hubspotRecordUrl('0-3', '60316278406'),
     'https://app.hubspot.com/contacts/43974586/record/0-3/60316278406',
   );
+  assert.strictEqual(
+    hubspotPrimaryAssociatedRecordUrl({
+      dealId: '60316278406',
+      contactId: '221459934275',
+      companyId: '54941778205',
+    }),
+    'https://app.hubspot.com/contacts/43974586/record/0-3/60316278406',
+  );
+  assert.strictEqual(
+    hubspotPrimaryAssociatedRecordUrl({ contactId: '221459934275', companyId: '54941778205' }),
+    'https://app.hubspot.com/contacts/43974586/record/0-1/221459934275',
+  );
+  assert.strictEqual(hubspotPrimaryAssociatedRecordUrl({}), '');
 
   const response = formatProspectWorkflowResponse({
     linkedinUrl: '',

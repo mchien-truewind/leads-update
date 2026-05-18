@@ -214,6 +214,13 @@ function hubspotRecordUrl(objectTypeId, objectId) {
   return `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/${objectTypeId}/${objectId}`;
 }
 
+function hubspotPrimaryAssociatedRecordUrl({ dealId, contactId, companyId } = {}) {
+  if (dealId) return hubspotRecordUrl('0-3', dealId);
+  if (contactId) return hubspotRecordUrl('0-1', contactId);
+  if (companyId) return hubspotRecordUrl('0-2', companyId);
+  return '';
+}
+
 async function httpRequest(url, options = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
@@ -1402,7 +1409,7 @@ const TOOLS = [
   },
   {
     name: 'hubspot_create_note',
-    description: 'Create a HubSpot note and associate it to an existing deal, contact, and/or company. Use this when the user asks to add notes to an existing HubSpot record.',
+    description: 'Create a HubSpot note and associate it to an existing deal, contact, and/or company. Use this when the user asks to add notes to an existing HubSpot record. HubSpot notes do not have reliable standalone record URLs, so return the attached record URL instead.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1581,10 +1588,17 @@ async function executeTool(name, input = {}) {
         body: escapeHubSpotNoteText(input.body).replace(/\r?\n/g, '<br>'),
       });
       const noteId = requireHubSpotObjectId(note, 'HubSpot note create');
+      const attachedRecordUrl = hubspotPrimaryAssociatedRecordUrl({
+        dealId: input.deal_id,
+        contactId: input.contact_id,
+        companyId: input.company_id,
+      });
       return JSON.stringify({
         id: noteId,
         hubspot_id: noteId,
-        url: hubspotRecordUrl('0-46', noteId),
+        url: attachedRecordUrl,
+        attached_record_url: attachedRecordUrl,
+        url_note: 'HubSpot notes are activities on CRM records; open the attached record URL to view the note.',
         deal_id: input.deal_id || '',
         contact_id: input.contact_id || '',
         company_id: input.company_id || '',
@@ -1693,7 +1707,7 @@ Daily progress notification counts are based on HubSpot deal records in pipeline
 When the current message itself is a structured request to create a new deal with fields like Company, Contact, Email, Deal owner, Source, Meeting booked, and Notes, the backend handles it directly before Claude runs. If you are responding after that flow, only relay the tool's concrete ID/link result. Do not add unrelated thread summaries.
 
 When someone asks you to add, push, create, or update a prospect/lead/opportunity/deal in HubSpot, use hubspot_push_truewind_prospect. Do not manually chain the low-level HubSpot write tools unless the user asks for a custom one-off update.
-When someone asks you to add a note to an existing HubSpot deal/contact/company, use hubspot_create_note. If they give a company or deal name instead of an ID, search HubSpot first, choose the unambiguous matching record, then call hubspot_create_note with the matching record ID. Never say you lack a note tool; hubspot_create_note is available.
+When someone asks you to add a note to an existing HubSpot deal/contact/company, use hubspot_create_note. If they give a company or deal name instead of an ID, search HubSpot first, choose the unambiguous matching record, then call hubspot_create_note with the matching record ID. Never say you lack a note tool; hubspot_create_note is available. Do not invent or share standalone note record URLs. HubSpot notes are activities on CRM records, so share the attached deal/contact/company record URL returned by the tool.
 
 Rules enforced by the backend tool:
 - Contact first, deal second. Contact is the anchor record.
@@ -3061,6 +3075,7 @@ module.exports = {
   formatProspectWorkflowResponse,
   formatWorkflowError,
   getSlackMetadata,
+  hubspotPrimaryAssociatedRecordUrl,
   hubspotPropertyCache,
   hubspotRecordUrl,
   isHubSpotWriteAuthorized,

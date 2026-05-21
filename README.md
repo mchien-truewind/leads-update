@@ -138,6 +138,55 @@ Notes:
 - It posts with the same message format used in local runs.
 - The local fallback uses Slack keyword counts, so Unknown is always `0` there; production HubSpot counts include blank and nonmatching `deal_source` values in Unknown.
 
+## Daily HubSpot Lead Status Sync (Railway)
+
+The Railway Slack bot also runs a daily HubSpot contact sync for list `694` (`[GTM Team] All Open Leads`) at 7:30 PM Pacific and posts a summary to `#slack-testing`.
+
+The sync is deterministic and does not call an LLM. Daily incremental runs search recent HubSpot activity timestamp fields with a 28-hour lookback, intersect those contacts with list `694`, then inspect only allowed contact engagements for those candidates. Allowed touchpoints are outbound `EMAIL`, outbound `CALL`, `MEETING`, and `TASK` engagements owned by the configured BDRs or sent from configured BDR emails. Segment/list membership changes do not count as touchpoints. Full-list mode is available by manual trigger, or by setting an optional weekly full-run weekday.
+
+Status rules:
+- New: `No one has contacted them` when there is no counted outreach activity.
+- Working: `Has contacted but no response` when BDR touchpoints exist and no reply signal exists.
+- Nurturing: `has contacted & responded` when a reply or meeting-booked signal exists.
+- Disqualified: `Disqualified (all)` when deterministic disqualification signals exist; `disqualified_reasons` is preserved or backfilled.
+- Protected statuses are not overwritten: `MQL`, existing disqualified contacts, and customer/opportunity/evangelist lifecycle contacts.
+
+Required env:
+
+```sh
+SLACK_BOT_TOKEN=xoxb-...
+HUBSPOT_PRIVATE_TOKEN=...
+LEAD_STATUS_SYNC_TRIGGER_SECRET=...
+```
+
+Optional overrides:
+
+```sh
+LEAD_STATUS_SYNC_TARGET_CHANNEL=slack-testing
+LEAD_STATUS_SYNC_LIST_ID=694
+LEAD_STATUS_SYNC_LOOKBACK_HOURS=28
+LEAD_STATUS_SYNC_TOUCHPOINT_DAYS=90
+LEAD_STATUS_SYNC_BDR_OWNER_IDS=84547076,89305622,91143842,91143844
+LEAD_STATUS_SYNC_BDR_EMAILS=sarah@trytruewind.com,xavier@trytruewind.com,jenilee@trytruewind.com,brendan@trytruewind.com
+LEAD_STATUS_SYNC_TARGET_HOUR=19
+LEAD_STATUS_SYNC_TARGET_MINUTE=30
+LEAD_STATUS_SYNC_WEEKLY_FULL_DAY=0  # optional; 0=Sunday, blank disables scheduled full runs
+```
+
+Manual dry run from Railway:
+
+```sh
+curl -H "x-lead-status-sync-token: $LEAD_STATUS_SYNC_TRIGGER_SECRET" \
+  "https://leads-update-production.up.railway.app/run-lead-status-sync?dryRun=1&skipSlack=1"
+```
+
+Manual full run:
+
+```sh
+curl -H "x-lead-status-sync-token: $LEAD_STATUS_SYNC_TRIGGER_SECRET" \
+  "https://leads-update-production.up.railway.app/run-lead-status-sync?mode=full"
+```
+
 ## Overnight Apollo Phone Enrichment (Webhook + Google Sheets)
 
 This runner submits Apollo `people/match` requests with `reveal_phone_number=true`, polls webhook callbacks, and continuously writes updates into a target sheet tab.

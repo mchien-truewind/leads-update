@@ -24,6 +24,9 @@ const {
   handleCalendlyHubSpotWebhook,
 } = require('./calendly_hubspot');
 const {
+  runLeadStatusSync,
+} = require('./lead_status_sync');
+const {
   buildDiscoveryDigestConfig,
   dedupeDigestMeetings,
   dedupeGrainRecordings,
@@ -2493,6 +2496,13 @@ const PROGRESS_TIMEZONE = 'America/Los_Angeles';
 const PROGRESS_TARGET_HOUR = 18;
 const PROGRESS_TARGET_MINUTE = 7;
 const PROGRESS_ALLOWED_WEEKDAY_INDEXES = new Set([0, 1, 2, 3, 4, 5]); // Sunday, Monday-Friday.
+const LEAD_STATUS_SYNC_TARGET_CHANNEL = process.env.LEAD_STATUS_SYNC_TARGET_CHANNEL || 'slack-testing';
+const LEAD_STATUS_SYNC_TRIGGER_SECRET = process.env.LEAD_STATUS_SYNC_TRIGGER_SECRET || PROGRESS_TRIGGER_SECRET || '';
+const LEAD_STATUS_SYNC_TARGET_HOUR = Number(process.env.LEAD_STATUS_SYNC_TARGET_HOUR || 19);
+const LEAD_STATUS_SYNC_TARGET_MINUTE = Number(process.env.LEAD_STATUS_SYNC_TARGET_MINUTE || 30);
+const LEAD_STATUS_SYNC_WEEKLY_FULL_DAY = String(process.env.LEAD_STATUS_SYNC_WEEKLY_FULL_DAY || '').trim() === ''
+  ? null
+  : Number(process.env.LEAD_STATUS_SYNC_WEEKLY_FULL_DAY);
 const PACIFIC_WEEKDAY_INDEX = {
   Sun: 0,
   Mon: 1,
@@ -2838,6 +2848,20 @@ function isAuthorizedProgressTrigger(reqUrl, headers = {}) {
     && crypto.timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
+function isAuthorizedLeadStatusSyncTrigger(reqUrl, headers = {}) {
+  if (!LEAD_STATUS_SYNC_TRIGGER_SECRET) return false;
+
+  const params = new URL(reqUrl, 'http://localhost').searchParams;
+  const provided = params.get('token')
+    || headers['x-lead-status-sync-token']
+    || headers['x-lead-report-token']
+    || '';
+  const expectedBuffer = Buffer.from(LEAD_STATUS_SYNC_TRIGGER_SECRET);
+  const providedBuffer = Buffer.from(String(provided));
+  return providedBuffer.length === expectedBuffer.length
+    && crypto.timingSafeEqual(providedBuffer, expectedBuffer);
+}
+
 async function runDailyProgress(channelOverride, options = {}) {
   const force = Boolean(options.force);
   const allowDuplicate = Boolean(options.allowDuplicate);
@@ -2960,6 +2984,110 @@ function scheduleDailyProgress() {
   scheduleNext();
 }
 
+function parseHubSpotFetchBody(options = {}) {
+  if (!options.body) return null;
+  if (typeof options.body === 'string') return JSON.parse(options.body);
+  return options.body;
+}
+
+async function hubspotRequestFromFetchOptions(endpoint, options = {}) {
+  return hubspotRequest(endpoint, options.method || 'GET', parseHubSpotFetchBody(options));
+}
+
+async function postLeadStatusSyncMessage(text, channelName = LEAD_STATUS_SYNC_TARGET_CHANNEL) {
+  const targetId = await resolveChannelId(channelName);
+  if (!targetId) throw new Error(`Channel not found: #${channelName}`);
+
+  await app.client.chat.postMessage({
+    token: process.env.SLACK_BOT_TOKEN,
+    channel: targetId,
+    text,
+  });
+}
+
+async function runLeadStatusSyncForSlack(options = {}) {
+  const stats = await runLeadStatusSync({
+    ...options,
+    targetChannel: options.targetChannel || LEAD_STATUS_SYNC_TARGET_CHANNEL,
+    hubspot: options.hubspot || hubspotRequestFromFetchOptions,
+    postSlackMessage: options.postSlackMessage || postLeadStatusSyncMessage,
+    logger: console,
+  });
+
+  console.log(
+    `Lead status sync: mode=${stats.mode} candidates=${stats.candidateCount} `
+    + `updates=${stats.updatedContacts} status=${stats.statusUpdates} `
+    + `touchpoints=${stats.touchpointUpdates} errors=${stats.errors}`,
+  );
+  return stats;
+}
+
+function getNextLeadStatusSyncRun(referenceDate = new Date()) {
+  const currentPacific = getPacificParts(referenceDate);
+  let nextDate = {
+    year: currentPacific.year,
+    month: currentPacific.month,
+    day: currentPacific.day,
+  };
+  let nextRunUtc = pacificLocalToUtcDate(
+    nextDate.year,
+    nextDate.month,
+    nextDate.day,
+    LEAD_STATUS_SYNC_TARGET_HOUR,
+    LEAD_STATUS_SYNC_TARGET_MINUTE,
+    0,
+  );
+
+  if (nextRunUtc <= referenceDate) {
+    nextDate = shiftPacificDate(nextDate, 1);
+    nextRunUtc = pacificLocalToUtcDate(
+      nextDate.year,
+      nextDate.month,
+      nextDate.day,
+      LEAD_STATUS_SYNC_TARGET_HOUR,
+      LEAD_STATUS_SYNC_TARGET_MINUTE,
+      0,
+    );
+  }
+
+  return { nextDate, nextRunUtc };
+}
+
+function leadStatusSyncModeForDate(date = new Date()) {
+  return LEAD_STATUS_SYNC_WEEKLY_FULL_DAY != null
+    && getPacificParts(date).weekdayIndex === LEAD_STATUS_SYNC_WEEKLY_FULL_DAY
+    ? 'full'
+    : 'incremental';
+}
+
+function scheduleLeadStatusSync() {
+  const scheduleNext = () => {
+    const { nextDate, nextRunUtc } = getNextLeadStatusSyncRun();
+    const delayMs = Math.max(nextRunUtc.getTime() - Date.now(), 1000);
+    setTimeout(async () => {
+      try {
+        await runLeadStatusSyncForSlack({ mode: leadStatusSyncModeForDate(new Date()) });
+      } catch (err) {
+        console.error('Lead status sync scheduled run failed:', err.message);
+        try {
+          await postLeadStatusSyncMessage(`Lead status sync failed: ${err.message}`);
+        } catch (slackErr) {
+          console.error('Lead status sync failure Slack post failed:', slackErr.message);
+        }
+      }
+      scheduleNext();
+    }, delayMs);
+    console.log(
+      `  Lead status sync scheduled, next run: ${nextRunUtc.toISOString()} `
+      + `(${nextDate.month}/${nextDate.day}/${String(nextDate.year).slice(-2)} `
+      + `${String(LEAD_STATUS_SYNC_TARGET_HOUR).padStart(2, '0')}:`
+      + `${String(LEAD_STATUS_SYNC_TARGET_MINUTE).padStart(2, '0')} PT)`,
+    );
+  };
+
+  scheduleNext();
+}
+
 function startHttpServer() {
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = process.env.PORT || 3000;
@@ -3014,6 +3142,28 @@ function startHttpServer() {
       res.end('Daily progress triggered');
       return;
     }
+    if (req.url.split('?')[0] === '/run-lead-status-sync') {
+      const qs = new URL(req.url, 'http://localhost').searchParams;
+      if (!isAuthorizedLeadStatusSyncTrigger(req.url, req.headers)) {
+        res.writeHead(401);
+        res.end('unauthorized');
+        return;
+      }
+      try {
+        const stats = await runLeadStatusSyncForSlack({
+          mode: qs.get('mode') === 'full' ? 'full' : 'incremental',
+          dryRun: qs.get('dryRun') === '1' || qs.get('dryRun') === 'true',
+          skipSlack: qs.get('skipSlack') === '1' || qs.get('skipSlack') === 'true',
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+      } catch (err) {
+        console.error('Lead status sync manual trigger failed:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
     res.writeHead(200);
     res.end('ok');
   }).listen(PORT, () => {
@@ -3049,6 +3199,7 @@ async function startSlackBot() {
   // Schedule daily discovery digest and HubSpot deal progress only after Slack is connected.
   scheduleDiscoveryDigest();
   scheduleDailyProgress();
+  scheduleLeadStatusSync();
 
   // Manual CLI trigger is handled before socket mode starts so it posts once and exits.
 }
@@ -3083,6 +3234,7 @@ module.exports = {
   normalizeHubSpotPropertyValue,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
+  runLeadStatusSyncForSlack,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
   runStructuredDealCreateWorkflow,

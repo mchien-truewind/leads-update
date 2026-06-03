@@ -138,6 +138,46 @@ Notes:
 - It posts with the same message format used in local runs.
 - The local fallback uses Slack keyword counts, so Unknown is always `0` there; production HubSpot counts include blank and nonmatching `deal_source` values in Unknown.
 
+## Daily HubSpot MQL Discovery Report (Railway)
+
+The Railway Slack bot posts a read-only HubSpot deal report at 6:00 PM Pacific. It scopes to deals in Active Pipeline `105321581`, uses Stage 1 MQL `1307720553`, reads `hs_next_meeting_start_time`, and uses `hs_v2_date_entered_1307720553` plus `hs_v2_date_exited_1307720553` to identify deals that were MQL at 00:00 PT.
+
+The report includes:
+- Current MQL deals whose next meeting is on the next business day.
+- Today's discovery-call cohort grouped by current outcome: still MQL, advanced open stage, closed won, closed lost, rescheduled/future meeting, missing next meeting time, or other.
+- Data quality notes when next meeting time changed/blanked or MQL history is insufficient.
+
+Required env:
+
+```sh
+SLACK_BOT_TOKEN=xoxb-...
+HUBSPOT_PRIVATE_TOKEN=...
+MQL_DISCOVERY_REPORT_TRIGGER_SECRET=...
+```
+
+Optional overrides:
+
+```sh
+MQL_DISCOVERY_REPORT_TARGET_CHANNEL=slack-testing
+MQL_DISCOVERY_REPORT_TARGET_HOUR=18
+MQL_DISCOVERY_REPORT_TARGET_MINUTE=0
+HUBSPOT_PORTAL_ID=43974586
+```
+
+Manual dry run from Railway:
+
+```sh
+curl -H "x-mql-discovery-report-token: $MQL_DISCOVERY_REPORT_TRIGGER_SECRET" \
+  "https://leads-update-production.up.railway.app/run-mql-discovery-report?skipSlack=1"
+```
+
+Manual Slack post:
+
+```sh
+curl -H "x-mql-discovery-report-token: $MQL_DISCOVERY_REPORT_TRIGGER_SECRET" \
+  "https://leads-update-production.up.railway.app/run-mql-discovery-report"
+```
+
 ## Daily HubSpot Lead Status Sync (Railway)
 
 The Railway Slack bot also runs a daily HubSpot contact sync for list `694` (`[GTM Team] All Open Leads`) at 7:30 PM Pacific and posts a summary to `#slack-testing`.

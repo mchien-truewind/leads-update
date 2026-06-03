@@ -27,6 +27,10 @@ const {
   runLeadStatusSync,
 } = require('./lead_status_sync');
 const {
+  buildMqlDiscoveryReport,
+  formatMqlDiscoveryReport,
+} = require('./mql_discovery_report');
+const {
   buildDiscoveryDigestConfig,
   dedupeDigestMeetings,
   dedupeGrainRecordings,
@@ -4150,6 +4154,10 @@ const LEAD_STATUS_SYNC_TARGET_MINUTE = Number(process.env.LEAD_STATUS_SYNC_TARGE
 const LEAD_STATUS_SYNC_WEEKLY_FULL_DAY = String(process.env.LEAD_STATUS_SYNC_WEEKLY_FULL_DAY || '').trim() === ''
   ? null
   : Number(process.env.LEAD_STATUS_SYNC_WEEKLY_FULL_DAY);
+const MQL_DISCOVERY_REPORT_TARGET_CHANNEL = process.env.MQL_DISCOVERY_REPORT_TARGET_CHANNEL || 'slack-testing';
+const MQL_DISCOVERY_REPORT_TRIGGER_SECRET = process.env.MQL_DISCOVERY_REPORT_TRIGGER_SECRET || PROGRESS_TRIGGER_SECRET || '';
+const MQL_DISCOVERY_REPORT_TARGET_HOUR = Number(process.env.MQL_DISCOVERY_REPORT_TARGET_HOUR || 18);
+const MQL_DISCOVERY_REPORT_TARGET_MINUTE = Number(process.env.MQL_DISCOVERY_REPORT_TARGET_MINUTE || 0);
 const PACIFIC_WEEKDAY_INDEX = {
   Sun: 0,
   Mon: 1,
@@ -4509,6 +4517,20 @@ function isAuthorizedLeadStatusSyncTrigger(reqUrl, headers = {}) {
     && crypto.timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
+function isAuthorizedMqlDiscoveryReportTrigger(reqUrl, headers = {}) {
+  if (!MQL_DISCOVERY_REPORT_TRIGGER_SECRET) return false;
+
+  const params = new URL(reqUrl, 'http://localhost').searchParams;
+  const provided = params.get('token')
+    || headers['x-mql-discovery-report-token']
+    || headers['x-lead-report-token']
+    || '';
+  const expectedBuffer = Buffer.from(MQL_DISCOVERY_REPORT_TRIGGER_SECRET);
+  const providedBuffer = Buffer.from(String(provided));
+  return providedBuffer.length === expectedBuffer.length
+    && crypto.timingSafeEqual(providedBuffer, expectedBuffer);
+}
+
 async function runDailyProgress(channelOverride, options = {}) {
   const force = Boolean(options.force);
   const allowDuplicate = Boolean(options.allowDuplicate);
@@ -4669,6 +4691,94 @@ async function runLeadStatusSyncForSlack(options = {}) {
   return stats;
 }
 
+async function postMqlDiscoveryReport(options = {}) {
+  const report = await buildMqlDiscoveryReport(hubspotRequest, {
+    portalId: HUBSPOT_PORTAL_ID,
+    now: options.now || new Date(),
+  });
+  const text = formatMqlDiscoveryReport(report);
+
+  if (!options.skipSlack) {
+    const channelName = options.channel || MQL_DISCOVERY_REPORT_TARGET_CHANNEL;
+    const targetId = await resolveChannelId(channelName);
+    if (!targetId) throw new Error(`Channel not found: #${channelName}`);
+    await app.client.chat.postMessage({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel: targetId,
+      text,
+    });
+    console.log(`MQL discovery report: posted to #${channelName}`);
+  }
+
+  return {
+    generatedAt: report.generatedAt,
+    today: report.today,
+    nextBusinessDay: report.nextBusinessDay,
+    currentMqlNextBusinessDayCount: report.currentNextBusinessDayMqlDeals.length,
+    todaysCallCount: report.todaysCallDeals.length,
+    mqlAtStartCount: report.mqlAtStartCount,
+    outcomeCounts: Object.fromEntries(
+      Object.entries(report.outcomes).map(([key, deals]) => [key, deals.length]),
+    ),
+    dataQualityNoteCount: report.dataQualityNotes.length,
+    text,
+  };
+}
+
+function getNextMqlDiscoveryReportRun(referenceDate = new Date()) {
+  const currentPacific = getPacificParts(referenceDate);
+  let nextDate = {
+    year: currentPacific.year,
+    month: currentPacific.month,
+    day: currentPacific.day,
+  };
+  let nextRunUtc = pacificLocalToUtcDate(
+    nextDate.year,
+    nextDate.month,
+    nextDate.day,
+    MQL_DISCOVERY_REPORT_TARGET_HOUR,
+    MQL_DISCOVERY_REPORT_TARGET_MINUTE,
+    0,
+  );
+
+  if (nextRunUtc <= referenceDate) {
+    nextDate = shiftPacificDate(nextDate, 1);
+    nextRunUtc = pacificLocalToUtcDate(
+      nextDate.year,
+      nextDate.month,
+      nextDate.day,
+      MQL_DISCOVERY_REPORT_TARGET_HOUR,
+      MQL_DISCOVERY_REPORT_TARGET_MINUTE,
+      0,
+    );
+  }
+
+  return { nextDate, nextRunUtc };
+}
+
+function scheduleMqlDiscoveryReport() {
+  const scheduleNext = () => {
+    const { nextDate, nextRunUtc } = getNextMqlDiscoveryReportRun();
+    const delayMs = Math.max(nextRunUtc.getTime() - Date.now(), 1000);
+    setTimeout(async () => {
+      try {
+        await postMqlDiscoveryReport();
+      } catch (err) {
+        console.error('MQL discovery report scheduled run failed:', err.message);
+      }
+      scheduleNext();
+    }, delayMs);
+    console.log(
+      `  MQL discovery report scheduled, next run: ${nextRunUtc.toISOString()} `
+      + `(${nextDate.month}/${nextDate.day}/${String(nextDate.year).slice(-2)} `
+      + `${String(MQL_DISCOVERY_REPORT_TARGET_HOUR).padStart(2, '0')}:`
+      + `${String(MQL_DISCOVERY_REPORT_TARGET_MINUTE).padStart(2, '0')} PT)`,
+    );
+  };
+
+  scheduleNext();
+}
+
 function getNextLeadStatusSyncRun(referenceDate = new Date()) {
   const currentPacific = getPacificParts(referenceDate);
   let nextDate = {
@@ -4766,12 +4876,25 @@ function startHttpServer() {
       }
       return;
     }
-    if (req.url.startsWith('/run-digest')) {
+    if (req.url.split('?')[0] === '/run-mql-discovery-report') {
       const qs = new URL(req.url, 'http://localhost').searchParams;
-      const channel = qs.get('channel') || undefined;
-      runDiscoveryDigest(channel);
-      res.writeHead(200);
-      res.end(`Digest triggered${channel ? ` → #${channel}` : ''}`);
+      if (!isAuthorizedMqlDiscoveryReportTrigger(req.url, req.headers)) {
+        res.writeHead(401);
+        res.end('unauthorized');
+        return;
+      }
+      try {
+        const stats = await postMqlDiscoveryReport({
+          channel: qs.get('channel') || undefined,
+          skipSlack: qs.get('skipSlack') === '1' || qs.get('skipSlack') === 'true',
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+      } catch (err) {
+        console.error('MQL discovery report manual trigger failed:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
       return;
     }
     if (req.url.split('?')[0] === '/run-daily-progress') {
@@ -4820,9 +4943,11 @@ function startHttpServer() {
 }
 
 async function startSlackBot() {
-  const shouldRunDigestCli = process.argv.includes('--run-digest');
-  if (shouldRunDigestCli) {
-    await runDiscoveryDigest();
+  const shouldRunMqlDiscoveryReportCli = process.argv.includes('--run-mql-discovery-report');
+  if (shouldRunMqlDiscoveryReportCli) {
+    const skipSlack = process.argv.includes('--skip-slack');
+    const stats = await postMqlDiscoveryReport({ skipSlack });
+    if (skipSlack) console.log(stats.text);
     return;
   }
 
@@ -4839,12 +4964,11 @@ async function startSlackBot() {
   console.log(`  Google Sheets: ready`);
   console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
   console.log(`  Firecrawl: ${FIRECRAWL_API_KEY ? 'ready' : 'NOT CONFIGURED'}`);
-  console.log(`  Grain: ${GRAIN_API_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
 
   if (!slackStarted) return;
 
-  // Schedule daily discovery digest and HubSpot deal progress only after Slack is connected.
-  scheduleDiscoveryDigest();
+  // Schedule Slack posts only after Slack is connected.
+  scheduleMqlDiscoveryReport();
   scheduleDailyProgress();
   scheduleLeadStatusSync();
 
@@ -4905,6 +5029,7 @@ module.exports = {
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
+  postMqlDiscoveryReport,
   redactedToolInputForLog,
   resolveDealHubSpotOwner,
   runLeadStatusSyncForSlack,

@@ -220,6 +220,7 @@ class Config:
     gmail_query: str
     gmail_max_messages: int
     recruiter_sender_emails: set[str]
+    recruiter_sender_names: set[str]
     hiring_alias: str
     from_email: str
     proceed_template: str
@@ -514,6 +515,10 @@ def load_config() -> Config:
         recruiter_sender_emails=parse_csv_set(
             os.getenv("RECRUITING_RECRUITER_SENDER_EMAILS", ""),
             default="sam.k@hitruewind.com",
+        ),
+        recruiter_sender_names=parse_csv_set(
+            os.getenv("RECRUITING_RECRUITER_SENDER_NAMES", ""),
+            default="sam k,sam klein",
         ),
         hiring_alias=os.getenv("RECRUITING_HIRING_ALIAS", "").strip().lower(),
         from_email=from_email,
@@ -4442,6 +4447,7 @@ def backfill_missing_source_values(
     gmail_service: Any,
     *,
     recruiter_sender_emails: set[str],
+    recruiter_sender_names: set[str],
 ) -> int:
     properties_schema = database_schema.get("properties", {})
     if prop_map.source not in properties_schema:
@@ -4467,8 +4473,14 @@ def backfill_missing_source_values(
             except Exception:
                 thread = {}
             for message in sorted_thread_messages(thread):
-                sender_email = normalize_email(parseaddr(header_map(message).get("from", ""))[1])
-                if sender_is_recruiter_submission(sender_email, recruiter_sender_emails):
+                sender_name, sender_email = parseaddr(header_map(message).get("from", ""))
+                sender_email = normalize_email(sender_email)
+                if sender_is_recruiter_submission(
+                    sender_email,
+                    recruiter_sender_emails,
+                    sender_name=sender_name,
+                    recruiter_sender_names=recruiter_sender_names,
+                ):
                     source = SOURCE_SUPERPOSITION
                     break
 
@@ -4498,8 +4510,41 @@ def parse_candidate_from_message(
 EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 
 
-def sender_is_recruiter_submission(sender_email: str, recruiter_sender_emails: set[str]) -> bool:
-    return normalize_email(sender_email) in {normalize_email(item) for item in recruiter_sender_emails}
+def normalize_sender_name(value: str) -> str:
+    cleaned = clean_text(value).lower()
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    return clean_text(cleaned)
+
+
+def sender_is_recruiter_submission(
+    sender_email: str,
+    recruiter_sender_emails: set[str],
+    *,
+    sender_name: str = "",
+    recruiter_sender_names: set[str] | None = None,
+) -> bool:
+    if normalize_email(sender_email) in {normalize_email(item) for item in recruiter_sender_emails}:
+        return True
+    normalized_name = normalize_sender_name(sender_name)
+    if not normalized_name:
+        return False
+    normalized_recruiter_names = {normalize_sender_name(item) for item in (recruiter_sender_names or set())}
+    return normalized_name in normalized_recruiter_names
+
+
+def recruiter_sender_name_queries(recruiter_sender_names: set[str], max_messages: int) -> list[str]:
+    queries: list[str] = []
+    seen_tokens: set[str] = set()
+    for name in sorted(recruiter_sender_names):
+        normalized = normalize_sender_name(name)
+        if not normalized:
+            continue
+        first_token = normalized.split()[0]
+        if not first_token or first_token in seen_tokens:
+            continue
+        seen_tokens.add(first_token)
+        queries.append(f"from:({first_token})")
+    return queries[: max(1, max_messages)]
 
 
 def candidate_name_near_email(text: str, candidate_email: str) -> str:
@@ -4524,6 +4569,7 @@ def parse_recruiter_candidate_from_thread(
     thread: dict[str, Any],
     *,
     recruiter_sender_emails: set[str],
+    recruiter_sender_names: set[str],
     internal_domains: set[str],
 ) -> tuple[str, str, str, str] | None:
     messages = sorted_thread_messages(thread)
@@ -4531,11 +4577,20 @@ def parse_recruiter_candidate_from_thread(
         return None
 
     recruiter_messages: list[dict[str, Any]] = []
+    recruiter_message_sender_emails: set[str] = set()
     for message in messages:
         headers = header_map(message)
-        sender_email = normalize_email(parseaddr(headers.get("from", ""))[1])
-        if sender_is_recruiter_submission(sender_email, recruiter_sender_emails):
+        sender_name, sender_email = parseaddr(headers.get("from", ""))
+        sender_email = normalize_email(sender_email)
+        if sender_is_recruiter_submission(
+            sender_email,
+            recruiter_sender_emails,
+            sender_name=sender_name,
+            recruiter_sender_names=recruiter_sender_names,
+        ):
             recruiter_messages.append(message)
+            if sender_email:
+                recruiter_message_sender_emails.add(sender_email)
     if not recruiter_messages:
         return None
 
@@ -4544,7 +4599,7 @@ def parse_recruiter_candidate_from_thread(
     subject = headers.get("subject", "").strip()
     body = "\n".join(extract_message_body_text(item) for item in recruiter_messages)
     candidate_email = ""
-    excluded_emails = {normalize_email(item) for item in recruiter_sender_emails}
+    excluded_emails = {normalize_email(item) for item in recruiter_sender_emails} | recruiter_message_sender_emails
     for email in EMAIL_RE.findall(body):
         normalized = normalize_email(email)
         if normalized in excluded_emails:
@@ -4660,6 +4715,14 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
                 config.gmail_max_messages,
             )
         )
+    for query in recruiter_sender_name_queries(config.recruiter_sender_names, config.gmail_max_messages):
+        recruiter_messages.extend(
+            list_messages_matching_query(
+                gmail_service,
+                query,
+                config.gmail_max_messages,
+            )
+        )
     messages = merge_gmail_message_refs(labeled_messages, subject_messages, recruiter_messages)
 
     processed = 0
@@ -4688,10 +4751,22 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         if not thread_messages:
             skipped += 1
             continue
+        thread_recruiter_sender_emails: set[str] = set()
+        for message in thread_messages:
+            sender_name, sender_email = parseaddr(header_map(message).get("from", ""))
+            sender_email = normalize_email(sender_email)
+            if sender_is_recruiter_submission(
+                sender_email,
+                config.recruiter_sender_emails,
+                sender_name=sender_name,
+                recruiter_sender_names=config.recruiter_sender_names,
+            ):
+                thread_recruiter_sender_emails.add(sender_email)
 
         recruiter_candidate = parse_recruiter_candidate_from_thread(
             thread,
             recruiter_sender_emails=config.recruiter_sender_emails,
+            recruiter_sender_names=config.recruiter_sender_names,
             internal_domains=internal_domains,
         )
         ats_source = SOURCE_SUPERPOSITION if recruiter_candidate else SOURCE_INBOUND
@@ -4755,6 +4830,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
 
         if not candidate_email and resume_text:
             excluded_emails = {normalize_email(item) for item in config.recruiter_sender_emails}
+            excluded_emails |= thread_recruiter_sender_emails
             for email in EMAIL_RE.findall(resume_text):
                 normalized = normalize_email(email)
                 if normalized in excluded_emails:
@@ -4930,6 +5006,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         prop_map,
         gmail_service,
         recruiter_sender_emails=config.recruiter_sender_emails,
+        recruiter_sender_names=config.recruiter_sender_names,
     )
 
     if slack_enabled(config):
@@ -5998,6 +6075,7 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "gmail_query": config.gmail_query,
         "gmail_max_messages": config.gmail_max_messages,
         "recruiter_sender_emails": sorted(config.recruiter_sender_emails),
+        "recruiter_sender_names": sorted(config.recruiter_sender_names),
         "from_email": config.from_email,
         "drive_folder_id_configured": bool(config.drive_folder_id),
         "slack_enabled": slack_enabled(config),

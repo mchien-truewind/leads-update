@@ -5764,19 +5764,56 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                             reject_threads_archived += archived_count
                             reject_archive_failures += archive_failures
                         else:
-                            reject_drafts_auto_send_skipped_missing += 1
-                            notify_rejection_draft_issue(
-                                config,
-                                draft_id=reject_draft_id,
-                                issue_key="draft_send_failed",
-                                heading="Rejection draft send failed. Auto-send skipped.",
-                                candidate_name=candidate_name,
+                            verified_sent_at = thread_latest_manual_rejection_sent_at_any_thread(
+                                gmail_service,
+                                thread_ids=related_thread_ids,
+                                sender_email=config.from_email,
                                 candidate_email=candidate_email,
-                                details=[
-                                    "*Reason:* Gmail accepted the send request path but did not return a sent message ID.",
-                                ],
-                                notion_url=candidate_notion_url,
                             )
+                            sent_after_draft = bool(
+                                verified_sent_at
+                                and draft_created_at
+                                and verified_sent_at >= draft_created_at - timedelta(minutes=5)
+                            )
+                            if sent_after_draft:
+                                reject_drafts_auto_sent += 1
+                                current_status = "rejected"
+                                if prop.status in properties_schema:
+                                    update_payload[prop.status] = build_notion_value(
+                                        properties_schema[prop.status], STATUS_REJECTED
+                                    )
+                                if prop.reject_draft_id in properties_schema:
+                                    update_payload[prop.reject_draft_id] = build_notion_value(
+                                        properties_schema[prop.reject_draft_id], ""
+                                    )
+                                if prop.reject_send_at in properties_schema:
+                                    update_payload[prop.reject_send_at] = build_notion_value(
+                                        properties_schema[prop.reject_send_at], ""
+                                    )
+                                archive_labels = [hiring_label_id]
+                                if pipeline_label_id:
+                                    archive_labels.append(pipeline_label_id)
+                                archived_count, archive_failures = remove_labels_from_threads(
+                                    gmail_service,
+                                    thread_ids=related_thread_ids,
+                                    label_ids=archive_labels,
+                                )
+                                reject_threads_archived += archived_count
+                                reject_archive_failures += archive_failures
+                            else:
+                                reject_drafts_auto_send_skipped_missing += 1
+                                notify_rejection_draft_issue(
+                                    config,
+                                    draft_id=reject_draft_id,
+                                    issue_key="draft_send_failed",
+                                    heading="Rejection draft send failed. Auto-send skipped.",
+                                    candidate_name=candidate_name,
+                                    candidate_email=candidate_email,
+                                    details=[
+                                        "*Reason:* Gmail did not return a sent message ID, and no matching sent rejection email was found after the draft timestamp.",
+                                    ],
+                                    notion_url=candidate_notion_url,
+                                )
             elif not reject_send_at:
                 reject_send_at = decision_time + timedelta(hours=config.reject_delay_hours)
                 reject_scheduled += 1

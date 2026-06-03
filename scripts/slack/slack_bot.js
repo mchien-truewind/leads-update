@@ -2138,6 +2138,18 @@ function parseStructuredDealRequest(text) {
   };
 }
 
+function normalizeExplicitDealSource(input = {}) {
+  return String(input.deal_source || input.lead_source || input.source || '').trim();
+}
+
+function missingDealSourceMessage() {
+  return [
+    'Missing required deal source. No HubSpot deal was created.',
+    'Please provide the deal source before I create the deal.',
+    'Valid deal sources: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct.',
+  ].join('\n');
+}
+
 function splitFullName(name, email = '') {
   const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0) return parseNameFromEmail(email);
@@ -2196,6 +2208,10 @@ async function runStructuredDealCreateWorkflow(input) {
   if (!String(input.company || '').trim()) {
     return 'Error: missing Company. No HubSpot deal was created.';
   }
+  const leadSource = normalizeExplicitDealSource(input);
+  if (!leadSource) {
+    return `Error: ${missingDealSourceMessage()}`;
+  }
 
   const contactOwner = resolveHubSpotOwner({ context: input.context, slack_user_id: input.slack_user_id, channel_id: input.channel_id });
   const dealOwner = resolveDealHubSpotOwner(input, contactOwner);
@@ -2209,7 +2225,6 @@ async function runStructuredDealCreateWorkflow(input) {
     const nameParts = splitFullName(input.contact, email);
     const companyName = String(input.company || '').trim();
     const inferred = inferCompanyFromEmail(email);
-    const leadSource = input.lead_source || deduceLeadSource(input.context || input.notes || '');
 
     const existingContact = await findContactByEmail(email);
     let contactRes = existingContact;
@@ -2340,6 +2355,10 @@ async function runTruewindHubSpotProspectWorkflow(input) {
   }
 
   const context = input.context || input.context_text || input.notes || '';
+  const leadSource = normalizeExplicitDealSource(input);
+  if (!leadSource) {
+    return missingDealSourceMessage();
+  }
   const parsedName = parseNameFromEmail(email);
   const inferred = inferCompanyFromEmail(email);
   const contactOwner = await resolveRequesterHubSpotOwnerForProspect(input);
@@ -2348,7 +2367,6 @@ async function runTruewindHubSpotProspectWorkflow(input) {
   if (!authorization.authorized) {
     return `Not authorized to write to HubSpot: ${authorization.reason}. Ask an admin to set HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS or HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS, or map your Slack account to a HubSpot owner.`;
   }
-  const leadSource = input.lead_source || deduceLeadSource(context);
   const erp = input.erp || '';
   const noteBody = buildDealNoteBody(input);
 
@@ -2693,7 +2711,7 @@ const TOOLS = [
   },
   {
     name: 'hubspot_push_truewind_prospect',
-    description: 'End-to-end Truewind HubSpot workflow. Use this when asked to push/add/create a prospect, lead, opportunity, or new deal in HubSpot. It requires email, enriches LinkedIn via Firecrawl, creates/updates contact first, creates the MQL deal, creates all required associations, creates a HubSpot note associated to the deal/contact/company when notes are supplied, sets contact lifecycle to opportunity and lead status internal value MQL, and returns exact IDs.',
+    description: 'End-to-end Truewind HubSpot workflow. Use this when asked to push/add/create a prospect, lead, opportunity, or new deal in HubSpot. It requires email and explicit lead_source/deal source, enriches LinkedIn via Firecrawl, creates/updates contact first, creates the MQL deal, creates all required associations, creates a HubSpot note associated to the deal/contact/company when notes are supplied, sets contact lifecycle to opportunity and lead status internal value MQL, and returns exact IDs. If the user did not provide a source, ask for it before calling this tool.',
     input_schema: {
       type: 'object',
       properties: {
@@ -2708,14 +2726,14 @@ const TOOLS = [
         jobtitle: { type: 'string', description: 'Optional title if already known.' },
         linkedin_url: { type: 'string', description: 'Optional LinkedIn profile URL if the user already supplied it or selected a disambiguated match.' },
         erp: { type: 'string', description: 'Optional ERP value. Leave unset unless specified.' },
-        lead_source: { type: 'string', description: 'Optional lead source only if explicitly known. Otherwise the tool deduces it from context.' },
+        lead_source: { type: 'string', description: 'Required explicit lead/deal source from the user. Do not infer or default it. Valid values: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct.' },
         type: { type: 'string', description: 'Optional deal/prospect type if specified by the user. Included in the HubSpot note when present.' },
         meeting_booked: { type: 'string', description: 'Optional meeting booked date/time text if specified by the user. Included in the HubSpot note when present.' },
         notes: { type: 'string', description: 'Optional notes from the user request. Pass the full note text exactly; the workflow creates a HubSpot note associated to the deal, contact, and company.' },
         amount: { type: 'number', description: 'Optional deal amount if specified.' },
         closedate: { type: 'string', description: 'Optional close date if specified, in HubSpot-compatible date format.' },
       },
-      required: ['email'],
+      required: ['email', 'lead_source'],
     },
   },
   // --- HubSpot write tools ---
@@ -2762,23 +2780,24 @@ const TOOLS = [
   },
   {
     name: 'hubspot_create_deal',
-    description: 'Create a new deal in HubSpot. Active Pipeline ID is 105321581. Stages: MQL=1307720553, SQL=190380582, Full Product Demo=190380583, POC=190380586, Proposal=190380584, Won=1166230571, Closed/Lost=190380587.',
+    description: 'Create a new deal in HubSpot. Requires explicit deal_source from the user. If the user did not provide a source, ask for it before calling this tool. Active Pipeline ID is 105321581. Stages: MQL=1307720553, SQL=190380582, Full Product Demo=190380583, POC=190380586, Proposal=190380584, Won=1166230571, Closed/Lost=190380587.',
     input_schema: {
       type: 'object',
       properties: {
         dealname: { type: 'string', description: 'Deal name' },
         pipeline: { type: 'string', description: 'Pipeline ID (default: Active Pipeline 105321581)' },
         dealstage: { type: 'string', description: 'Stage ID' },
+        deal_source: { type: 'string', description: 'Required explicit deal source from the user. Do not infer or default it. Valid values: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct.' },
         amount: { type: 'number', description: 'Deal amount' },
         context: { type: 'string', description: 'Original Slack request/context for write authorization.' },
         channel_id: { type: 'string', description: 'Slack channel ID for write authorization.' },
         slack_user_id: { type: 'string', description: 'Slack user ID for write authorization.' },
         properties: {
           type: 'object',
-          description: 'Writable deal properties (e.g. hubspot_owner_id, closedate). Do not include HubSpot read-only/system fields such as hs_deal_stage_probability_shadow, notes_last_updated, or hs_object_source_detail_1.',
+          description: 'Writable deal properties (e.g. hubspot_owner_id, closedate). Do not include deal_source here; pass it as the top-level required deal_source field. Do not include HubSpot read-only/system fields such as hs_deal_stage_probability_shadow, notes_last_updated, or hs_object_source_detail_1.',
         },
       },
-      required: ['dealname', 'dealstage'],
+      required: ['dealname', 'dealstage', 'deal_source'],
     },
   },
   {
@@ -3076,9 +3095,14 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
       return JSON.stringify(formatHubSpotObjectResponse(res, '0-1'));
     }
     if (name === 'hubspot_create_deal') {
-      const props = { dealname: input.dealname, dealstage: input.dealstage, pipeline: input.pipeline || '105321581' };
+      const dealSource = normalizeExplicitDealSource(input);
+      if (!dealSource) {
+        return `Error: ${missingDealSourceMessage()}`;
+      }
+      const props = { dealname: input.dealname, dealstage: input.dealstage, pipeline: input.pipeline || '105321581', deal_source: dealSource };
       if (input.amount) props.amount = String(input.amount);
       if (input.properties) Object.assign(props, input.properties);
+      props.deal_source = dealSource;
       const validatedProps = await validateHubSpotProperties('deals', props);
       const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedProps });
       return JSON.stringify(formatHubSpotObjectResponse(res, '0-3'));
@@ -3315,22 +3339,19 @@ Deal recap output format:
 Rules enforced by the backend tool:
 - Contact first, deal second. Contact is the anchor record.
 - Email is required. If email is missing, ask for it.
+- Deal source is required for every new HubSpot deal. If the user does not provide a deal source/source, ask for it before creating or pushing the deal. Do not infer, deduce, or default deal source from context.
+- Valid deal source values are: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct.
 - Company is required, but the tool can infer it from LinkedIn or a non-generic email domain. Only ask if the tool says company is unclear.
 - The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to lifecycle opportunity and lead status internal value MQL (HubSpot label Converted).
-- Pass the full Slack request/thread in the context field so the backend can deduce lead source.
+- Pass the full Slack request/thread in the context field for write authorization and notes context, but pass the user's explicit source in lead_source/deal_source.
 - If the request includes notes, referral context, meeting-booked text, or deal/prospect type, pass notes, meeting_booked, and type into hubspot_push_truewind_prospect. The backend creates a HubSpot note object associated to the deal, contact, and company and reports the note ID or exact note error.
 - Pass channel_id and slack_user_id from Slack metadata on every HubSpot write tool call. The backend uses them for HubSpot write authorization and owner mapping. If the user explicitly names an owner, pass owner_name; explicit owner_name overrides Slack owner mapping. Otherwise it looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
-- Never ask for deal stage, owner, ERP, name/title, or lead source unless the backend tool explicitly needs clarification.
+- Never ask for deal stage, owner, ERP, or name/title unless the backend tool explicitly needs clarification. Always ask for deal source before deal creation when the user has not provided one.
 - Never say done without actual record IDs from the tool result. If the tool fails, show the exact error. Do not summarize unrelated earlier thread or channel messages as completed work.
 - Do not pass read-only HubSpot properties into low-level write tools. The backend validates properties before write and will reject system-managed fields such as hs_deal_stage_probability_shadow, notes_last_updated, and hs_object_source_detail_1.
 
-Lead source deduction:
-- "met at [conference/event]" -> Event
-- "reached out" or "contacted" -> Outbound - Sales Sourced List
-- "they contacted us" or "inbound" -> Self serve
-- "webinar" -> Webinar
-- "referred by" -> Referral
-- default -> Outbound - Sales Sourced List
+Deal source rule:
+- Never deduce or default deal source for a new HubSpot deal. If the user says "create/push/add a deal" without source, ask: "What deal source should I use? Valid options: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct."
 
 ## Recruiting calendar scheduling
 For recruiting pipeline questions in #hiring-review, use recruiting_list_outstanding_candidates. The recruiting/hiring candidate pipeline is the Notion ATS, not the HubSpot sales deal pipeline.

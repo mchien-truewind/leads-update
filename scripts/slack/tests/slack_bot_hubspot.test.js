@@ -40,6 +40,7 @@ const {
   notionPropValue,
   recruitingCalendarTitleFromCandidate,
   recruitingNotionPropertyMap,
+  normalizeHubSpotObjectTypeId,
   normalizeHubSpotOutcomeTracking,
   parseHubSpotAsOfBoundary,
   parseHubSpotDateBoundary,
@@ -321,6 +322,9 @@ function testDealNotesPromptAndTools() {
   assert.match(prompt, /The only source of truth for stage configuration is the real-time API response from hubspot_get_pipeline/);
   assert.match(prompt, /Critical HubSpot data freshness/);
   assert.match(prompt, /You MUST call the relevant HubSpot API for every HubSpot question/);
+  assert.match(prompt, /HubSpot record links/);
+  assert.match(prompt, /Deal disambiguation/);
+  assert.match(prompt, /Only ask for clarification if multiple open deals have similar recent activity/);
   assert.match(prompt, /hubspot_count_deals_entered_stage/);
   assert.match(prompt, /Do not use createdate, current dealstage only, or hs_date_entered_\{stageId\}/);
   assert.match(prompt, /true cohort conversion questions/);
@@ -955,6 +959,15 @@ function testProspectWorkflowResponseIncludesHubSpotLinks() {
     'https://app.hubspot.com/contacts/43974586/record/0-3/60316278406',
   );
   assert.strictEqual(
+    hubspotRecordUrl('deals', '60316278406'),
+    'https://app.hubspot.com/contacts/43974586/record/0-3/60316278406',
+  );
+  assert.strictEqual(
+    hubspotRecordUrl('contacts', '221459934275'),
+    'https://app.hubspot.com/contacts/43974586/record/0-1/221459934275',
+  );
+  assert.strictEqual(hubspotRecordUrl('unknown', '123'), '');
+  assert.strictEqual(
     hubspotPrimaryAssociatedRecordUrl({
       dealId: '60316278406',
       contactId: '221459934275',
@@ -1029,6 +1042,29 @@ function testRecruitingNotionPropertyHelpers() {
   assert.strictEqual(map.status, 'Status');
 }
 
+function testHubSpotRecordUrlsUseObjectTypeIds() {
+  assert.strictEqual(normalizeHubSpotObjectTypeId('contact'), '0-1');
+  assert.strictEqual(normalizeHubSpotObjectTypeId('contacts'), '0-1');
+  assert.strictEqual(normalizeHubSpotObjectTypeId('company'), '0-2');
+  assert.strictEqual(normalizeHubSpotObjectTypeId('companies'), '0-2');
+  assert.strictEqual(normalizeHubSpotObjectTypeId('deal'), '0-3');
+  assert.strictEqual(normalizeHubSpotObjectTypeId('deals'), '0-3');
+  assert.strictEqual(normalizeHubSpotObjectTypeId('meetings'), '0-47');
+  assert.strictEqual(normalizeHubSpotObjectTypeId('0-47'), '0-47');
+  assert.strictEqual(
+    hubspotRecordUrl('deals', '60016351576'),
+    'https://app.hubspot.com/contacts/43974586/record/0-3/60016351576',
+  );
+  assert.strictEqual(
+    hubspotRecordUrl('contacts', '123'),
+    'https://app.hubspot.com/contacts/43974586/record/0-1/123',
+  );
+  assert.strictEqual(
+    hubspotRecordUrl('companies', '456'),
+    'https://app.hubspot.com/contacts/43974586/record/0-2/456',
+  );
+}
+
 async function run() {
   await testConvertedLeadStatusUsesInternalValue();
   await testReadOnlyDealPropertiesAreRejectedBeforeWrite();
@@ -1054,6 +1090,7 @@ async function run() {
   testGrainSearchFilteringHelpers();
   testDailyProgressUsesDealSourceProperty();
   testProspectWorkflowResponseIncludesHubSpotLinks();
+  testHubSpotRecordUrlsUseObjectTypeIds();
 }
 
 run()

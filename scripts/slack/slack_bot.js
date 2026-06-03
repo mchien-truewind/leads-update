@@ -177,6 +177,21 @@ const HUBSPOT_WRITE_REQUIRE_AUTH = process.env.HUBSPOT_WRITE_REQUIRE_AUTH !== 'f
 const RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS = parseDelimitedEnvSet('RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS');
 const RECRUITING_CALENDAR_ALLOWED_SLACK_CHANNEL_IDS = parseDelimitedEnvSet('RECRUITING_CALENDAR_ALLOWED_SLACK_CHANNEL_IDS');
 const RECRUITING_CALENDAR_REQUIRE_AUTH = process.env.RECRUITING_CALENDAR_REQUIRE_AUTH !== 'false';
+const DEAL_SOURCE_PROPERTY = 'deal_source';
+const DEAL_SOURCE_SELECT_ACTION_ID = 'select_deal_source_for_structured_deal';
+const DEAL_SOURCE_BLOCK_ID_PREFIX = 'deal_source_request:';
+const DEAL_SOURCE_REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
+const FALLBACK_DEAL_SOURCE_OPTIONS = [
+  { label: 'Outbound - Sales Sourced List', value: 'Outbound - Sales Sourced List' },
+  { label: 'Outbound - Event (Conferences)', value: 'Event' },
+  { label: 'Outbound - In-Person Socials', value: 'In-Person Socials' },
+  { label: 'Outbound - Webinar', value: 'Webinar' },
+  { label: 'Inbound - Website', value: 'PR' },
+  { label: 'Inbound - Free Trial/Self Serve', value: 'Self serve' },
+  { label: 'Inbound - Referral', value: 'Referral' },
+  { label: 'Inbound - Direct', value: 'Inbound - Direct' },
+];
+const pendingDealSourceRequests = new Map();
 const DEFAULT_RECRUITING_CALENDAR_SLACK_USER_ID = (
   process.env.RECRUITING_SLACK_MENTION_USER_ID
   || process.env.SLACK_USER_ID
@@ -188,6 +203,7 @@ function createSlackApp() {
     return {
       client: { chat: { postMessage: async () => ({ ok: true }) } },
       event: () => {},
+      action: () => {},
       start: async () => {},
     };
   }
@@ -1195,6 +1211,27 @@ async function getHubSpotProperty(objectType, propertyName) {
   }
 }
 
+async function getDealSourceOptions() {
+  try {
+    const property = await getHubSpotProperty('deals', DEAL_SOURCE_PROPERTY);
+    const options = Array.isArray(property?.options) ? property.options : [];
+    const visibleOptions = options
+      .filter((option) => !option.hidden && String(option.value || '').trim())
+      .map((option) => ({
+        label: String(option.label || option.value).trim(),
+        value: String(option.value).trim(),
+      }));
+    return visibleOptions.length > 0 ? visibleOptions : FALLBACK_DEAL_SOURCE_OPTIONS;
+  } catch (err) {
+    console.error(`Cannot read HubSpot deal source options: ${err.message}`);
+    return FALLBACK_DEAL_SOURCE_OPTIONS;
+  }
+}
+
+function formatDealSourceOptions(options = FALLBACK_DEAL_SOURCE_OPTIONS) {
+  return options.map((option) => option.value).filter(Boolean).join(', ');
+}
+
 function normalizeHubSpotPropertyValue(property, value) {
   if (value === undefined || value === null || value === '') return value;
   const options = Array.isArray(property?.options) ? property.options : [];
@@ -2142,12 +2179,77 @@ function normalizeExplicitDealSource(input = {}) {
   return String(input.deal_source || input.lead_source || input.source || '').trim();
 }
 
-function missingDealSourceMessage() {
+function missingDealSourceMessage(options = FALLBACK_DEAL_SOURCE_OPTIONS) {
   return [
     'Missing required deal source. No HubSpot deal was created.',
     'Please provide the deal source before I create the deal.',
-    'Valid deal sources: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct.',
+    `Valid deal sources: ${formatDealSourceOptions(options)}.`,
   ].join('\n');
+}
+
+function prunePendingDealSourceRequests() {
+  const expiresBefore = Date.now() - DEAL_SOURCE_REQUEST_TTL_MS;
+  for (const [requestId, request] of pendingDealSourceRequests.entries()) {
+    if (request.createdAt < expiresBefore) pendingDealSourceRequests.delete(requestId);
+  }
+}
+
+function storePendingDealSourceRequest(input) {
+  prunePendingDealSourceRequests();
+  const requestId = crypto.randomUUID();
+  pendingDealSourceRequests.set(requestId, {
+    input: { ...input },
+    createdAt: Date.now(),
+  });
+  return requestId;
+}
+
+function parseDealSourceRequestId(blockId = '') {
+  const value = String(blockId || '');
+  return value.startsWith(DEAL_SOURCE_BLOCK_ID_PREFIX)
+    ? value.slice(DEAL_SOURCE_BLOCK_ID_PREFIX.length)
+    : '';
+}
+
+function slackPlainText(value, maxLength = 75) {
+  const text = String(value || '').trim() || 'Option';
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function buildDealSourceSelectBlocks(requestId, options = FALLBACK_DEAL_SOURCE_OPTIONS) {
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: 'I need a deal source before creating this HubSpot deal. Select one below.',
+      },
+    },
+    {
+      type: 'actions',
+      block_id: `${DEAL_SOURCE_BLOCK_ID_PREFIX}${requestId}`,
+      elements: [
+        {
+          type: 'static_select',
+          action_id: DEAL_SOURCE_SELECT_ACTION_ID,
+          placeholder: {
+            type: 'plain_text',
+            text: 'Select deal source',
+            emoji: true,
+          },
+          options: options.slice(0, 100).map((option) => ({
+            text: {
+              type: 'plain_text',
+              text: slackPlainText(option.label || option.value),
+              emoji: true,
+            },
+            value: String(option.value),
+          })),
+        },
+      ],
+    },
+  ];
 }
 
 function splitFullName(name, email = '') {
@@ -2726,7 +2828,7 @@ const TOOLS = [
         jobtitle: { type: 'string', description: 'Optional title if already known.' },
         linkedin_url: { type: 'string', description: 'Optional LinkedIn profile URL if the user already supplied it or selected a disambiguated match.' },
         erp: { type: 'string', description: 'Optional ERP value. Leave unset unless specified.' },
-        lead_source: { type: 'string', description: 'Required explicit lead/deal source from the user. Do not infer or default it. Valid values: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct.' },
+        lead_source: { type: 'string', description: 'Required explicit lead/deal source from the user. Do not infer or default it. Use one of the current HubSpot deal_source property options.' },
         type: { type: 'string', description: 'Optional deal/prospect type if specified by the user. Included in the HubSpot note when present.' },
         meeting_booked: { type: 'string', description: 'Optional meeting booked date/time text if specified by the user. Included in the HubSpot note when present.' },
         notes: { type: 'string', description: 'Optional notes from the user request. Pass the full note text exactly; the workflow creates a HubSpot note associated to the deal, contact, and company.' },
@@ -2787,7 +2889,7 @@ const TOOLS = [
         dealname: { type: 'string', description: 'Deal name' },
         pipeline: { type: 'string', description: 'Pipeline ID (default: Active Pipeline 105321581)' },
         dealstage: { type: 'string', description: 'Stage ID' },
-        deal_source: { type: 'string', description: 'Required explicit deal source from the user. Do not infer or default it. Valid values: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct.' },
+        deal_source: { type: 'string', description: 'Required explicit deal source from the user. Do not infer or default it. Use one of the current HubSpot deal_source property options.' },
         amount: { type: 'number', description: 'Deal amount' },
         context: { type: 'string', description: 'Original Slack request/context for write authorization.' },
         channel_id: { type: 'string', description: 'Slack channel ID for write authorization.' },
@@ -3340,7 +3442,7 @@ Rules enforced by the backend tool:
 - Contact first, deal second. Contact is the anchor record.
 - Email is required. If email is missing, ask for it.
 - Deal source is required for every new HubSpot deal. If the user does not provide a deal source/source, ask for it before creating or pushing the deal. Do not infer, deduce, or default deal source from context.
-- Valid deal source values are: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct.
+- Valid deal source values are the current HubSpot deal_source property options.
 - Company is required, but the tool can infer it from LinkedIn or a non-generic email domain. Only ask if the tool says company is unclear.
 - The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to lifecycle opportunity and lead status internal value MQL (HubSpot label Converted).
 - Pass the full Slack request/thread in the context field for write authorization and notes context, but pass the user's explicit source in lead_source/deal_source.
@@ -3351,7 +3453,7 @@ Rules enforced by the backend tool:
 - Do not pass read-only HubSpot properties into low-level write tools. The backend validates properties before write and will reject system-managed fields such as hs_deal_stage_probability_shadow, notes_last_updated, and hs_object_source_detail_1.
 
 Deal source rule:
-- Never deduce or default deal source for a new HubSpot deal. If the user says "create/push/add a deal" without source, ask: "What deal source should I use? Valid options: Outbound - Sales Sourced List, Event, In-Person Socials, Webinar, PR, Self serve, Referral, Inbound - Direct."
+- Never deduce or default deal source for a new HubSpot deal. If the user says "create/push/add a deal" without source, ask them which HubSpot deal source to use before calling a HubSpot write tool.
 
 ## Recruiting calendar scheduling
 For recruiting pipeline questions in #hiring-review, use recruiting_list_outstanding_candidates. The recruiting/hiring candidate pipeline is the Notion ATS, not the HubSpot sales deal pipeline.
@@ -3559,6 +3661,16 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
     structuredDeal.context = `${cleanText}\n\n[Slack metadata: channel_id=${channel}, thread_ts=${threadTs}, thread_date=${threadDate}${slackUserId ? `, slack_user_id=${slackUserId}` : ''}]`;
     structuredDeal.channel_id = channel;
     structuredDeal.slack_user_id = slackUserId;
+    if (!normalizeExplicitDealSource(structuredDeal)) {
+      const dealSourceOptions = await getDealSourceOptions();
+      const requestId = storePendingDealSourceRequest(structuredDeal);
+      await say({
+        text: missingDealSourceMessage(dealSourceOptions),
+        blocks: buildDealSourceSelectBlocks(requestId, dealSourceOptions),
+        thread_ts: threadTs,
+      });
+      return;
+    }
     const reply = await runStructuredDealCreateWorkflow(structuredDeal);
     await say({ text: reply, thread_ts: threadTs });
     return;
@@ -3645,6 +3757,56 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
     await say({ text: `Error: Claude request failed: ${err.message}. No action completed by this response.`, thread_ts: threadTs });
   }
 }
+
+app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) => {
+  await ack();
+
+  const blockId = action?.block_id || body?.actions?.[0]?.block_id || '';
+  const requestId = parseDealSourceRequestId(blockId);
+  const pending = requestId ? pendingDealSourceRequests.get(requestId) : null;
+  const channel = body?.channel?.id || body?.container?.channel_id;
+  const threadTs = body?.message?.thread_ts || body?.message?.ts;
+
+  if (!channel) {
+    console.error('Deal source select action missing Slack channel');
+    return;
+  }
+
+  if (!pending) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: 'That deal source request expired or was already used. Please send the create-deal request again.',
+    });
+    return;
+  }
+
+  pendingDealSourceRequests.delete(requestId);
+  const selectedOption = action?.selected_option || body?.actions?.[0]?.selected_option || {};
+  const dealSource = String(selectedOption.value || '').trim();
+  const dealSourceLabel = selectedOption.text?.text || dealSource;
+  if (!dealSource) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: missingDealSourceMessage(),
+    });
+    return;
+  }
+
+  await client.chat.postMessage({
+    channel,
+    thread_ts: threadTs,
+    text: `Creating the HubSpot deal with deal source: ${dealSourceLabel}.`,
+  });
+
+  const reply = await runStructuredDealCreateWorkflow({
+    ...pending.input,
+    lead_source: dealSource,
+    deal_source: dealSource,
+  });
+  await client.chat.postMessage({ channel, thread_ts: threadTs, text: reply });
+});
 
 // Respond to @mentions in channels
 app.event('app_mention', async ({ event, say }) => {

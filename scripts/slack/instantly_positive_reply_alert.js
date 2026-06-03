@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 
-const DEFAULT_CHANNEL = 'slack-testing';
+const DEFAULT_CHANNEL = 'gtm-outbound';
 const POSITIVE_EVENT_TYPES = new Set([
   'lead_interested',
   'lead_positive',

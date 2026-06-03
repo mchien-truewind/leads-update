@@ -96,9 +96,9 @@ function testSecretValidation() {
 }
 
 function testChannelNormalization() {
-  assert.strictEqual(normalizeChannel('#slack-testing'), 'slack-testing');
-  assert.strictEqual(normalizeChannel('slack-testing'), 'slack-testing');
-  assert.strictEqual(normalizeChannel(''), 'slack-testing');
+  assert.strictEqual(normalizeChannel('#gtm-outbound'), 'gtm-outbound');
+  assert.strictEqual(normalizeChannel('gtm-outbound'), 'gtm-outbound');
+  assert.strictEqual(normalizeChannel(''), 'gtm-outbound');
 }
 
 function makeJsonRequest(body, headers = {}) {
@@ -132,7 +132,7 @@ async function testHandlerPostsPositiveReply() {
   await handleInstantlyPositiveReplyWebhook(req, res, {
     slackClient: { chat: { postMessage: async payload => posts.push(payload) } },
     slackToken: 'xoxb-test',
-    channel: '#slack-testing',
+    channel: '#gtm-outbound',
     mentionUserId: 'U123',
     webhookSecret: 'secret',
   });
@@ -140,7 +140,7 @@ async function testHandlerPostsPositiveReply() {
   assert.strictEqual(res.statusCode, 200);
   assert.strictEqual(res.body, 'ok');
   assert.strictEqual(posts.length, 1);
-  assert.strictEqual(posts[0].channel, 'slack-testing');
+  assert.strictEqual(posts[0].channel, 'gtm-outbound');
   assert.ok(posts[0].text.startsWith('<@U123> *Positive Instantly reply*'));
   assert.ok(posts[0].text.includes('positive@example.com'));
 }
@@ -156,7 +156,7 @@ async function testHandlerRejectsBadSecret() {
   await handleInstantlyPositiveReplyWebhook(req, res, {
     slackClient: { chat: { postMessage: async payload => posts.push(payload) } },
     slackToken: 'xoxb-test',
-    channel: '#slack-testing',
+    channel: '#gtm-outbound',
     mentionUserId: 'U123',
     webhookSecret: 'secret',
   });

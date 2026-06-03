@@ -3738,7 +3738,7 @@ def collect_review_candidates_for_slack(
     candidates: list[dict[str, str]] = []
     for page in notion.query_pages({"page_size": 100}):
         props = page.get("properties", {})
-        status = notion_prop_value(props.get(prop_map.status, {})).strip().lower()
+        status = status_key(notion_prop_value(props.get(prop_map.status, {})))
         if status and status != "awaiting decision":
             continue
         source = notion_prop_value(props.get(prop_map.source, {})).strip()
@@ -3780,7 +3780,7 @@ def collect_active_candidates_for_weekly_slack(
     candidates: list[dict[str, str]] = []
     for page in notion.query_pages({"page_size": 100}):
         props = page.get("properties", {})
-        status = notion_prop_value(props.get(prop_map.status, {})).strip() or "Awaiting Decision"
+        status = canonical_status(notion_prop_value(props.get(prop_map.status, {})))
         if status_is_terminal(status):
             continue
         if should_exclude_from_active_digest(status):
@@ -3997,8 +3997,9 @@ def sync_slack_decisions(
             continue
 
         page_props = page.get("properties", {})
-        existing_status = notion_prop_value(page_props.get(prop.status, {})).strip().lower()
-        if status_is_terminal(existing_status):
+        existing_status_raw = notion_prop_value(page_props.get(prop.status, {})).strip()
+        existing_status = status_key(existing_status_raw)
+        if status_is_terminal(existing_status_raw):
             skipped_locked += 1
             continue
         existing_decision = notion_prop_value(page_props.get(prop.decision, {})).strip().lower()
@@ -4016,8 +4017,8 @@ def sync_slack_decisions(
         update_payload[prop.decision] = build_notion_value(properties[prop.decision], decision.title())
         update_payload[prop.decision_time] = build_notion_value(properties[prop.decision_time], now_iso)
         if prop.status in properties:
-            next_status = "Proceed Selected" if decision == "proceed" else "Reject Selected"
-            update_payload[prop.status] = build_notion_value(properties[prop.status], next_status)
+            if decision == "reject":
+                update_payload[prop.status] = build_notion_value(properties[prop.status], STATUS_REJECTED)
 
         # Reset stale workflow fields when decision changes.
         if decision == "proceed":
@@ -4095,10 +4096,10 @@ def sync_slack_decisions(
                 )
                 forwards_sent += 1
 
-            if prop.status in properties and existing_status != "N/A":
+            if prop.status in properties and status_key(existing_status) != "n/a":
                 notion.update_page(
                     page["id"],
-                    {prop.status: build_notion_value(properties[prop.status], "N/A")},
+                    {prop.status: build_notion_value(properties[prop.status], STATUS_NA)},
                 )
 
     return (
@@ -4128,9 +4129,58 @@ SOURCE_OPTIONS = ("Inbound", "Superposition")
 SOURCE_INBOUND = "Inbound"
 SOURCE_SUPERPOSITION = "Superposition"
 CUSTOM_GPT_FIRST_ROUND_ROLES = {"BDR", "AE"}
-STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process", "N/A", "Offered")
+STATUS_AWAITING_DECISION = "Awaiting Decision"
+STATUS_WAITING_ON_CUSTOM_GPT = "Waiting on CustomGPT"
+STATUS_ROUND_1_SCHEDULING = "Round 1 Scheduling"
+STATUS_SCHEDULING_SENT = "Scheduling Sent"
+STATUS_INTERVIEW_IN_PROCESS = "Interview in Process"
+STATUS_NEEDS_ATTENTION = "Needs Attention"
+STATUS_NO_RESPONSE = "No response"
+STATUS_REJECTED = "Rejected"
+STATUS_PASSED = "Passed"
+STATUS_ACCEPTED = "Accepted"
+STATUS_OFFERED = "Offered"
+STATUS_NA = "N/A"
+STATUS_OPTIONS = (
+    STATUS_AWAITING_DECISION,
+    STATUS_WAITING_ON_CUSTOM_GPT,
+    STATUS_ROUND_1_SCHEDULING,
+    STATUS_SCHEDULING_SENT,
+    STATUS_INTERVIEW_IN_PROCESS,
+    STATUS_NEEDS_ATTENTION,
+    STATUS_NO_RESPONSE,
+    STATUS_REJECTED,
+    STATUS_PASSED,
+    STATUS_ACCEPTED,
+    STATUS_OFFERED,
+    STATUS_NA,
+)
 TERMINAL_STATUSES = {"rejected", "passed", "accepted", "n/a", "offered"}
-ATS_DIGEST_EXCLUDED_STATUSES = {"reject pending"}
+ATS_DIGEST_EXCLUDED_STATUSES = set()
+STATUS_ALIASES = {
+    "awaiting decision": STATUS_AWAITING_DECISION,
+    "proceed selected": STATUS_AWAITING_DECISION,
+    "reject selected": STATUS_REJECTED,
+    "proceed drafted": STATUS_ROUND_1_SCHEDULING,
+    "reject drafted": STATUS_REJECTED,
+    "reject pending": STATUS_REJECTED,
+    "in customgpt process": STATUS_WAITING_ON_CUSTOM_GPT,
+    "customgpt processing": STATUS_WAITING_ON_CUSTOM_GPT,
+    "custom gpt processing": STATUS_WAITING_ON_CUSTOM_GPT,
+    "scheduling": STATUS_ROUND_1_SCHEDULING,
+    "round 1 scheduling": STATUS_ROUND_1_SCHEDULING,
+    "scheduling sent": STATUS_SCHEDULING_SENT,
+    "interview scheduled": STATUS_SCHEDULING_SENT,
+    "in process": STATUS_INTERVIEW_IN_PROCESS,
+    "interview in process": STATUS_INTERVIEW_IN_PROCESS,
+    "needs attention": STATUS_NEEDS_ATTENTION,
+    "no response": STATUS_NO_RESPONSE,
+    "rejected": STATUS_REJECTED,
+    "passed": STATUS_PASSED,
+    "accepted": STATUS_ACCEPTED,
+    "offered": STATUS_OFFERED,
+    "n/a": STATUS_NA,
+}
 ATS_FOLLOW_UP_WEEKDAYS = {
     0: "Monday",
     1: "Tuesday",
@@ -4157,11 +4207,30 @@ def notion_prop_values(prop: dict[str, Any]) -> list[str]:
 
 
 def status_is_terminal(status: str) -> bool:
-    return clean_text(status).lower() in TERMINAL_STATUSES
+    return status_key(status) in TERMINAL_STATUSES
 
 
 def should_exclude_from_active_digest(status: str) -> bool:
-    return clean_text(status).lower() in ATS_DIGEST_EXCLUDED_STATUSES
+    return status_key(status) in ATS_DIGEST_EXCLUDED_STATUSES
+
+
+def canonical_status(status: str, default: str = STATUS_AWAITING_DECISION) -> str:
+    cleaned = clean_text(status)
+    if not cleaned:
+        return default
+    return STATUS_ALIASES.get(cleaned.lower(), cleaned)
+
+
+def status_key(status: str) -> str:
+    return canonical_status(status).lower()
+
+
+def rejected_with_pending_automation(status: str, decision: str, reject_draft_id: str, reject_send_at: str) -> bool:
+    return (
+        status_key(status) == "rejected"
+        and clean_text(decision).lower() == "reject"
+        and bool(clean_text(reject_draft_id) or clean_text(reject_send_at))
+    )
 
 
 def page_role_values(page_props: dict[str, Any], prop_map: NotionPropertyMap) -> set[str]:
@@ -5107,7 +5176,10 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     for page in pages:
         page_props = page.get("properties", {})
         decision = notion_prop_value(page_props.get(prop.decision, {})).strip().lower()
-        current_status = notion_prop_value(page_props.get(prop.status, {})).strip().lower()
+        current_status_raw = notion_prop_value(page_props.get(prop.status, {})).strip()
+        current_status = status_key(current_status_raw)
+        reject_draft_id_raw = notion_prop_value(page_props.get(prop.reject_draft_id, {})).strip()
+        reject_send_at_raw = notion_prop_value(page_props.get(prop.reject_send_at, {})).strip()
         candidate_roles = page_role_values(page_props, prop)
         uses_custom_gpt_assignment = bool(CUSTOM_GPT_FIRST_ROUND_ROLES.intersection(candidate_roles))
         candidate_name = notion_prop_value(page_props.get(prop.candidate_name, {})).strip() or "Candidate"
@@ -5130,7 +5202,12 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             fallback_thread_id=thread_id,
         )
 
-        if status_is_terminal(current_status):
+        if status_is_terminal(current_status_raw) and not rejected_with_pending_automation(
+            current_status_raw,
+            decision,
+            reject_draft_id_raw,
+            reject_send_at_raw,
+        ):
             archive_labels = [label_id for label_id in (hiring_label_id, pipeline_label_id) if label_id]
             if archive_labels:
                 archived_count, archive_failures = remove_labels_from_threads(
@@ -5150,12 +5227,12 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             label_id=pipeline_label_id,
         ):
             in_pipeline = True
-            if current_status != "in process" and prop.status in properties_schema:
+            if current_status != "interview in process" and prop.status in properties_schema:
                 in_process_marked += 1
                 update_payload[prop.status] = build_notion_value(
-                    properties_schema[prop.status], "In Process"
+                    properties_schema[prop.status], STATUS_INTERVIEW_IN_PROCESS
                 )
-                current_status = "in process"
+                current_status = "interview in process"
 
         manual_reject_sent_at: datetime | None = None
         if current_status != "rejected" and not in_pipeline:
@@ -5168,7 +5245,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             if manual_reject_sent_at:
                 manual_reject_marked += 1
                 if prop.status in properties_schema:
-                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "Rejected")
+                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], STATUS_REJECTED)
                     current_status = "rejected"
                 if prop.decision in properties_schema and decision != "reject":
                     update_payload[prop.decision] = build_notion_value(properties_schema[prop.decision], "Reject")
@@ -5198,7 +5275,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             continue
 
         sent_archive_labels = [hiring_label_id] if hiring_label_id else []
-        if current_status == "proceed drafted":
+        if clean_text(current_status_raw).lower() == "proceed drafted":
             if uses_custom_gpt_assignment:
                 proceed_sent_at = thread_latest_assignment_sent_at_any_thread(
                     gmail_service,
@@ -5216,7 +5293,11 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 )
             if proceed_sent_at:
                 if prop.status in properties_schema:
-                    next_status = "In CustomGPT Process" if uses_custom_gpt_assignment else "In Process"
+                    next_status = (
+                        STATUS_WAITING_ON_CUSTOM_GPT
+                        if uses_custom_gpt_assignment
+                        else STATUS_ROUND_1_SCHEDULING
+                    )
                     update_payload[prop.status] = build_notion_value(properties_schema[prop.status], next_status)
                 archived_count, archive_failures = remove_labels_from_threads(
                     gmail_service,
@@ -5229,7 +5310,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
                 continue
 
-        if current_status == "scheduling":
+        if current_status == "round 1 scheduling":
             proceed_sent_at = thread_latest_sent_matching_patterns_any_thread(
                 gmail_service,
                 thread_ids=related_thread_ids,
@@ -5274,11 +5355,11 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                     )
                                 if prop.status in properties_schema:
                                     update_payload[prop.status] = build_notion_value(
-                                        properties_schema[prop.status], "Scheduling Sent"
+                                        properties_schema[prop.status], STATUS_SCHEDULING_SENT
                                     )
                     elif reply_state in {"decline", "ambiguous"} and prop.status in properties_schema:
                         update_payload[prop.status] = build_notion_value(
-                            properties_schema[prop.status], "Needs Attention"
+                            properties_schema[prop.status], STATUS_NEEDS_ATTENTION
                         )
 
             if update_payload:
@@ -5331,7 +5412,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                 )
                             if prop.status in properties_schema:
                                 update_payload[prop.status] = build_notion_value(
-                                    properties_schema[prop.status], "Interview Scheduled"
+                                    properties_schema[prop.status], STATUS_SCHEDULING_SENT
                                 )
                             if prop.proposed_slot in properties_schema:
                                 update_payload[prop.proposed_slot] = build_notion_value(
@@ -5339,9 +5420,52 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                 )
                     elif reply_state in {"decline", "ambiguous"} and prop.status in properties_schema:
                         update_payload[prop.status] = build_notion_value(
-                            properties_schema[prop.status], "Needs Attention"
+                            properties_schema[prop.status], STATUS_NEEDS_ATTENTION
                         )
 
+            proposed_slot_raw = notion_prop_value(page_props.get(prop.proposed_slot, {})).strip()
+            proposed_slot = parse_iso_datetime(proposed_slot_raw, config.timezone_name)
+            if proposed_slot and now_local(config.timezone_name).astimezone(timezone.utc) >= proposed_slot.astimezone(timezone.utc):
+                post_meeting_sent = thread_latest_sent_matching_patterns_any_thread(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    sender_email=config.from_email,
+                    candidate_email=candidate_email,
+                    patterns=[re.compile(r".", re.DOTALL)],
+                )
+                if post_meeting_sent and post_meeting_sent >= proposed_slot.astimezone(timezone.utc):
+                    if prop.status in properties_schema:
+                        update_payload[prop.status] = build_notion_value(
+                            properties_schema[prop.status], STATUS_INTERVIEW_IN_PROCESS
+                        )
+
+            if update_payload:
+                notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
+            continue
+
+        if current_status == "waiting on customgpt":
+            assignment_sent_at = thread_latest_assignment_sent_at_any_thread(
+                gmail_service,
+                thread_ids=related_thread_ids,
+                sender_email=config.from_email,
+                keywords=config.assignment_keywords,
+            )
+            if assignment_sent_at:
+                reply_dt, _reply_text = latest_candidate_message_since_any_thread(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    candidate_email=candidate_email,
+                    since=assignment_sent_at,
+                )
+                if reply_dt and prop.status in properties_schema:
+                    update_payload[prop.status] = build_notion_value(
+                        properties_schema[prop.status], STATUS_ROUND_1_SCHEDULING
+                    )
+            else:
+                if prop.status in properties_schema:
+                    update_payload[prop.status] = build_notion_value(
+                        properties_schema[prop.status], STATUS_NEEDS_ATTENTION
+                    )
             if update_payload:
                 notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
             continue
@@ -5359,7 +5483,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 closeout_labels.append(pipeline_label_id)
             if no_response_sent_at:
                 if prop.status in properties_schema:
-                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "Rejected")
+                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], STATUS_REJECTED)
                 if prop.decision in properties_schema:
                     update_payload[prop.decision] = build_notion_value(properties_schema[prop.decision], "Reject")
                 archived_count, archive_failures = remove_labels_from_threads(
@@ -5417,7 +5541,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                 )
                             if prop.status in properties_schema:
                                 update_payload[prop.status] = build_notion_value(
-                                    properties_schema[prop.status], "Reject Drafted"
+                                    properties_schema[prop.status], STATUS_REJECTED
                                 )
             if update_payload:
                 notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
@@ -5429,11 +5553,15 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
 
         if decision == "proceed":
             proceed_draft_id = notion_prop_value(page_props.get(prop.proceed_draft_id, {})).strip()
-            if proceed_draft_id and current_status == "proceed drafted":
+            if proceed_draft_id and current_status == "round 1 scheduling":
                 sent_message_id = send_gmail_draft(gmail_service, proceed_draft_id)
                 if sent_message_id:
                     proceed_drafts_auto_sent += 1
-                    next_status = "In CustomGPT Process" if uses_custom_gpt_assignment else "Scheduling"
+                    next_status = (
+                        STATUS_WAITING_ON_CUSTOM_GPT
+                        if uses_custom_gpt_assignment
+                        else STATUS_ROUND_1_SCHEDULING
+                    )
                     current_status = next_status.lower()
                     if prop.status in properties_schema:
                         update_payload[prop.status] = build_notion_value(
@@ -5469,12 +5597,19 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     )
                 if prop.status in properties_schema:
                     update_payload[prop.status] = build_notion_value(
-                        properties_schema[prop.status], "Proceed Drafted"
+                        properties_schema[prop.status],
+                        STATUS_WAITING_ON_CUSTOM_GPT
+                        if uses_custom_gpt_assignment
+                        else STATUS_ROUND_1_SCHEDULING,
                     )
                 sent_message_id = send_gmail_draft(gmail_service, draft_id)
                 if sent_message_id:
                     proceed_drafts_auto_sent += 1
-                    next_status = "In CustomGPT Process" if uses_custom_gpt_assignment else "Scheduling"
+                    next_status = (
+                        STATUS_WAITING_ON_CUSTOM_GPT
+                        if uses_custom_gpt_assignment
+                        else STATUS_ROUND_1_SCHEDULING
+                    )
                     current_status = next_status.lower()
                     if prop.status in properties_schema:
                         update_payload[prop.status] = build_notion_value(
@@ -5500,16 +5635,15 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     reply_state = classify_scheduling_readiness_reply(reply_text)
                     if reply_state == "ready" and prop.status in properties_schema:
                         update_payload[prop.status] = build_notion_value(
-                            properties_schema[prop.status], "Scheduling"
+                            properties_schema[prop.status], STATUS_ROUND_1_SCHEDULING
                         )
                     elif reply_state in {"decline", "ambiguous"} and prop.status in properties_schema:
                         update_payload[prop.status] = build_notion_value(
-                            properties_schema[prop.status], "Needs Attention"
+                            properties_schema[prop.status], STATUS_NEEDS_ATTENTION
                         )
 
         if decision == "reject":
-            reject_draft_id = notion_prop_value(page_props.get(prop.reject_draft_id, {})).strip()
-            reject_send_at_raw = notion_prop_value(page_props.get(prop.reject_send_at, {})).strip()
+            reject_draft_id = reject_draft_id_raw
             reject_send_at = parse_iso_datetime(reject_send_at_raw, config.timezone_name)
 
             if not decision_time:
@@ -5519,7 +5653,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         properties_schema[prop.decision_time], iso(decision_time)
                     )
 
-            if reject_draft_id and current_status == "reject drafted":
+            if reject_draft_id and current_status == "rejected":
                 candidate_notion_url = notion_page_url(page.get("id", ""))
                 draft = get_gmail_draft(gmail_service, reject_draft_id)
                 draft_created_at = gmail_draft_created_at(draft or {})
@@ -5598,6 +5732,10 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                             f"{candidate_name} <{candidate_email}> draft='{greeting_first_name}' "
                             f"reason='{failure_reason}'"
                         )
+                        if prop.status in properties_schema:
+                            update_payload[prop.status] = build_notion_value(
+                                properties_schema[prop.status], STATUS_NEEDS_ATTENTION
+                            )
                     else:
                         sent_message_id = send_gmail_draft(gmail_service, reject_draft_id)
                         if sent_message_id:
@@ -5605,7 +5743,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                             current_status = "rejected"
                             if prop.status in properties_schema:
                                 update_payload[prop.status] = build_notion_value(
-                                    properties_schema[prop.status], "Rejected"
+                                    properties_schema[prop.status], STATUS_REJECTED
                                 )
                             if prop.reject_draft_id in properties_schema:
                                 update_payload[prop.reject_draft_id] = build_notion_value(
@@ -5648,7 +5786,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     )
                 if prop.status in properties_schema:
                     update_payload[prop.status] = build_notion_value(
-                        properties_schema[prop.status], "Reject Pending"
+                        properties_schema[prop.status], STATUS_REJECTED
                     )
             elif now >= reject_send_at and not reject_draft_id:
                 draft_id = create_reply_draft(
@@ -5665,7 +5803,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     )
                 if prop.status in properties_schema:
                     update_payload[prop.status] = build_notion_value(
-                        properties_schema[prop.status], "Reject Drafted"
+                        properties_schema[prop.status], STATUS_REJECTED
                     )
             if current_status != "rejected" and not in_pipeline:
                 # Mark as rejected once an outbound email is actually sent after the reject decision.
@@ -5683,7 +5821,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     reject_marked_sent += 1
                     if prop.status in properties_schema:
                         update_payload[prop.status] = build_notion_value(
-                            properties_schema[prop.status], "Rejected"
+                            properties_schema[prop.status], STATUS_REJECTED
                         )
                     archive_labels = [hiring_label_id]
                     if pipeline_label_id:
@@ -5702,15 +5840,15 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         effective_status = current_status
         status_update = update_payload.get(prop.status)
         if isinstance(status_update, dict):
-            status_payload = status_update.get("status")
+            status_payload = status_update.get("status") or status_update.get("select")
             if isinstance(status_payload, dict):
                 status_name = clean_text(status_payload.get("name", ""))
                 if status_name:
-                    effective_status = status_name.lower()
+                    effective_status = status_key(status_name)
 
         if (
             hiring_label_id
-            and effective_status not in {"scheduling", "scheduling sent"}
+            and status_key(effective_status) not in {"round 1 scheduling", "scheduling sent"}
             and any_thread_has_label(
                 gmail_service,
                 thread_ids=related_thread_ids,
@@ -5808,7 +5946,7 @@ def close_stale_custom_gpt_cmd(args: argparse.Namespace) -> None:
     for page in pages:
         page_props = page.get("properties", {})
         current_status = notion_prop_value(page_props.get(prop.status, {})).strip()
-        if current_status.lower() != "in customgpt process":
+        if status_key(current_status) != "waiting on customgpt":
             continue
         scanned += 1
 
@@ -5886,7 +6024,7 @@ def close_stale_custom_gpt_cmd(args: argparse.Namespace) -> None:
             sent += 1
             update_payload: dict[str, Any] = {}
             if prop.status in properties_schema:
-                update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "Rejected")
+                update_payload[prop.status] = build_notion_value(properties_schema[prop.status], STATUS_REJECTED)
             if prop.decision in properties_schema:
                 update_payload[prop.decision] = build_notion_value(properties_schema[prop.decision], "Reject")
             if prop.decision_time in properties_schema:

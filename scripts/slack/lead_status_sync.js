@@ -5,6 +5,7 @@ const DEFAULT_TARGET_CHANNEL = 'slack-testing';
 const DEFAULT_LOOKBACK_HOURS = 28;
 const DEFAULT_TOUCHPOINT_DAYS = 90;
 const DEFAULT_BDR_OWNER_IDS = ['84547076', '89305622', '91143842', '91143844'];
+const DEFAULT_NOOKS_NOT_INTERESTED_DISPOSITION_IDS = ['739e9efc-95d4-448d-9440-7a14287a02fa'];
 const DEFAULT_BDR_EMAILS = [
   'sarah@trytruewind.com',
   'xavier@trytruewind.com',
@@ -117,6 +118,11 @@ function makeDefaultConfig(env = process.env) {
     touchpointDays: Number(env.LEAD_STATUS_SYNC_TOUCHPOINT_DAYS || DEFAULT_TOUCHPOINT_DAYS),
     bdrOwnerIds: parseDelimitedList(env.LEAD_STATUS_SYNC_BDR_OWNER_IDS, DEFAULT_BDR_OWNER_IDS).map(String),
     bdrEmails: parseDelimitedList(env.LEAD_STATUS_SYNC_BDR_EMAILS, DEFAULT_BDR_EMAILS).map(email => email.toLowerCase()),
+    enableNooksNotInterestedSync: String(env.LEAD_STATUS_SYNC_ENABLE_NOOKS_NOT_INTERESTED || 'true').toLowerCase() !== 'false',
+    nooksNotInterestedDispositionIds: parseDelimitedList(
+      env.LEAD_STATUS_SYNC_NOOKS_NOT_INTERESTED_DISPOSITION_IDS,
+      DEFAULT_NOOKS_NOT_INTERESTED_DISPOSITION_IDS,
+    ).map(String),
     searchDelayMs: Number(env.LEAD_STATUS_SYNC_SEARCH_DELAY_MS || 250),
     generalDelayMs: Number(env.LEAD_STATUS_SYNC_GENERAL_DELAY_MS || 80),
     engagementConcurrency: Number(env.LEAD_STATUS_SYNC_ENGAGEMENT_CONCURRENCY || 6),
@@ -244,6 +250,90 @@ async function batchReadContacts(hubspot, ids, config) {
   return contacts;
 }
 
+async function searchNooksNotInterestedCalls(hubspot, sinceMs, config) {
+  const callsById = new Map();
+  const filterGroups = [];
+  const baseFilters = [
+    { propertyName: 'hs_object_source_detail_1', operator: 'EQ', value: 'Nooks' },
+  ];
+  if (sinceMs) {
+    baseFilters.push({ propertyName: 'hs_createdate', operator: 'GTE', value: String(sinceMs) });
+  }
+
+  for (const dispositionId of config.nooksNotInterestedDispositionIds || []) {
+    filterGroups.push({
+      filters: [
+        ...baseFilters,
+        { propertyName: 'hs_call_disposition', operator: 'EQ', value: dispositionId },
+      ],
+    });
+  }
+  filterGroups.push({
+    filters: [
+      ...baseFilters,
+      { propertyName: 'hs_call_title', operator: 'CONTAINS_TOKEN', value: 'Not interested' },
+    ],
+  });
+
+  for (const filterGroup of filterGroups) {
+    let after;
+    do {
+      const body = {
+        filterGroups: [filterGroup],
+        properties: [
+          'hs_call_title',
+          'hs_call_disposition',
+          'hs_createdate',
+          'hs_object_source_detail_1',
+          'hubspot_owner_id',
+        ],
+        limit: 100,
+        sorts: [{ propertyName: 'hs_createdate', direction: 'DESCENDING' }],
+      };
+      if (after) body.after = after;
+      const data = await hubspot('/crm/v3/objects/calls/search', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      for (const call of data.results || []) {
+        const ownerId = String(call.properties?.hubspot_owner_id || '');
+        if (ownerId && config.bdrOwnerIds.includes(ownerId)) callsById.set(String(call.id), call);
+      }
+      after = data.paging?.next?.after;
+      if (config.searchDelayMs) await sleep(config.searchDelayMs);
+    } while (after);
+  }
+
+  return [...callsById.values()];
+}
+
+async function readCallContactAssociations(hubspot, callIds, config) {
+  const contactIds = new Set();
+  for (let i = 0; i < callIds.length; i += 100) {
+    const data = await hubspot('/crm/v4/associations/calls/contacts/batch/read', {
+      method: 'POST',
+      body: JSON.stringify({
+        inputs: callIds.slice(i, i + 100).map(id => ({ id })),
+      }),
+    });
+    for (const row of data.results || []) {
+      for (const target of row.to || []) {
+        const id = target.toObjectId || target.id;
+        if (id) contactIds.add(String(id));
+      }
+    }
+    if (config.generalDelayMs) await sleep(config.generalDelayMs);
+  }
+  return [...contactIds];
+}
+
+async function findNooksNotInterestedContactIds(hubspot, sinceMs, config) {
+  const calls = await searchNooksNotInterestedCalls(hubspot, sinceMs, config);
+  if (!calls.length) return { callCount: 0, contactIds: [] };
+  const contactIds = await readCallContactAssociations(hubspot, calls.map(call => String(call.id)), config);
+  return { callCount: calls.length, contactIds };
+}
+
 function metadataEmail(metadata) {
   return String(metadata?.from?.email || metadata?.fromEmail || metadata?.senderEmail || '').toLowerCase();
 }
@@ -341,10 +431,19 @@ function canMoveToStatus(currentStatus, targetStatus) {
   return (STATUS_RANK[targetStatus] || 0) > (STATUS_RANK[currentStatus] || 0);
 }
 
-function classifyLeadStatus(contact, touchpointCount) {
+function classifyLeadStatus(contact, touchpointCount, signals = {}) {
   const properties = contact.properties || {};
   const currentStatus = properties.hs_lead_status || '';
   const currentReason = properties.disqualified_reasons || '';
+
+  if (signals.nooksNotInterested) {
+    return {
+      targetStatus: STATUS.DISQUALIFIED,
+      disqualifiedReason: DISQUALIFIED_REASONS.NOT_INTERESTED,
+      reason: 'nooks_not_interested',
+      forceDisqualifiedReason: true,
+    };
+  }
 
   if (currentStatus === STATUS.DISQUALIFIED) {
     if (!currentReason) {
@@ -395,10 +494,23 @@ async function batchUpdateContacts(hubspot, inputs, config) {
   }
 }
 
-function buildContactUpdate(contact, targetStatus, disqualifiedReason, touchpointCount, calculatedAtMs) {
+function buildContactUpdate(contact, targetStatus, disqualifiedReason, touchpointCount, calculatedAtMs, options = {}) {
   const properties = contact.properties || {};
   const update = {};
-  if (canMoveToStatus(properties.hs_lead_status || '', targetStatus)) {
+  const forceDisqualification = Boolean(
+    options.forceDisqualifiedReason
+      && targetStatus === STATUS.DISQUALIFIED
+      && disqualifiedReason,
+  );
+
+  if (forceDisqualification) {
+    if ((properties.hs_lead_status || '') !== targetStatus) {
+      update.hs_lead_status = targetStatus;
+    }
+    if ((properties.disqualified_reasons || '') !== disqualifiedReason) {
+      update.disqualified_reasons = disqualifiedReason;
+    }
+  } else if (canMoveToStatus(properties.hs_lead_status || '', targetStatus)) {
     update.hs_lead_status = targetStatus;
     if (targetStatus === STATUS.DISQUALIFIED && disqualifiedReason) {
       update.disqualified_reasons = properties.disqualified_reasons || disqualifiedReason;
@@ -442,10 +554,12 @@ function formatLeadStatusSyncSummary(stats) {
     `Lead status sync complete (${stats.mode}${stats.dryRun ? ', dry run' : ''})`,
     '',
     `Scanned candidates: ${stats.candidateCount}`,
-    `In GTM open leads: ${stats.listCandidateCount}`,
+    `Contacts evaluated: ${stats.listCandidateCount}`,
     `Contacts updated: ${stats.updatedContacts}`,
     `Status changes: ${stats.statusUpdates}`,
     `Touchpoint field changes: ${stats.touchpointUpdates}`,
+    `Nooks not interested calls: ${stats.nooksNotInterestedCalls || 0}`,
+    `Nooks not interested contacts: ${stats.nooksNotInterestedContacts || 0}`,
     `Errors: ${stats.errors}`,
     '',
     'Stage moves:',
@@ -479,6 +593,19 @@ async function runLeadStatusSync(options = {}) {
   const listIds = await getListMemberIds(hubspot, config.listId, config);
   const listSet = new Set(listIds);
   let candidateIds = listIds;
+  const nooksNotInterestedContactIds = new Set();
+  let nooksNotInterestedCalls = 0;
+
+  if (config.enableNooksNotInterestedSync) {
+    const sinceMs = mode === 'full' ? 0 : now.getTime() - lookbackMs;
+    const nooksResult = await findNooksNotInterestedContactIds(hubspot, sinceMs, config);
+    nooksNotInterestedCalls = nooksResult.callCount;
+    for (const id of nooksResult.contactIds) nooksNotInterestedContactIds.add(id);
+    logger.log?.(
+      `Lead status sync: Nooks not interested calls=${nooksNotInterestedCalls} `
+      + `contacts=${nooksNotInterestedContactIds.size}`,
+    );
+  }
 
   if (mode !== 'full') {
     const found = new Set();
@@ -492,6 +619,8 @@ async function runLeadStatusSync(options = {}) {
     }
     candidateIds = [...found];
   }
+  for (const id of nooksNotInterestedContactIds) candidateIds.push(id);
+  candidateIds = [...new Set(candidateIds)];
 
   const contacts = await batchReadContacts(hubspot, candidateIds, config);
   const updates = [];
@@ -505,6 +634,8 @@ async function runLeadStatusSync(options = {}) {
     statusUpdates: 0,
     touchpointUpdates: 0,
     errors: 0,
+    nooksNotInterestedCalls,
+    nooksNotInterestedContacts: nooksNotInterestedContactIds.size,
     transitions: {},
     disqualifiedReasons: {},
     workingTouchpointContacts: 0,
@@ -515,13 +646,16 @@ async function runLeadStatusSync(options = {}) {
   await mapLimit(contacts, config.engagementConcurrency, async (contact) => {
     try {
       const touchpointCount = await countTouchpoints90d(hubspot, contact.id, touchpointSinceMs, config);
-      const classification = classifyLeadStatus(contact, touchpointCount);
+      const classification = classifyLeadStatus(contact, touchpointCount, {
+        nooksNotInterested: nooksNotInterestedContactIds.has(String(contact.id)),
+      });
       const update = buildContactUpdate(
         contact,
         classification.targetStatus,
         classification.disqualifiedReason,
         touchpointCount,
         calculatedAtMs,
+        { forceDisqualifiedReason: classification.forceDisqualifiedReason },
       );
 
       const currentStatus = contact.properties?.hs_lead_status || '';

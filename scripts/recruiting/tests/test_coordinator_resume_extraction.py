@@ -180,6 +180,7 @@ def build_config(**overrides) -> cli.Config:
         "gmail_query": "",
         "gmail_max_messages": 1,
         "recruiter_sender_emails": set(),
+        "recruiter_sender_names": set(),
         "hiring_alias": "hiring@example.com",
         "from_email": "hiring@example.com",
         "proceed_template": "",
@@ -274,6 +275,32 @@ class SlackMentionBehaviorTests(unittest.TestCase):
             any("<@" in block.get("text", {}).get("text", "") for block in blocks),
             "blank slack_mention_user_id should not mention or auth-test the bot user",
         )
+
+
+class ProceedRoleRoutingTests(unittest.TestCase):
+    def test_growth_generalist_skips_custom_gpt_first_round(self):
+        prop_map = cli.NotionPropertyMap()
+        page_props = {
+            prop_map.role: {
+                "type": "multi_select",
+                "multi_select": [{"name": "Growth Generalist"}],
+            }
+        }
+
+        self.assertFalse(cli.uses_custom_gpt_first_round(page_props, prop_map))
+
+    def test_bdr_and_ae_use_custom_gpt_first_round(self):
+        prop_map = cli.NotionPropertyMap()
+        for role in ("BDR", "AE"):
+            with self.subTest(role=role):
+                page_props = {
+                    prop_map.role: {
+                        "type": "multi_select",
+                        "multi_select": [{"name": role}],
+                    }
+                }
+
+                self.assertTrue(cli.uses_custom_gpt_first_round(page_props, prop_map))
 
 
 if __name__ == "__main__":

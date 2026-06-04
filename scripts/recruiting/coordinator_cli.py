@@ -4283,6 +4283,10 @@ def page_role_values(page_props: dict[str, Any], prop_map: NotionPropertyMap) ->
     return set(notion_prop_values(page_props.get(prop_map.role, {})))
 
 
+def uses_custom_gpt_first_round(page_props: dict[str, Any], prop_map: NotionPropertyMap) -> bool:
+    return bool(CUSTOM_GPT_FIRST_ROUND_ROLES.intersection(page_role_values(page_props, prop_map)))
+
+
 def ensure_role_property_schema(
     notion: NotionClient,
     database_schema: dict[str, Any],
@@ -5231,8 +5235,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         current_status = status_key(current_status_raw)
         reject_draft_id_raw = notion_prop_value(page_props.get(prop.reject_draft_id, {})).strip()
         reject_send_at_raw = notion_prop_value(page_props.get(prop.reject_send_at, {})).strip()
-        candidate_roles = page_role_values(page_props, prop)
-        uses_custom_gpt_assignment = bool(CUSTOM_GPT_FIRST_ROUND_ROLES.intersection(candidate_roles))
+        uses_custom_gpt_assignment = uses_custom_gpt_first_round(page_props, prop)
         candidate_name = notion_prop_value(page_props.get(prop.candidate_name, {})).strip() or "Candidate"
         linkedin_url = notion_prop_value(page_props.get(prop.linkedin_url, {})).strip()
 
@@ -5490,6 +5493,15 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             continue
 
         if current_status == "waiting on customgpt":
+            if not uses_custom_gpt_assignment:
+                if prop.status in properties_schema:
+                    update_payload[prop.status] = build_notion_value(
+                        properties_schema[prop.status], STATUS_ROUND_1_SCHEDULING
+                    )
+                if update_payload:
+                    notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
+                continue
+
             assignment_sent_at = thread_latest_assignment_sent_at_any_thread(
                 gmail_service,
                 thread_ids=related_thread_ids,

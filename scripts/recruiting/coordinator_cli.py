@@ -4323,21 +4323,26 @@ def ensure_status_property_schema(
     if not status_schema or status_schema.get("type") != "select":
         return database_schema
 
-    existing = [
-        {
-            "name": (item.get("name") or "").strip(),
-            "color": item.get("color", "default") or "default",
-        }
+    existing_by_name = {
+        (item.get("name") or "").strip(): item.get("color", "default") or "default"
         for item in (status_schema.get("select", {}) or {}).get("options", []) or []
         if (item.get("name") or "").strip()
+    }
+    desired_options = [
+        {
+            "name": name,
+            "color": existing_by_name.get(name, "default"),
+        }
+        for name in STATUS_OPTIONS
     ]
-    existing_names = {item["name"] for item in existing}
-    missing = [name for name in STATUS_OPTIONS if name not in existing_names]
-    if not missing:
+    existing_ordered = [
+        {"name": name, "color": color}
+        for name, color in existing_by_name.items()
+    ]
+    if existing_ordered == desired_options:
         return database_schema
 
-    updated_options = existing + [{"name": name, "color": "default"} for name in missing]
-    return notion.update_database({status_name: {"select": {"options": updated_options}}})
+    return notion.update_database({status_name: {"select": {"options": desired_options}}})
 
 
 def ensure_source_property_schema(

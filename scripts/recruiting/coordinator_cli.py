@@ -2220,6 +2220,57 @@ def gmail_draft_body_text(draft: dict[str, Any]) -> str:
     return extract_message_body_text(message).strip()
 
 
+def update_gmail_draft_body_text(
+    gmail_service,
+    *,
+    draft: dict[str, Any],
+    body_text: str,
+) -> bool:
+    draft_id = str(draft.get("id", "") or "").strip()
+    message_payload = draft.get("message") or {}
+    if not draft_id or not isinstance(message_payload, dict):
+        return False
+    thread_id = str(message_payload.get("threadId", "") or "").strip()
+    headers = header_map(message_payload)
+    message = EmailMessage()
+    for header_name in ("from", "to", "cc", "bcc", "subject", "in-reply-to", "references"):
+        value = headers.get(header_name, "").strip()
+        if value:
+            message[header_name.title()] = value
+    message.set_content(body_text)
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    try:
+        gmail_service.users().drafts().update(
+            userId="me",
+            id=draft_id,
+            body={"message": {"raw": raw, "threadId": thread_id}},
+        ).execute()
+    except Exception:
+        return False
+    return True
+
+
+def repair_missing_greeting_draft(
+    gmail_service,
+    *,
+    draft: dict[str, Any],
+    body_text: str,
+    candidate_name: str,
+    candidate_email: str,
+) -> tuple[str, bool]:
+    if extract_greeting_first_name(body_text):
+        return body_text, True
+    first_name = extract_first_name(candidate_name, candidate_email)
+    if not first_name or normalize_first_name_for_verification(first_name) in {"candidate", "there"}:
+        return body_text, False
+    repaired_body = apply_email_greeting(body_text, first_name)
+    if repaired_body == body_text:
+        return body_text, True
+    if update_gmail_draft_body_text(gmail_service, draft=draft, body_text=repaired_body):
+        return repaired_body, True
+    return repaired_body, False
+
+
 def send_gmail_draft(gmail_service, draft_id: str) -> str:
     if not draft_id:
         return ""
@@ -5659,19 +5710,51 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 draft_created_at = gmail_draft_created_at(draft or {})
                 now_utc = now.astimezone(timezone.utc)
                 if not draft:
-                    reject_drafts_auto_send_skipped_missing += 1
-                    notify_rejection_draft_issue(
-                        config,
-                        draft_id=reject_draft_id,
-                        issue_key="draft_missing",
-                        heading="Rejection draft is missing. Auto-send skipped.",
-                        candidate_name=candidate_name,
+                    verified_sent_at = thread_latest_manual_rejection_sent_at_any_thread(
+                        gmail_service,
+                        thread_ids=related_thread_ids,
+                        sender_email=config.from_email,
                         candidate_email=candidate_email,
-                        details=[
-                            "*Reason:* Gmail could not find the draft stored on the ATS row.",
-                        ],
-                        notion_url=candidate_notion_url,
                     )
+                    if verified_sent_at:
+                        reject_drafts_auto_sent += 1
+                        current_status = "rejected"
+                        if prop.status in properties_schema:
+                            update_payload[prop.status] = build_notion_value(
+                                properties_schema[prop.status], STATUS_REJECTED
+                            )
+                        if prop.reject_draft_id in properties_schema:
+                            update_payload[prop.reject_draft_id] = build_notion_value(
+                                properties_schema[prop.reject_draft_id], ""
+                            )
+                        if prop.reject_send_at in properties_schema:
+                            update_payload[prop.reject_send_at] = build_notion_value(
+                                properties_schema[prop.reject_send_at], ""
+                            )
+                        archive_labels = [hiring_label_id]
+                        if pipeline_label_id:
+                            archive_labels.append(pipeline_label_id)
+                        archived_count, archive_failures = remove_labels_from_threads(
+                            gmail_service,
+                            thread_ids=related_thread_ids,
+                            label_ids=archive_labels,
+                        )
+                        reject_threads_archived += archived_count
+                        reject_archive_failures += archive_failures
+                    else:
+                        reject_drafts_auto_send_skipped_missing += 1
+                        notify_rejection_draft_issue(
+                            config,
+                            draft_id=reject_draft_id,
+                            issue_key="draft_missing",
+                            heading="Rejection draft is missing. Auto-send skipped.",
+                            candidate_name=candidate_name,
+                            candidate_email=candidate_email,
+                            details=[
+                                "*Reason:* Gmail could not find the draft stored on the ATS row, and no matching sent rejection email was found.",
+                            ],
+                            notion_url=candidate_notion_url,
+                        )
                 elif not draft_created_at:
                     reject_drafts_auto_send_skipped_missing += 1
                     notify_rejection_draft_issue(
@@ -5690,6 +5773,13 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     reject_drafts_auto_send_skipped_young += 1
                 else:
                     draft_body = gmail_draft_body_text(draft)
+                    draft_body, can_send_existing_draft = repair_missing_greeting_draft(
+                        gmail_service,
+                        draft=draft,
+                        body_text=draft_body,
+                        candidate_name=candidate_name,
+                        candidate_email=candidate_email,
+                    )
                     name_evidence = build_rejection_first_name_evidence(
                         gmail_service,
                         thread_ids=related_thread_ids,
@@ -5737,7 +5827,16 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                 properties_schema[prop.status], STATUS_NEEDS_ATTENTION
                             )
                     else:
-                        sent_message_id = send_gmail_draft(gmail_service, reject_draft_id)
+                        if can_send_existing_draft:
+                            sent_message_id = send_gmail_draft(gmail_service, reject_draft_id)
+                        else:
+                            sent_message_id = send_reply_email(
+                                gmail_service,
+                                sender_email=config.from_email,
+                                to_email=candidate_email,
+                                thread_id=reply_thread_id,
+                                body_text=draft_body,
+                            )
                         if sent_message_id:
                             reject_drafts_auto_sent += 1
                             current_status = "rejected"

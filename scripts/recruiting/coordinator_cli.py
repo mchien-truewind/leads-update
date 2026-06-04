@@ -3792,6 +3792,9 @@ def collect_review_candidates_for_slack(
         status = status_key(notion_prop_value(props.get(prop_map.status, {})))
         if status and status != "awaiting decision":
             continue
+        decision = notion_prop_value(props.get(prop_map.decision, {})).strip()
+        if decision:
+            continue
         source = notion_prop_value(props.get(prop_map.source, {})).strip()
         if clean_text(source).lower() == SOURCE_SUPERPOSITION.lower():
             continue
@@ -3832,6 +3835,9 @@ def collect_active_candidates_for_weekly_slack(
     for page in notion.query_pages({"page_size": 100}):
         props = page.get("properties", {})
         status = canonical_status(notion_prop_value(props.get(prop_map.status, {})))
+        decision = notion_prop_value(props.get(prop_map.decision, {})).strip().lower()
+        if decision == "reject":
+            continue
         if status_is_terminal(status):
             continue
         if should_exclude_from_active_digest(status):
@@ -4067,9 +4073,6 @@ def sync_slack_decisions(
         update_payload: dict[str, Any] = {}
         update_payload[prop.decision] = build_notion_value(properties[prop.decision], decision.title())
         update_payload[prop.decision_time] = build_notion_value(properties[prop.decision_time], now_iso)
-        if prop.status in properties:
-            if decision == "reject":
-                update_payload[prop.status] = build_notion_value(properties[prop.status], STATUS_REJECTED)
 
         # Reset stale workflow fields when decision changes.
         if decision == "proceed":
@@ -4274,14 +4277,6 @@ def canonical_status(status: str, default: str = STATUS_AWAITING_DECISION) -> st
 
 def status_key(status: str) -> str:
     return canonical_status(status).lower()
-
-
-def rejected_with_pending_automation(status: str, decision: str, reject_draft_id: str, reject_send_at: str) -> bool:
-    return (
-        status_key(status) == "rejected"
-        and clean_text(decision).lower() == "reject"
-        and bool(clean_text(reject_draft_id) or clean_text(reject_send_at))
-    )
 
 
 def page_role_values(page_props: dict[str, Any], prop_map: NotionPropertyMap) -> set[str]:
@@ -5253,12 +5248,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             fallback_thread_id=thread_id,
         )
 
-        if status_is_terminal(current_status_raw) and not rejected_with_pending_automation(
-            current_status_raw,
-            decision,
-            reject_draft_id_raw,
-            reject_send_at_raw,
-        ):
+        if status_is_terminal(current_status_raw):
             archive_labels = [label_id for label_id in (hiring_label_id, pipeline_label_id) if label_id]
             if archive_labels:
                 archived_count, archive_failures = remove_labels_from_threads(
@@ -5592,7 +5582,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                 )
                             if prop.status in properties_schema:
                                 update_payload[prop.status] = build_notion_value(
-                                    properties_schema[prop.status], STATUS_REJECTED
+                                    properties_schema[prop.status], STATUS_NO_RESPONSE
                                 )
             if update_payload:
                 notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
@@ -5921,9 +5911,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         properties_schema[prop.reject_send_at], iso(reject_send_at)
                     )
                 if prop.status in properties_schema:
-                    update_payload[prop.status] = build_notion_value(
-                        properties_schema[prop.status], STATUS_REJECTED
-                    )
+                    update_payload.pop(prop.status, None)
             elif now >= reject_send_at and not reject_draft_id:
                 draft_id = create_reply_draft(
                     gmail_service,
@@ -5938,9 +5926,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         properties_schema[prop.reject_draft_id], draft_id
                     )
                 if prop.status in properties_schema:
-                    update_payload[prop.status] = build_notion_value(
-                        properties_schema[prop.status], STATUS_REJECTED
-                    )
+                    update_payload.pop(prop.status, None)
             if current_status != "rejected" and not in_pipeline:
                 # Mark as rejected once an outbound email is actually sent after the reject decision.
                 # This works for both generated drafts and manual sends.

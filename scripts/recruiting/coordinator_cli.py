@@ -710,6 +710,10 @@ class SlackClient:
             },
         )
 
+    def get_message_permalink(self, channel_id: str, message_ts: str) -> str:
+        response = self._request("chat.getPermalink", {"channel": channel_id, "message_ts": message_ts})
+        return str(response.get("permalink", "") or "")
+
     def list_channel_messages(self, channel_id: str, oldest_ts: float) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         cursor = ""
@@ -3626,9 +3630,26 @@ def load_slack_posted_threads(path: Path) -> set[str]:
     return set()
 
 
-def save_slack_posted_threads(path: Path, thread_ids: set[str]) -> None:
+def load_slack_review_links(path: Path) -> dict[str, str]:
     payload = load_slack_state(path)
+    raw_items = payload.get("posted_thread_links", {})
+    if isinstance(raw_items, dict):
+        return {
+            str(thread_id).strip(): str(url).strip()
+            for thread_id, url in raw_items.items()
+            if str(thread_id).strip() and str(url).strip()
+        }
+    return {}
+
+
+def save_slack_posted_threads(path: Path, thread_ids: set[str], thread_links: dict[str, str] | None = None) -> None:
+    payload = load_slack_state(path)
+    existing_links = load_slack_review_links(path)
+    if thread_links:
+        existing_links.update({key: value for key, value in thread_links.items() if key and value})
     payload["posted_thread_ids"] = sorted(thread_ids)
+    if existing_links:
+        payload["posted_thread_links"] = dict(sorted(existing_links.items()))
     save_slack_state(path, payload)
 
 
@@ -3664,19 +3685,34 @@ def save_rejection_name_failure_notified_draft(path: Path, draft_id: str) -> Non
     save_slack_state(path, payload)
 
 
-def load_recent_slack_posted_threads(config: Config, client: SlackClient, channel_id: str) -> set[str]:
+def load_recent_slack_posted_threads(
+    config: Config,
+    client: SlackClient,
+    channel_id: str,
+) -> tuple[set[str], dict[str, str]]:
     oldest_ts = (datetime.now(timezone.utc) - timedelta(days=config.slack_history_lookback_days)).timestamp()
     try:
         messages = client.list_channel_messages(channel_id, oldest_ts)
     except Exception:
-        return set()
+        return set(), {}
 
     thread_ids: set[str] = set()
+    thread_links: dict[str, str] = {}
     for message in messages:
         thread_id = extract_thread_id_from_slack_message(message.get("text", ""))
         if thread_id:
             thread_ids.add(thread_id)
-    return thread_ids
+            permalink = str(message.get("permalink", "") or "").strip()
+            if not permalink:
+                message_ts = str(message.get("ts", "") or "").strip()
+                if message_ts:
+                    try:
+                        permalink = client.get_message_permalink(channel_id, message_ts)
+                    except Exception:
+                        permalink = ""
+            if permalink:
+                thread_links[thread_id] = permalink
+    return thread_ids, thread_links
 
 
 def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, str]]) -> tuple[int, int]:
@@ -3685,15 +3721,25 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
 
     client = slack_post_client(config)
     posted_threads = load_slack_posted_threads(config.slack_state_file)
+    posted_thread_links = load_slack_review_links(config.slack_state_file)
     state_changed = False
     try:
         channel_id = client.resolve_channel_id(config.slack_review_channel)
     except Exception:
         return 0, len(candidates)
-    history_posted_threads = load_recent_slack_posted_threads(config, client, channel_id)
+    history_posted_threads, history_thread_links = load_recent_slack_posted_threads(config, client, channel_id)
     if history_posted_threads.difference(posted_threads):
         posted_threads.update(history_posted_threads)
         state_changed = True
+    if history_thread_links:
+        new_links = {
+            thread_id: url
+            for thread_id, url in history_thread_links.items()
+            if posted_thread_links.get(thread_id) != url
+        }
+        if new_links:
+            posted_thread_links.update(new_links)
+            state_changed = True
     posted = 0
     failed = 0
     mention_prefix = f"<@{config.slack_mention_user_id}> " if config.slack_mention_user_id else ""
@@ -3766,16 +3812,24 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
             blocks.append({"type": "actions", "elements": action_elements})
 
         try:
-            client.post_message(channel_id, fallback_text, blocks)
+            response = client.post_message(channel_id, fallback_text, blocks)
             posted += 1
             posted_threads.add(thread_id)
+            message_ts = str(response.get("ts", "") or "").strip()
+            if message_ts:
+                try:
+                    permalink = client.get_message_permalink(channel_id, message_ts)
+                except Exception:
+                    permalink = ""
+                if permalink:
+                    posted_thread_links[thread_id] = permalink
             state_changed = True
         except Exception as exc:
             print(f"Slack review post failed for thread {thread_id}: {exc}")
             failed += 1
 
     if state_changed:
-        save_slack_posted_threads(config.slack_state_file, posted_threads)
+        save_slack_posted_threads(config.slack_state_file, posted_threads, posted_thread_links)
     return posted, failed
 
 
@@ -3848,18 +3902,112 @@ def collect_active_candidates_for_weekly_slack(
                 "role": notion_prop_value(props.get(prop_map.role, {})).strip() or "Unknown",
                 "status": status,
                 "notion_url": notion_page_url(page.get("id", "")),
+                "thread_id": notion_prop_value(props.get(prop_map.gmail_thread_id, {})).strip(),
                 "date_first_entered": notion_prop_value(props.get(prop_map.date_first_entered, {})).strip(),
             }
         )
 
     candidates.sort(
         key=lambda item: (
-            (item.get("status", "") or "").lower(),
+            active_digest_status_rank(item.get("status", "")),
             item.get("date_first_entered", ""),
             item.get("candidate_name", ""),
         )
     )
     return candidates
+
+
+def active_digest_status_rank(status: str) -> tuple[int, str]:
+    key = status_key(status)
+    if key in ATS_DIGEST_STATUS_PRIORITY:
+        return (ATS_DIGEST_STATUS_PRIORITY[key], key)
+    return (len(ATS_DIGEST_STATUS_PRIORITY), key)
+
+
+def active_digest_status_summary(counts: Counter[str]) -> str:
+    ordered = sorted(counts.items(), key=lambda item: (*active_digest_status_rank(item[0]), item[0]))
+    return ", ".join(f"{status}: {count}" for status, count in ordered)
+
+
+def active_digest_candidate_line(candidate: dict[str, str]) -> str:
+    candidate_name = candidate.get("candidate_name", "Unknown")
+    role = candidate.get("role", "Unknown")
+    status = candidate.get("status", STATUS_AWAITING_DECISION)
+    notion_url = candidate.get("notion_url", "")
+    slack_review_url = candidate.get("slack_review_url", "")
+    if slack_review_url:
+        candidate_display = f"<{slack_review_url}|{candidate_name}>"
+    elif notion_url:
+        candidate_display = f"<{notion_url}|{candidate_name}>"
+    else:
+        candidate_display = candidate_name
+
+    parts = [f"* {candidate_display}", status, role]
+    if slack_review_url and notion_url:
+        parts.append(f"<{notion_url}|ATS>")
+    elif status_key(status) == status_key(STATUS_AWAITING_DECISION):
+        parts.append("review thread missing")
+    return " | ".join(parts)
+
+
+def build_active_candidates_digest_blocks(
+    *,
+    heading: str,
+    mention_prefix: str,
+    candidates: list[dict[str, str]],
+    slot_key: str,
+) -> tuple[list[dict[str, Any]], str]:
+    counts = Counter(candidate.get("status", STATUS_AWAITING_DECISION) for candidate in candidates)
+    summary = active_digest_status_summary(counts)
+    actionable = [
+        candidate
+        for candidate in candidates
+        if status_key(candidate.get("status", "")) in ATS_DIGEST_ACTION_STATUS_KEYS
+    ]
+    actionable.sort(
+        key=lambda item: (
+            active_digest_status_rank(item.get("status", "")),
+            item.get("date_first_entered", ""),
+            item.get("candidate_name", ""),
+        )
+    )
+    displayed = actionable
+
+    headline = f"{mention_prefix}{heading}: {len(actionable)} need action, {len(candidates)} active total."
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": headline}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Status summary:* {summary}"}},
+    ]
+
+    if displayed:
+        lines = ["*Action queue:*", *(active_digest_candidate_line(candidate) for candidate in displayed)]
+    else:
+        lines = ["*Action queue:*", "_No Needs Attention or Awaiting Decision candidates right now._"]
+
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}})
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"{ATS_FOLLOW_UP_SLOT_MARKER_PREFIX}{slot_key}"}],
+        }
+    )
+
+    fallback_text = f"{headline} {summary} {ATS_FOLLOW_UP_SLOT_MARKER_PREFIX}{slot_key}"
+    return blocks, fallback_text
+
+
+def attach_slack_review_links(
+    candidates: list[dict[str, str]],
+    thread_links: dict[str, str],
+) -> list[dict[str, str]]:
+    enriched: list[dict[str, str]] = []
+    for candidate in candidates:
+        item = candidate.copy()
+        thread_id = item.get("thread_id", "").strip()
+        if thread_id and thread_links.get(thread_id):
+            item["slack_review_url"] = thread_links[thread_id]
+        enriched.append(item)
+    return enriched
 
 
 def weekly_active_review_slot_key(dt: datetime) -> str:
@@ -3936,42 +4084,26 @@ def post_weekly_active_candidates_digest(
 
     mention_prefix = f"<@{config.slack_mention_user_id}> " if config.slack_mention_user_id else ""
 
-    counts = Counter(candidate.get("status", "Awaiting Decision") for candidate in candidates)
-    summary = ", ".join(f"{status}: {count}" for status, count in sorted(counts.items()))
-    lines = [
-        f"* <{candidate['notion_url']}|{candidate['candidate_name']}> | {candidate['status']} | {candidate['role']}"
-        if candidate.get("notion_url")
-        else f"* {candidate['candidate_name']} | {candidate['status']} | {candidate['role']}"
-        for candidate in candidates
-    ]
-
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"{mention_prefix}{heading}: {len(candidates)} non-terminal candidates still need review.",
-            },
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Status summary:* {summary}"}},
-    ]
-    for idx in range(0, len(lines), 15):
-        blocks.append(
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": "\n".join(lines[idx : idx + 15])},
-            }
-        )
-    blocks.append(
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"{ATS_FOLLOW_UP_SLOT_MARKER_PREFIX}{slot_key}"}],
+    review_links = load_slack_review_links(config.slack_state_file)
+    _recent_threads, recent_review_links = load_recent_slack_posted_threads(config, client, channel_id)
+    if recent_review_links:
+        updated_review_links = {
+            thread_id: url
+            for thread_id, url in recent_review_links.items()
+            if review_links.get(thread_id) != url
         }
-    )
+        if updated_review_links:
+            review_links.update(updated_review_links)
+            posted_threads = load_slack_posted_threads(config.slack_state_file)
+            posted_threads.update(recent_review_links.keys())
+            save_slack_posted_threads(config.slack_state_file, posted_threads, review_links)
 
-    fallback_text = (
-        f"{mention_prefix}{heading}: {len(candidates)} non-terminal candidates still need review. "
-        f"{summary} {ATS_FOLLOW_UP_SLOT_MARKER_PREFIX}{slot_key}"
+    candidates_with_links = attach_slack_review_links(candidates, review_links)
+    blocks, fallback_text = build_active_candidates_digest_blocks(
+        heading=heading,
+        mention_prefix=mention_prefix,
+        candidates=candidates_with_links,
+        slot_key=slot_key,
     )
     try:
         client.post_message(channel_id, fallback_text, blocks)
@@ -4246,6 +4378,19 @@ ATS_FOLLOW_UP_WEEKDAYS = {
 }
 ATS_FOLLOW_UP_HOUR = 17
 ATS_FOLLOW_UP_SLOT_MARKER_PREFIX = "ATS_ACTIVE_REVIEW_SLOT:"
+ATS_DIGEST_STATUS_PRIORITY = {
+    "needs attention": 0,
+    "awaiting decision": 1,
+    "round 1 scheduling": 2,
+    "scheduling sent": 3,
+    "waiting on customgpt": 4,
+    "interview in process": 5,
+    "no response": 6,
+}
+ATS_DIGEST_ACTION_STATUS_KEYS = {
+    "needs attention",
+    "awaiting decision",
+}
 
 
 def notion_prop_values(prop: dict[str, Any]) -> list[str]:

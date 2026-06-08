@@ -259,10 +259,12 @@ class SlackMentionBehaviorTests(unittest.TestCase):
             config.slack_state_file = Path(tmpdir) / "slack-posted.json"
 
             with mock.patch.object(cli, "requests", mock.Mock()), mock.patch.object(
-                cli, "load_recent_slack_posted_threads", return_value=set()
+                cli, "load_recent_slack_posted_threads", return_value=(set(), {})
             ), mock.patch.object(
                 cli.SlackClient, "resolve_channel_id", return_value="C123"
             ), mock.patch.object(cli.SlackClient, "auth_test", side_effect=AssertionError("auth_test fallback called")), mock.patch.object(
+                cli.SlackClient, "get_message_permalink", return_value="https://truewind.slack.com/review"
+            ), mock.patch.object(
                 cli.SlackClient, "post_message", return_value={"ok": True, "ts": "123.456"}
             ) as post_message:
                 posted, failed = cli.post_candidate_reviews_to_slack(config, [candidate])
@@ -301,6 +303,99 @@ class ProceedRoleRoutingTests(unittest.TestCase):
                 }
 
                 self.assertTrue(cli.uses_custom_gpt_first_round(page_props, prop_map))
+
+
+class ActiveAtsDigestTests(unittest.TestCase):
+    def _candidate(
+        self,
+        name: str,
+        status: str,
+        date_first_entered: str = "2026-06-01",
+        thread_id: str = "",
+        slack_review_url: str = "",
+    ) -> dict[str, str]:
+        return {
+            "candidate_name": name,
+            "role": "AE",
+            "status": status,
+            "notion_url": f"https://notion.so/{name.replace(' ', '-')}",
+            "date_first_entered": date_first_entered,
+            "thread_id": thread_id,
+            "slack_review_url": slack_review_url,
+        }
+
+    def _digest_text(self, candidates: list[dict[str, str]]) -> str:
+        blocks, fallback_text = cli.build_active_candidates_digest_blocks(
+            heading="Daily ATS follow-up",
+            mention_prefix="<@U123> ",
+            candidates=candidates,
+            slot_key="2026-06-08-monday-1700",
+        )
+        block_text = "\n".join(
+            block.get("text", {}).get("text", "")
+            for block in blocks
+            if block.get("type") == "section"
+        )
+        return f"{fallback_text}\n{block_text}"
+
+    def test_active_digest_shows_all_awaiting_decision_candidates_with_slack_links(self):
+        candidates = [
+            self._candidate(f"Needs Attention {idx:02d}", cli.STATUS_NEEDS_ATTENTION, f"2026-06-{idx + 1:02d}")
+            for idx in range(2)
+        ] + [
+            self._candidate(
+                f"Awaiting Decision {idx:02d}",
+                cli.STATUS_AWAITING_DECISION,
+                f"2026-06-{idx + 1:02d}",
+                thread_id=f"gmail-{idx}",
+                slack_review_url=f"https://truewind.slack.com/archives/C123/p{idx:016d}",
+            )
+            for idx in range(20)
+        ] + [
+            self._candidate(f"Waiting {idx:02d}", cli.STATUS_WAITING_ON_CUSTOM_GPT)
+            for idx in range(2)
+        ]
+
+        text = self._digest_text(candidates)
+
+        self.assertIn("Daily ATS follow-up: 22 need action, 24 active total.", text)
+        self.assertIn("*Status summary:* Needs Attention: 2, Awaiting Decision: 20, Waiting on CustomGPT: 2", text)
+        self.assertIn("<https://truewind.slack.com/archives/C123/p0000000000000000|Awaiting Decision 00>", text)
+        self.assertIn("<https://truewind.slack.com/archives/C123/p0000000000000019|Awaiting Decision 19>", text)
+        self.assertIn("<https://notion.so/Awaiting-Decision-19|ATS>", text)
+        self.assertNotIn("more hidden", text)
+        self.assertNotIn("Waiting 00", text)
+
+    def test_active_digest_summarizes_non_action_statuses_without_candidate_dump(self):
+        candidates = [
+            self._candidate("Round One", cli.STATUS_ROUND_1_SCHEDULING),
+            self._candidate("Scheduling Sent", cli.STATUS_SCHEDULING_SENT),
+            self._candidate("Interviewing", cli.STATUS_INTERVIEW_IN_PROCESS),
+            self._candidate("CustomGPT", cli.STATUS_WAITING_ON_CUSTOM_GPT),
+        ]
+
+        text = self._digest_text(candidates)
+
+        self.assertIn("Daily ATS follow-up: 0 need action, 4 active total.", text)
+        self.assertIn("No Needs Attention or Awaiting Decision candidates right now.", text)
+        self.assertIn("Round 1 Scheduling: 1", text)
+        self.assertIn("Scheduling Sent: 1", text)
+        self.assertIn("Waiting on CustomGPT: 1", text)
+        self.assertIn("Interview in Process: 1", text)
+        self.assertNotIn("<https://notion.so/Round-One|Round One>", text)
+        self.assertNotIn("<https://notion.so/CustomGPT|CustomGPT>", text)
+
+    def test_slack_review_links_are_attached_by_gmail_thread_id(self):
+        candidates = [
+            self._candidate("Linked Candidate", cli.STATUS_AWAITING_DECISION, thread_id="thread-1"),
+            self._candidate("Missing Link", cli.STATUS_AWAITING_DECISION, thread_id="thread-2"),
+        ]
+
+        enriched = cli.attach_slack_review_links(candidates, {"thread-1": "https://truewind.slack.com/review"})
+        text = self._digest_text(enriched)
+
+        self.assertIn("<https://truewind.slack.com/review|Linked Candidate>", text)
+        self.assertIn("* <https://notion.so/Missing-Link|Missing Link> | Awaiting Decision | AE | review thread missing", text)
 
 
 if __name__ == "__main__":

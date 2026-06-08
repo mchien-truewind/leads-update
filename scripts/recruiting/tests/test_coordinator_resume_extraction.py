@@ -338,6 +338,68 @@ class ActiveAtsDigestTests(unittest.TestCase):
         )
         return f"{fallback_text}\n{block_text}"
 
+    def _notion_schema(self) -> dict[str, object]:
+        return {
+            "properties": {
+                "Candidate Name": {"type": "title"},
+                "Source": {"type": "select"},
+                "Role": {"type": "multi_select"},
+                "Status": {"type": "select"},
+                "Decision": {"type": "select"},
+                "Gmail thread id": {"type": "rich_text"},
+                "Date first entered": {"type": "date"},
+            }
+        }
+
+    def _notion_page(
+        self,
+        name: str,
+        source: str,
+        *,
+        status: str = cli.STATUS_AWAITING_DECISION,
+        decision: str = "",
+    ) -> dict[str, object]:
+        return {
+            "id": name.lower().replace(" ", "-"),
+            "properties": {
+                "Candidate Name": {"type": "title", "title": [{"plain_text": name}]},
+                "Source": {"type": "select", "select": {"name": source.strip()} if source.strip() else None},
+                "Role": {"type": "multi_select", "multi_select": [{"name": "AE"}]},
+                "Status": {"type": "select", "select": {"name": status}},
+                "Decision": {"type": "select", "select": {"name": decision} if decision else None},
+                "Gmail thread id": {
+                    "type": "rich_text",
+                    "rich_text": [{"plain_text": f"thread-{name.lower().replace(' ', '-')}"}],
+                },
+                "Date first entered": {"type": "date", "date": {"start": "2026-06-01"}},
+            },
+        }
+
+    def test_active_digest_collector_only_includes_inbound_source(self):
+        class FakeNotion:
+            def __init__(self, pages):
+                self.pages = pages
+
+            def query_pages(self, payload=None):
+                return self.pages
+
+        pages = [
+            self._notion_page("Inbound One", cli.SOURCE_INBOUND),
+            self._notion_page("Inbound Two", " inbound "),
+            self._notion_page("Superposition Candidate", cli.SOURCE_SUPERPOSITION),
+            self._notion_page("Blank Source", ""),
+            self._notion_page("Referral Candidate", "Referral"),
+        ]
+
+        candidates = cli.collect_active_candidates_for_weekly_slack(
+            FakeNotion(pages),
+            self._notion_schema(),
+            cli.NotionPropertyMap(),
+        )
+
+        self.assertEqual([candidate["candidate_name"] for candidate in candidates], ["Inbound One", "Inbound Two"])
+        self.assertTrue(all(candidate["source"].strip().lower() == "inbound" for candidate in candidates))
+
     def test_active_digest_shows_all_awaiting_decision_candidates_with_slack_links(self):
         candidates = [
             self._candidate(f"Needs Attention {idx:02d}", cli.STATUS_NEEDS_ATTENTION, f"2026-06-{idx + 1:02d}")

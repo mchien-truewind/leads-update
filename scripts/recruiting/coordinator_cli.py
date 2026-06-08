@@ -3888,6 +3888,9 @@ def collect_active_candidates_for_weekly_slack(
     candidates: list[dict[str, str]] = []
     for page in notion.query_pages({"page_size": 100}):
         props = page.get("properties", {})
+        source = notion_prop_value(props.get(prop_map.source, {})).strip()
+        if clean_text(source).lower() != SOURCE_INBOUND.lower():
+            continue
         status = canonical_status(notion_prop_value(props.get(prop_map.status, {})))
         decision = notion_prop_value(props.get(prop_map.decision, {})).strip().lower()
         if decision == "reject":
@@ -3900,6 +3903,7 @@ def collect_active_candidates_for_weekly_slack(
             {
                 "candidate_name": notion_prop_value(props.get(title_prop_name, {})).strip() or "Unknown",
                 "role": notion_prop_value(props.get(prop_map.role, {})).strip() or "Unknown",
+                "source": source,
                 "status": status,
                 "notion_url": notion_page_url(page.get("id", "")),
                 "thread_id": notion_prop_value(props.get(prop_map.gmail_thread_id, {})).strip(),

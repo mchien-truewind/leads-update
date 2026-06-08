@@ -44,6 +44,7 @@ const CONFIG = {
     ['https://api.calendly.com/users/faa4a75c-b934-4b35-8b42-eef03611a78b', 'Amy Vetter'],
   ]),
 };
+const CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY = 'calendly_meeting_booked';
 
 function readRequestBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
@@ -480,15 +481,35 @@ async function ensureCompany({ payload }) {
   return createCompany(identity);
 }
 
-async function createContact({ name, email }) {
+function buildCalendlyContactProperties({ name, email, markMeetingBooked = false }) {
   const nameParts = splitName(name);
+  const properties = {
+    email: clean(email),
+    ...nameParts,
+  };
+  if (markMeetingBooked) properties[CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY] = 'true';
+  return properties;
+}
+
+async function updateContactProperties(contactId, properties) {
+  if (!contactId || !properties || !Object.keys(properties).length) return null;
+  return hubspotRequest(`/crm/v3/objects/contacts/${contactId}`, {
+    method: 'PATCH',
+    body: { properties },
+  });
+}
+
+async function markContactCalendlyMeetingBooked(contactId) {
+  return updateContactProperties(contactId, {
+    [CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY]: 'true',
+  });
+}
+
+async function createContact({ name, email, markMeetingBooked = false }) {
   return hubspotRequest('/crm/v3/objects/contacts', {
     method: 'POST',
     body: {
-      properties: {
-        email: clean(email),
-        ...nameParts,
-      },
+      properties: buildCalendlyContactProperties({ name, email, markMeetingBooked }),
     },
   });
 }
@@ -629,8 +650,11 @@ async function ensureContact({ payload }) {
   const email = clean(payload.email);
   if (!email) throw new Error('Calendly invitee payload missing email');
   const existing = await findContactByEmail(email);
-  if (existing) return existing;
-  return createContact({ name: payload.name, email });
+  if (existing) {
+    await markContactCalendlyMeetingBooked(existing.id);
+    return existing;
+  }
+  return createContact({ name: payload.name, email, markMeetingBooked: true });
 }
 
 async function handleInviteeCreated(payload, scheduledEvent, filter) {
@@ -842,7 +866,9 @@ async function handleCalendlyHubSpotWebhook(req, res, { logger = console } = {})
 
 module.exports = {
   CONFIG,
+  CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY,
   buildDealName,
+  buildCalendlyContactProperties,
   findAllowedHostUserUri,
   getCompanyNameFromPayload,
   getCompanyIdentityFromPayload,

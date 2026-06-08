@@ -6,6 +6,8 @@ const path = require('path');
 
 const {
   CONFIG,
+  CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY,
+  buildCalendlyContactProperties,
   buildDealName,
   findAllowedHostUserUri,
   getCompanyIdentityFromPayload,
@@ -199,6 +201,34 @@ function testCompanyIdentityExtraction() {
   );
 }
 
+function testCalendlyContactPropertiesMarkMeetingBooked() {
+  assert.strictEqual(CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY, 'calendly_meeting_booked');
+  assert.deepStrictEqual(
+    buildCalendlyContactProperties({
+      name: 'Ada Lovelace',
+      email: 'ada@acme-finance.com',
+      markMeetingBooked: true,
+    }),
+    {
+      email: 'ada@acme-finance.com',
+      firstname: 'Ada',
+      lastname: 'Lovelace',
+      calendly_meeting_booked: 'true',
+    },
+  );
+  assert.deepStrictEqual(
+    buildCalendlyContactProperties({
+      name: 'Ada Lovelace',
+      email: 'ada@acme-finance.com',
+    }),
+    {
+      email: 'ada@acme-finance.com',
+      firstname: 'Ada',
+      lastname: 'Lovelace',
+    },
+  );
+}
+
 function testOrganizerName() {
   assert.strictEqual(
     getOrganizerName('https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01'),
@@ -237,6 +267,7 @@ async function run() {
   testDealName();
   testCompanyNameExtraction();
   testCompanyIdentityExtraction();
+  testCalendlyContactPropertiesMarkMeetingBooked();
   testOrganizerName();
   testConfigHasExpectedCloseLostStage();
 }

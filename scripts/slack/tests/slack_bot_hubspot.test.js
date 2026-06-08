@@ -15,6 +15,7 @@ process.env.SLACK_TO_HUBSPOT_OWNER_JSON = JSON.stringify({
 const {
   TOOLS,
   TRUEWIND_HUBSPOT,
+  __setHubSpotRequestOverrideForTests,
   buildDealNoteBody,
   buildRecruitingCalendarInvite,
   classifyProgressDealSource,
@@ -52,6 +53,7 @@ const {
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
   matchingActivityKeywords,
+  runStructuredDealCreateWorkflow,
   summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
 } = require('../slack_bot');
@@ -64,6 +66,18 @@ function seedHubSpotProperty(objectType, name, overrides = {}) {
     options: [],
     ...overrides,
   });
+}
+
+function seedStructuredDealWorkflowProperties() {
+  for (const property of ['email', 'firstname', 'lastname', 'company', 'jobtitle', 'contact_type', 'erp', 'lead_source', 'hubspot_owner_id', 'lifecyclestage', 'hs_lead_status', 'linkedin___profile', 'hs_linkedin_url', 'linkedin_profile_url']) {
+    seedHubSpotProperty('contacts', property);
+  }
+  for (const property of ['name', 'domain']) {
+    seedHubSpotProperty('companies', property);
+  }
+  for (const property of ['dealname', 'pipeline', 'dealstage', 'hubspot_owner_id', 'deal_source', 'erp', 'amount', 'closedate']) {
+    seedHubSpotProperty('deals', property);
+  }
 }
 
 async function testConvertedLeadStatusUsesInternalValue() {
@@ -1065,6 +1079,208 @@ function testHubSpotRecordUrlsUseObjectTypeIds() {
   );
 }
 
+async function testStructuredDealWorkflowBlocksOpenDuplicateDeal() {
+  seedStructuredDealWorkflowProperties();
+  const calls = [];
+  const duplicateDeal = {
+    id: '60896321431',
+    properties: {
+      dealname: 'Oakland Promise - Xavier Marco - 2026-06-11',
+      pipeline: TRUEWIND_HUBSPOT.pipeline,
+      dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
+      hs_is_closed: 'false',
+      hubspot_owner_id: TRUEWIND_HUBSPOT.defaultOwnerId,
+      hs_lastmodifieddate: '2026-06-07T12:00:00.000Z',
+    },
+  };
+
+  __setHubSpotRequestOverrideForTests(async (endpoint, method = 'GET', body = null) => {
+    calls.push({ endpoint, method, body });
+    if (endpoint === '/crm/v3/objects/contacts/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/contacts' && method === 'POST') return { id: '221459934275', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/companies/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/companies' && method === 'POST') return { id: '54941778205', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/deals/search' && body.filterGroups?.[0]?.filters?.some(filter => filter.operator === 'CONTAINS_TOKEN')) {
+      return { results: [duplicateDeal] };
+    }
+    if (endpoint === '/crm/v3/objects/deals/search') return { results: [] };
+    if (endpoint.includes('/associations/')) return { results: [] };
+    throw new Error(`Unexpected HubSpot mock call: ${method} ${endpoint}`);
+  });
+
+  try {
+    const result = await runStructuredDealCreateWorkflow({
+      company: 'Oakland Promise',
+      contact: 'Xavier Marco',
+      email: 'xavier@oaklandpromise.org',
+      lead_source: 'Referral',
+      slack_user_id: 'U_TEST',
+    });
+    const parsed = JSON.parse(result);
+    assert.strictEqual(parsed.error, 'duplicate_deal_exists');
+    assert.deepStrictEqual(parsed.existing_deal, {
+      id: '60896321431',
+      name: 'Oakland Promise - Xavier Marco - 2026-06-11',
+      stage: 'MQL',
+      owner: 'Xavier Marco',
+      url: 'https://app.hubspot.com/contacts/43974586/record/0-3/60896321431',
+    });
+    assert.strictEqual(
+      calls.some(call => call.endpoint === '/crm/v3/objects/deals' && call.method === 'POST'),
+      false,
+    );
+  } finally {
+    __setHubSpotRequestOverrideForTests(null);
+  }
+}
+
+async function testStructuredDealWorkflowAllowsExplicitDuplicateOverride() {
+  seedStructuredDealWorkflowProperties();
+  const calls = [];
+
+  __setHubSpotRequestOverrideForTests(async (endpoint, method = 'GET', body = null) => {
+    calls.push({ endpoint, method, body });
+    if (endpoint === '/crm/v3/objects/contacts/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/contacts' && method === 'POST') return { id: '221459934275', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/companies/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/companies' && method === 'POST') return { id: '54941778205', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/deals/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/deals' && method === 'POST') return { id: '60896321432', properties: body.properties };
+    if (endpoint.includes('/associations/')) return {};
+    if (endpoint === '/crm/v3/objects/contacts/221459934275' && method === 'PATCH') return { id: '221459934275', properties: body.properties };
+    throw new Error(`Unexpected HubSpot mock call: ${method} ${endpoint}`);
+  });
+
+  try {
+    const result = await runStructuredDealCreateWorkflow({
+      company: 'Oakland Promise',
+      contact: 'Xavier Marco',
+      email: 'xavier@oaklandpromise.org',
+      lead_source: 'Referral',
+      slack_user_id: 'U_TEST',
+      check_duplicates: false,
+    });
+    assert.match(result, /Deal created: Oakland Promise - New Deal/);
+    assert.match(result, /Deal ID: 60896321432/);
+    assert.strictEqual(
+      calls.some(call => call.endpoint === '/crm/v3/objects/deals' && call.method === 'POST'),
+      true,
+    );
+    assert.strictEqual(
+      calls.some(call => call.endpoint.includes('/associations/deals')),
+      false,
+    );
+  } finally {
+    __setHubSpotRequestOverrideForTests(null);
+  }
+}
+
+async function testStructuredDealWorkflowIgnoresAssociatedDealInDifferentPipeline() {
+  seedStructuredDealWorkflowProperties();
+  const calls = [];
+  const otherPipelineDeal = {
+    id: '60896321433',
+    properties: {
+      dealname: 'Oakland Promise - Old Pipeline',
+      pipeline: 'default',
+      dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
+      hs_is_closed: 'false',
+      hubspot_owner_id: TRUEWIND_HUBSPOT.defaultOwnerId,
+      hs_lastmodifieddate: '2026-06-07T12:00:00.000Z',
+    },
+  };
+
+  __setHubSpotRequestOverrideForTests(async (endpoint, method = 'GET', body = null) => {
+    calls.push({ endpoint, method, body });
+    if (endpoint === '/crm/v3/objects/contacts/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/contacts' && method === 'POST') return { id: '221459934275', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/companies/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/companies' && method === 'POST') return { id: '54941778205', properties: body.properties };
+    if (endpoint === '/crm/v4/objects/0-2/54941778205/associations/0-3?limit=100') {
+      return { results: [{ toObjectId: '60896321433' }] };
+    }
+    if (endpoint === '/crm/v3/objects/0-3/batch/read') return { results: [otherPipelineDeal] };
+    if (endpoint.includes('/associations/')) return { results: [] };
+    if (endpoint === '/crm/v3/objects/deals/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/deals' && method === 'POST') return { id: '60896321434', properties: body.properties };
+    throw new Error(`Unexpected HubSpot mock call: ${method} ${endpoint}`);
+  });
+
+  try {
+    const result = await runStructuredDealCreateWorkflow({
+      company: 'Oakland Promise',
+      contact: 'Xavier Marco',
+      email: 'xavier@oaklandpromise.org',
+      lead_source: 'Referral',
+      slack_user_id: 'U_TEST',
+    });
+    assert.match(result, /Deal created: Oakland Promise - New Deal/);
+    assert.match(result, /Deal ID: 60896321434/);
+    assert.strictEqual(
+      calls.some(call => call.endpoint === '/crm/v3/objects/deals' && call.method === 'POST'),
+      true,
+    );
+  } finally {
+    __setHubSpotRequestOverrideForTests(null);
+  }
+}
+
+async function testProspectWorkflowBlocksOpenDuplicateDeal() {
+  seedStructuredDealWorkflowProperties();
+  const calls = [];
+  const duplicateDeal = {
+    id: '60896321435',
+    properties: {
+      dealname: 'Oakland Promise - Xavier Marco - 2026-06-11',
+      pipeline: TRUEWIND_HUBSPOT.pipeline,
+      dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
+      hs_is_closed: 'false',
+      hubspot_owner_id: TRUEWIND_HUBSPOT.defaultOwnerId,
+      hs_lastmodifieddate: '2026-06-07T12:00:00.000Z',
+    },
+  };
+
+  __setHubSpotRequestOverrideForTests(async (endpoint, method = 'GET', body = null) => {
+    calls.push({ endpoint, method, body });
+    if (endpoint === '/crm/v3/objects/contacts/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/contacts' && method === 'POST') return { id: '221459934276', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/companies/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/companies' && method === 'POST') return { id: '54941778206', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/deals/search' && body.filterGroups?.[0]?.filters?.some(filter => filter.operator === 'CONTAINS_TOKEN')) {
+      return { results: [duplicateDeal] };
+    }
+    if (endpoint === '/crm/v3/objects/deals/search') return { results: [] };
+    if (endpoint.includes('/associations/')) return { results: [] };
+    throw new Error(`Unexpected HubSpot mock call: ${method} ${endpoint}`);
+  });
+
+  try {
+    const result = await executeTool('hubspot_push_truewind_prospect', {
+      email: 'xavier@oaklandpromise.org',
+      company: 'Oakland Promise',
+      firstname: 'Xavier',
+      lastname: 'Marco',
+      linkedin_url: 'https://www.linkedin.com/in/xavier-marco/',
+      lead_source: 'Referral',
+      slack_user_id: 'U_TEST',
+    });
+    const parsed = JSON.parse(result);
+    assert.strictEqual(parsed.error, 'duplicate_deal_exists');
+    assert.strictEqual(parsed.existing_deal.id, '60896321435');
+    assert.strictEqual(parsed.existing_deal.name, 'Oakland Promise - Xavier Marco - 2026-06-11');
+    assert.strictEqual(
+      calls.some(call => call.endpoint === '/crm/v3/objects/deals' && call.method === 'POST'),
+      false,
+    );
+    assert.strictEqual(
+      calls.some(call => call.endpoint === '/crm/v3/objects/contacts/221459934276' && call.method === 'PATCH'),
+      false,
+    );
+  } finally {
+    __setHubSpotRequestOverrideForTests(null);
+  }
+}
+
 async function run() {
   await testConvertedLeadStatusUsesInternalValue();
   await testReadOnlyDealPropertiesAreRejectedBeforeWrite();
@@ -1091,6 +1307,10 @@ async function run() {
   testDailyProgressUsesDealSourceProperty();
   testProspectWorkflowResponseIncludesHubSpotLinks();
   testHubSpotRecordUrlsUseObjectTypeIds();
+  await testStructuredDealWorkflowBlocksOpenDuplicateDeal();
+  await testStructuredDealWorkflowAllowsExplicitDuplicateOverride();
+  await testStructuredDealWorkflowIgnoresAssociatedDealInDifferentPipeline();
+  await testProspectWorkflowBlocksOpenDuplicateDeal();
 }
 
 run()

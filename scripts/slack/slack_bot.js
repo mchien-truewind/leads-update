@@ -177,6 +177,7 @@ const SLACK_TO_HUBSPOT_OWNER = {
 };
 const hubspotContactPropertyCache = new Map();
 const hubspotPropertyCache = new Map();
+let hubspotRequestOverride = null;
 
 function parseDelimitedEnvSet(name) {
   return new Set(String(process.env[name] || '').split(',').map((value) => value.trim()).filter(Boolean));
@@ -227,6 +228,7 @@ function createSlackApp() {
 }
 
 async function hubspotRequest(endpoint, method = 'GET', body = null) {
+  if (hubspotRequestOverride) return hubspotRequestOverride(endpoint, method, body);
   return new Promise((resolve, reject) => {
     const url = new URL(endpoint.startsWith('http') ? endpoint : `https://api.hubapi.com${endpoint}`);
     const options = {
@@ -906,6 +908,10 @@ function inferCompanyFromEmail(email) {
   return { company: titleCase(root), domain };
 }
 
+function shouldCheckDuplicates(input = {}) {
+  return input.check_duplicates !== false && String(input.check_duplicates || '').toLowerCase() !== 'false';
+}
+
 function compactProperties(properties, options = {}) {
   const preserveEmptyKeys = new Set(options.preserveEmptyKeys || []);
   return Object.fromEntries(
@@ -1326,6 +1332,141 @@ async function searchHubSpotObject(objectType, filters, properties, limit = 10) 
     limit,
   });
   return res.results || [];
+}
+
+const OPEN_DEAL_DUPLICATE_PROPERTIES = [
+  'dealname',
+  'pipeline',
+  'dealstage',
+  'hs_is_closed',
+  'hubspot_owner_id',
+  'hs_lastmodifieddate',
+];
+
+const TRUEWIND_CLOSED_DEAL_STAGE_IDS = new Set(['1166230571', '190380587', 'closedwon', 'closedlost']);
+const TRUEWIND_STAGE_LABELS = {
+  [TRUEWIND_HUBSPOT.mqlDealStage]: 'MQL',
+  190380582: 'SQL',
+  190380583: 'Full Product Demo',
+  190380586: 'POC',
+  190380584: 'Proposal',
+  1166230571: 'Closed/Won',
+  190380587: 'Closed/Lost',
+  closedwon: 'Closed/Won',
+  closedlost: 'Closed/Lost',
+};
+
+function addHubSpotRecordsById(recordsById, records) {
+  for (const record of records || []) {
+    if (record?.id && !recordsById.has(String(record.id))) recordsById.set(String(record.id), record);
+  }
+}
+
+function isOpenHubSpotDeal(deal) {
+  const props = deal?.properties || deal || {};
+  if (props.pipeline && String(props.pipeline) !== TRUEWIND_HUBSPOT.pipeline) return false;
+  const hsIsClosed = String(props.hs_is_closed || '').toLowerCase();
+  if (hsIsClosed === 'true') return false;
+  return !TRUEWIND_CLOSED_DEAL_STAGE_IDS.has(String(props.dealstage || '').toLowerCase());
+}
+
+function hubSpotOwnerNameFromId(ownerId) {
+  const id = String(ownerId || '');
+  if (!id) return '';
+  const owner = Object.values(TRUEWIND_HUBSPOT.ownersByName).find(candidate => String(candidate.id) === id);
+  return owner?.name || id;
+}
+
+function formatDuplicateDealError(deal) {
+  const props = deal?.properties || {};
+  const stage = TRUEWIND_STAGE_LABELS[String(props.dealstage || '').toLowerCase()]
+    || TRUEWIND_STAGE_LABELS[props.dealstage]
+    || props.dealstage
+    || '';
+  return {
+    error: 'duplicate_deal_exists',
+    existing_deal: {
+      id: String(deal.id || ''),
+      name: props.dealname || '',
+      stage,
+      owner: hubSpotOwnerNameFromId(props.hubspot_owner_id),
+      url: hubspotRecordUrl('deals', deal.id),
+    },
+    message: 'An open deal already exists for this company. Would you like to update it instead?',
+  };
+}
+
+async function addAssociatedDeals(recordsById, fromType, fromId) {
+  const { ids } = await fetchHubSpotAssociationIds(fromType, fromId, 'deals', 100);
+  if (ids.length === 0) return;
+  const deals = await batchReadHubSpotObjects('deals', ids, OPEN_DEAL_DUPLICATE_PROPERTIES);
+  addHubSpotRecordsById(recordsById, deals);
+}
+
+async function findDuplicateOpenDeal({ companyName = '', email = '', contactId = '', companyId = '' } = {}) {
+  const recordsById = new Map();
+  const cleanCompanyName = String(companyName || '').trim();
+  const domain = getEmailDomain(email);
+  const inferred = inferCompanyFromEmail(email);
+  const useDomain = Boolean(domain && inferred.company);
+
+  if (cleanCompanyName) {
+    addHubSpotRecordsById(recordsById, await searchHubSpotObject(
+      'deals',
+      [
+        { propertyName: 'dealname', operator: 'EQ', value: `${cleanCompanyName} - New Deal` },
+        { propertyName: 'pipeline', operator: 'EQ', value: TRUEWIND_HUBSPOT.pipeline },
+      ],
+      OPEN_DEAL_DUPLICATE_PROPERTIES,
+      10
+    ));
+    addHubSpotRecordsById(recordsById, await searchHubSpotObject(
+      'deals',
+      [
+        { propertyName: 'dealname', operator: 'CONTAINS_TOKEN', value: cleanCompanyName },
+        { propertyName: 'pipeline', operator: 'EQ', value: TRUEWIND_HUBSPOT.pipeline },
+      ],
+      OPEN_DEAL_DUPLICATE_PROPERTIES,
+      10
+    ));
+  }
+
+  if (companyId) {
+    await addAssociatedDeals(recordsById, 'companies', companyId);
+  } else if (cleanCompanyName || useDomain) {
+    const companySearches = [];
+    if (useDomain) {
+      companySearches.push(searchHubSpotObject('companies', [{ propertyName: 'domain', operator: 'EQ', value: domain }], ['name', 'domain'], 10));
+    }
+    if (cleanCompanyName) {
+      companySearches.push(searchHubSpotObject('companies', [{ propertyName: 'name', operator: 'EQ', value: cleanCompanyName }], ['name', 'domain'], 10));
+      companySearches.push(searchHubSpotObject('companies', [{ propertyName: 'name', operator: 'CONTAINS_TOKEN', value: cleanCompanyName }], ['name', 'domain'], 10));
+    }
+    const companies = (await Promise.all(companySearches)).flat();
+    for (const company of companies) {
+      if (company?.id) await addAssociatedDeals(recordsById, 'companies', company.id);
+    }
+  }
+
+  if (contactId) {
+    await addAssociatedDeals(recordsById, 'contacts', contactId);
+  }
+  if (email) {
+    const contactSearches = [
+      searchHubSpotObject('contacts', [{ propertyName: 'email', operator: 'EQ', value: normalizeEmail(email) }], ['email'], 10),
+    ];
+    if (useDomain) {
+      contactSearches.push(searchHubSpotObject('contacts', [{ propertyName: 'email', operator: 'CONTAINS_TOKEN', value: domain }], ['email'], 25));
+    }
+    const contacts = (await Promise.all(contactSearches)).flat();
+    for (const contact of contacts) {
+      if (contact?.id) await addAssociatedDeals(recordsById, 'contacts', contact.id);
+    }
+  }
+
+  return [...recordsById.values()]
+    .filter(isOpenHubSpotDeal)
+    .sort((a, b) => String(b.properties?.hs_lastmodifieddate || '').localeCompare(String(a.properties?.hs_lastmodifieddate || '')))[0] || null;
 }
 
 async function findContactByEmail(email) {
@@ -2371,6 +2512,10 @@ async function runStructuredDealCreateWorkflow(input) {
     partial.companyId = companyId;
 
     const dealName = input.dealname || `${companyName} - New Deal`;
+    if (shouldCheckDuplicates(input)) {
+      const duplicateDeal = await findDuplicateOpenDeal({ companyName, email, contactId, companyId });
+      if (duplicateDeal) return JSON.stringify(formatDuplicateDealError(duplicateDeal));
+    }
     const dealProps = await validateHubSpotProperties('deals', compactProperties({
       dealname: dealName,
       pipeline: TRUEWIND_HUBSPOT.pipeline,
@@ -2588,6 +2733,10 @@ async function runTruewindHubSpotProspectWorkflow(input) {
       closedate: input.closedate || '',
     });
     const validatedDealProps = await validateHubSpotProperties('deals', dealProps);
+    if (shouldCheckDuplicates(input)) {
+      const duplicateDeal = await findDuplicateOpenDeal({ companyName, email, contactId, companyId });
+      if (duplicateDeal) return JSON.stringify(formatDuplicateDealError(duplicateDeal));
+    }
     const existingDeal = await findExistingDeal(dealName);
     const dealRes = existingDeal || await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedDealProps });
     const dealId = requireHubSpotObjectId(dealRes, 'HubSpot deal create');
@@ -2856,6 +3005,7 @@ const TOOLS = [
         notes: { type: 'string', description: 'Optional notes from the user request. Pass the full note text exactly; the workflow creates a HubSpot note associated to the deal, contact, and company.' },
         amount: { type: 'number', description: 'Optional deal amount if specified.' },
         closedate: { type: 'string', description: 'Optional close date if specified, in HubSpot-compatible date format.' },
+        check_duplicates: { type: 'boolean', description: 'Defaults to true. Set to false only if the user explicitly says to create a second/separate duplicate deal for the same company.' },
       },
       required: ['email', 'lead_source'],
     },
@@ -3493,6 +3643,7 @@ Rules enforced by the backend tool:
 - Company is required, but the tool can infer it from LinkedIn or a non-generic email domain. Only ask if the tool says company is unclear.
 - The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to lifecycle opportunity and lead status internal value MQL (HubSpot label Converted).
 - Pass the full Slack request/thread in the context field for write authorization and notes context, but pass the user's explicit source in lead_source/deal_source.
+- The backend checks for open duplicate deals by company name, company association, contact email, and non-generic contact email domain before creating a deal. Leave check_duplicates unset or true by default. Only set check_duplicates=false when the user explicitly asks for a separate second deal despite an existing open deal.
 - If the request includes notes, referral context, meeting-booked text, or deal/prospect type, pass notes, meeting_booked, and type into hubspot_push_truewind_prospect. The backend creates a HubSpot note object associated to the deal, contact, and company and reports the note ID or exact note error.
 - Pass channel_id and slack_user_id from Slack metadata on every HubSpot write tool call. The backend uses them for HubSpot write authorization and owner mapping. If the user explicitly names an owner, pass owner_name; explicit owner_name overrides Slack owner mapping. Otherwise it looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
 - Never ask for deal stage, owner, ERP, or name/title unless the backend tool explicitly needs clarification. Always ask for deal source before deal creation when the user has not provided one.
@@ -5271,4 +5422,9 @@ module.exports = {
   startSlackBot,
   summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
+  findDuplicateOpenDeal,
+  formatDuplicateDealError,
+  __setHubSpotRequestOverrideForTests(fn) {
+    hubspotRequestOverride = typeof fn === 'function' ? fn : null;
+  },
 };

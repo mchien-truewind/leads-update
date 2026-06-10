@@ -171,7 +171,7 @@ REJECT_EXCLUSION_PATTERNS = [
 DEFAULT_DRAFT_BCC = "hiring@trytruewind.com"
 SLACK_THREAD_MARKER_PREFIX = "ATS_THREAD_ID:"
 FORWARD_THREAD_MARKER_PREFIX = "ATS_FORWARD_THREAD_ID:"
-DEFAULT_RECRUITING_SLACK_MENTION_USER_ID = "U0ABULY5TEK"
+DEFAULT_RECRUITING_SLACK_MENTION_USER_ID = ""
 DOCLING_PARSE_EXTENSIONS = {"pdf", "doc", "docx"}
 DEFAULT_ASSIGNMENT_KEYWORDS = (
     "assignment,case study,take-home,take home,exercise,project,"
@@ -249,6 +249,7 @@ class Config:
     slack_reject_reactions: set[str]
     slack_forward_reactions: set[str]
     slack_allow_decision_override: bool
+    ats_follow_up_enabled: bool
     slack_state_file: Path
     forward_to_email: str
     property_map: NotionPropertyMap
@@ -568,6 +569,7 @@ def load_config() -> Config:
             os.getenv("RECRUITING_SLACK_FORWARD_REACTIONS", ""), default="arrow_right"
         ),
         slack_allow_decision_override=parse_env_bool("RECRUITING_SLACK_ALLOW_DECISION_OVERRIDE", False),
+        ats_follow_up_enabled=parse_env_bool("RECRUITING_ENABLE_ATS_FOLLOW_UP_DIGEST", False),
         slack_state_file=Path(
             os.getenv("RECRUITING_SLACK_STATE_FILE", "outputs/recruiting/slack_review_posts.json")
         ).expanduser(),
@@ -3752,7 +3754,7 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
         if not thread_id:
             failed += 1
             continue
-        if thread_id in posted_threads and thread_id in history_posted_threads:
+        if thread_id in posted_threads or thread_id in history_posted_threads:
             continue
 
         marker = slack_thread_marker(thread_id)
@@ -3831,6 +3833,10 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
     if state_changed:
         save_slack_posted_threads(config.slack_state_file, posted_threads, posted_thread_links)
     return posted, failed
+
+
+def select_ingest_review_candidates(created_candidates: list[dict[str, str]]) -> list[dict[str, str]]:
+    return list(created_candidates)
 
 
 def collect_review_candidates_for_slack(
@@ -4118,6 +4124,22 @@ def post_weekly_active_candidates_digest(
     if record_slot:
         save_weekly_active_review_slot(config.slack_state_file, slot_key)
     return 1, len(candidates)
+
+
+def post_scheduled_ats_follow_up_if_enabled(
+    config: Config,
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+) -> tuple[int, int]:
+    if not config.ats_follow_up_enabled:
+        return 0, 0
+    return post_weekly_active_candidates_digest(
+        config,
+        notion,
+        database_schema,
+        prop_map,
+    )
 
 
 def sync_slack_decisions(
@@ -5283,15 +5305,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     )
 
     if slack_enabled(config):
-        running_in_github_actions = os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
-        if running_in_github_actions:
-            review_candidates = created_candidates
-        else:
-            review_candidates = collect_review_candidates_for_slack(
-                notion,
-                database_schema,
-                prop_map,
-            )
+        review_candidates = select_ingest_review_candidates(created_candidates)
         slack_posts, slack_post_failures = post_candidate_reviews_to_slack(config, review_candidates)
 
     print(f"Processed messages: {processed}")
@@ -6169,7 +6183,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Non-scheduling ATS threads archived from hiring label: {non_scheduling_threads_archived}")
     print(f"Non-scheduling ATS thread archive failures: {non_scheduling_archive_failures}")
     print(f"In Process records marked from pipeline label: {in_process_marked}")
-    daily_review_posts, daily_review_candidate_count = post_weekly_active_candidates_digest(
+    daily_review_posts, daily_review_candidate_count = post_scheduled_ats_follow_up_if_enabled(
         config,
         notion,
         database_schema,
@@ -6510,6 +6524,7 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "slack_mention_user_configured": bool(config.slack_mention_user_id),
         "slack_history_lookback_days": config.slack_history_lookback_days,
         "slack_allow_decision_override": config.slack_allow_decision_override,
+        "ats_follow_up_enabled": config.ats_follow_up_enabled,
         "slack_proceed_reactions": sorted(config.slack_proceed_reactions),
         "slack_reject_reactions": sorted(config.slack_reject_reactions),
         "slack_forward_reactions": sorted(config.slack_forward_reactions),

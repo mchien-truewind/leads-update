@@ -4367,7 +4367,7 @@ STATUS_OPTIONS = (
     STATUS_OFFERED,
     STATUS_NA,
 )
-TERMINAL_STATUSES = {"rejected", "passed", "accepted", "n/a", "offered"}
+TERMINAL_STATUSES = {"rejected", "passed", "accepted", "n/a", "offered", "no response"}
 ATS_DIGEST_EXCLUDED_STATUSES = set()
 STATUS_ALIASES = {
     "awaiting decision": STATUS_AWAITING_DECISION,

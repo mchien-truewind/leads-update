@@ -458,6 +458,28 @@ class ActiveAtsDigestTests(unittest.TestCase):
         self.assertEqual([candidate["candidate_name"] for candidate in candidates], ["Inbound One", "Inbound Two"])
         self.assertTrue(all(candidate["source"].strip().lower() == "inbound" for candidate in candidates))
 
+    def test_no_response_status_is_terminal_and_excluded_from_active_digest(self):
+        class FakeNotion:
+            def __init__(self, pages):
+                self.pages = pages
+
+            def query_pages(self, payload=None):
+                return self.pages
+
+        self.assertTrue(cli.status_is_terminal(cli.STATUS_NO_RESPONSE))
+        pages = [
+            self._notion_page("Still Active", cli.SOURCE_INBOUND),
+            self._notion_page("No Response Candidate", cli.SOURCE_INBOUND, status=cli.STATUS_NO_RESPONSE),
+        ]
+
+        candidates = cli.collect_active_candidates_for_weekly_slack(
+            FakeNotion(pages),
+            self._notion_schema(),
+            cli.NotionPropertyMap(),
+        )
+
+        self.assertEqual([candidate["candidate_name"] for candidate in candidates], ["Still Active"])
+
     def test_active_digest_shows_all_awaiting_decision_candidates_with_slack_links(self):
         candidates = [
             self._candidate(f"Needs Attention {idx:02d}", cli.STATUS_NEEDS_ATTENTION, f"2026-06-{idx + 1:02d}")

@@ -209,6 +209,7 @@ def build_config(**overrides) -> cli.Config:
         "slack_reject_reactions": {"x"},
         "slack_forward_reactions": {"arrow_right"},
         "slack_allow_decision_override": False,
+        "ats_follow_up_enabled": False,
         "slack_state_file": Path(tempfile.gettempdir()) / "coordinator-test-slack-state.json",
         "forward_to_email": "",
         "property_map": cli.NotionPropertyMap(),
@@ -227,32 +228,42 @@ def build_config(**overrides) -> cli.Config:
     return cli.Config(**values)
 
 
+def slack_candidate(thread_id: str) -> dict[str, str]:
+    return {
+        "source": cli.SOURCE_INBOUND,
+        "thread_id": thread_id,
+        "candidate_name": "Jordan Lee",
+        "role": "Account Executive",
+        "current_title": "Senior Product Manager",
+        "company": "Beta Analytics",
+        "location": "United States",
+        "career_stage": "Experienced",
+        "linkedin_url": "",
+        "resume_url": "",
+        "notion_url": "",
+    }
+
+
 class SlackMentionBehaviorTests(unittest.TestCase):
     def _config(self) -> cli.Config:
         return build_config()
 
-    def test_load_config_mention_default_targets_mercedes_and_can_be_disabled(self):
+    def test_load_config_mention_default_is_blank_and_can_be_configured(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "U0ABULY5TEK")
+            self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "")
         with mock.patch.dict(os.environ, {"RECRUITING_SLACK_MENTION_USER_ID": "none"}, clear=True):
+            self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "")
+        with mock.patch.dict(os.environ, {"RECRUITING_SLACK_MENTION_USER_ID": "off"}, clear=True):
+            self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "")
+        with mock.patch.dict(os.environ, {"RECRUITING_SLACK_MENTION_USER_ID": "false"}, clear=True):
+            self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "")
+        with mock.patch.dict(os.environ, {"RECRUITING_SLACK_MENTION_USER_ID": "0"}, clear=True):
             self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "")
         with mock.patch.dict(os.environ, {"RECRUITING_SLACK_MENTION_USER_ID": "U123"}, clear=True):
             self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "U123")
 
     def test_blank_slack_mention_user_id_does_not_fallback_to_auth_test(self):
-        candidate = {
-            "source": cli.SOURCE_INBOUND,
-            "thread_id": "thread-1",
-            "candidate_name": "Jordan Lee",
-            "role": "Account Executive",
-            "current_title": "Senior Product Manager",
-            "company": "Beta Analytics",
-            "location": "United States",
-            "career_stage": "Experienced",
-            "linkedin_url": "",
-            "resume_url": "",
-            "notion_url": "",
-        }
+        candidate = slack_candidate("thread-1")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self._config()
@@ -277,6 +288,53 @@ class SlackMentionBehaviorTests(unittest.TestCase):
             any("<@" in block.get("text", {}).get("text", "") for block in blocks),
             "blank slack_mention_user_id should not mention or auth-test the bot user",
         )
+
+    def test_post_candidate_reviews_skips_threads_known_in_local_state(self):
+        candidate = slack_candidate("thread-1")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config()
+            config.slack_state_file = Path(tmpdir) / "slack-posted.json"
+            cli.save_slack_posted_threads(config.slack_state_file, {"thread-1"})
+
+            with mock.patch.object(cli, "requests", mock.Mock()), mock.patch.object(
+                cli, "load_recent_slack_posted_threads", return_value=(set(), {})
+            ), mock.patch.object(
+                cli.SlackClient, "resolve_channel_id", return_value="C123"
+            ), mock.patch.object(
+                cli.SlackClient, "post_message", side_effect=AssertionError("old candidate reposted")
+            ) as post_message:
+                posted, failed = cli.post_candidate_reviews_to_slack(config, [candidate])
+
+        self.assertEqual((posted, failed), (0, 0))
+        post_message.assert_not_called()
+
+    def test_post_candidate_reviews_skips_threads_seen_in_recent_slack_history(self):
+        candidate = slack_candidate("thread-1")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config()
+            config.slack_state_file = Path(tmpdir) / "slack-posted.json"
+
+            with mock.patch.object(cli, "requests", mock.Mock()), mock.patch.object(
+                cli, "load_recent_slack_posted_threads", return_value=({"thread-1"}, {})
+            ), mock.patch.object(
+                cli.SlackClient, "resolve_channel_id", return_value="C123"
+            ), mock.patch.object(
+                cli.SlackClient, "post_message", side_effect=AssertionError("recent candidate reposted")
+            ) as post_message:
+                posted, failed = cli.post_candidate_reviews_to_slack(config, [candidate])
+
+        self.assertEqual((posted, failed), (0, 0))
+        post_message.assert_not_called()
+
+    def test_ingest_slack_candidates_are_only_newly_created_candidates(self):
+        created_candidates = [slack_candidate("new-thread")]
+
+        selected = cli.select_ingest_review_candidates(created_candidates)
+
+        self.assertEqual(selected, created_candidates)
+        self.assertIsNot(selected, created_candidates)
 
 
 class ProceedRoleRoutingTests(unittest.TestCase):
@@ -458,6 +516,38 @@ class ActiveAtsDigestTests(unittest.TestCase):
 
         self.assertIn("<https://truewind.slack.com/review|Linked Candidate>", text)
         self.assertIn("* <https://notion.so/Missing-Link|Missing Link> | Awaiting Decision | AE | review thread missing", text)
+
+    def test_scheduled_ats_follow_up_is_disabled_by_default(self):
+        config = build_config(ats_follow_up_enabled=False)
+
+        with mock.patch.object(
+            cli,
+            "post_weekly_active_candidates_digest",
+            side_effect=AssertionError("scheduled digest posted while disabled"),
+        ) as post_digest:
+            result = cli.post_scheduled_ats_follow_up_if_enabled(
+                config,
+                notion=mock.Mock(),
+                database_schema={},
+                prop_map=cli.NotionPropertyMap(),
+            )
+
+        self.assertEqual(result, (0, 0))
+        post_digest.assert_not_called()
+
+    def test_scheduled_ats_follow_up_posts_when_explicitly_enabled(self):
+        config = build_config(ats_follow_up_enabled=True)
+
+        with mock.patch.object(cli, "post_weekly_active_candidates_digest", return_value=(1, 3)) as post_digest:
+            result = cli.post_scheduled_ats_follow_up_if_enabled(
+                config,
+                notion=mock.Mock(),
+                database_schema={},
+                prop_map=cli.NotionPropertyMap(),
+            )
+
+        self.assertEqual(result, (1, 3))
+        post_digest.assert_called_once()
 
 
 if __name__ == "__main__":

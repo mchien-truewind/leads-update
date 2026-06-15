@@ -961,11 +961,6 @@ function resolveHubSpotOwner(input = {}) {
   };
 }
 
-function isAllowedDealOwner(owner = {}) {
-  const ownerId = String(owner.id || '').trim();
-  return ownerId === TRUEWIND_HUBSPOT.dealOwnerIds.sarah || ownerId === TRUEWIND_HUBSPOT.dealOwnerIds.xavier;
-}
-
 function stableOwnerHash(value) {
   const text = String(value || '').trim().toLowerCase();
   let hash = 0;
@@ -977,10 +972,10 @@ function stableOwnerHash(value) {
 
 function resolveDealHubSpotOwner(input = {}, requesterOwner = null) {
   const explicitOwner = resolveExplicitHubSpotOwner(input);
-  if (explicitOwner && isAllowedDealOwner(explicitOwner)) {
+  if (explicitOwner) {
     return { ...explicitOwner, source: 'explicit deal owner' };
   }
-  if (requesterOwner && isAllowedDealOwner(requesterOwner)) {
+  if (requesterOwner?.id && requesterOwner.source === 'from Slack tag') {
     return { ...requesterOwner, source: 'requester is deal owner' };
   }
 
@@ -2630,7 +2625,7 @@ async function runTruewindHubSpotProspectWorkflow(input) {
   }
   const parsedName = parseNameFromEmail(email);
   const inferred = inferCompanyFromEmail(email);
-  const contactOwner = await resolveRequesterHubSpotOwnerForProspect(input);
+  const contactOwner = await resolveHubSpotOwnerForProspect(input);
   const dealOwner = resolveDealHubSpotOwner(input, contactOwner);
   const authorization = isHubSpotWriteAuthorized(input, contactOwner);
   if (!authorization.authorized) {
@@ -2690,6 +2685,7 @@ async function runTruewindHubSpotProspectWorkflow(input) {
     const existingContact = await findContactByEmail(email);
     const explicitKeys = new Set([
       ...['firstname', 'lastname', 'jobtitle', 'company', 'erp', 'lead_source'].filter((key) => input[key]),
+      ...(resolveExplicitHubSpotOwner(input) ? ['hubspot_owner_id'] : []),
       ...linkedinProperties.filter(() => input.linkedin_url),
     ]);
     const contactProps = existingContact

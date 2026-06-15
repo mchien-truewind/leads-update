@@ -3512,7 +3512,33 @@ const INSTANTLY_POSITIVE_REPLY_MENTION_USER_ID = (
 ).trim();
 const INSTANTLY_WEBHOOK_SECRET = (process.env.INSTANTLY_WEBHOOK_SECRET || '').trim();
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// maxRetries: 0 makes withRetry() below the single source of truth for retries
+// (otherwise the SDK's built-in retries nest inside ours and compound the backoff).
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, maxRetries: 0 });
+
+// Retry transient Anthropic failures: rate limits (429), overload (529), 5xx, and
+// network errors (no status). Permanent errors (400/401/403/404) are NOT retried.
+async function withRetry(fn, { label = 'Claude call', maxAttempts = 5 } = {}) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const status = err?.status;
+      const transient =
+        status === 408 || status === 409 || status === 429 ||
+        status === 500 || status === 502 || status === 503 || status === 529 ||
+        status === undefined; // network error / timeout / dropped connection
+      if (!transient || attempt >= maxAttempts - 1) throw err;
+      // Respect the server's Retry-After header when present, else exponential backoff capped at 30s.
+      const retryAfter = Number(err?.headers?.['retry-after']);
+      const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : Math.min(2 ** attempt * 1000, 30000);
+      console.log(`${label} failed (status=${status ?? 'network'}), retry ${attempt + 1}/${maxAttempts - 1} in ${Math.round(backoffMs / 1000)}s...`);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  }
+}
 const CLAUDE_DEFAULT_MODEL = process.env.CLAUDE_MODEL_DEFAULT
   || process.env.CLAUDE_MODEL_SONNET
   || 'claude-sonnet-4-6';
@@ -3897,26 +3923,17 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
   const selectedModel = selectClaudeModelForMessages(messages);
   console.log(`Claude model selected: ${selectedModel.model} tier=${selectedModel.tier} reason=${selectedModel.reason}`);
 
-  // Helper to call Claude with retries on overload (529)
+  // Call Claude with transient-error retries (see withRetry).
+  // The cache_control breakpoint on the system block caches the whole static
+  // prefix (tools + system), which is re-sent on every turn of the tool loop.
   async function callClaude(msgs) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        return await anthropic.messages.create({
-          model: selectedModel.model,
-          max_tokens: 2048,
-          system: getSystemPrompt(),
-          tools: TOOLS,
-          messages: msgs,
-        });
-      } catch (err) {
-        if (err.status === 529 && attempt < 2) {
-          console.log(`Overloaded, retrying in ${(attempt + 1) * 5}s...`);
-          await new Promise((r) => setTimeout(r, (attempt + 1) * 5000));
-          continue;
-        }
-        throw err;
-      }
-    }
+    return withRetry(() => anthropic.messages.create({
+      model: selectedModel.model,
+      max_tokens: 2048,
+      system: [{ type: 'text', text: getSystemPrompt(), cache_control: { type: 'ephemeral' } }],
+      tools: TOOLS,
+      messages: msgs,
+    }));
   }
 
   try {
@@ -4361,7 +4378,7 @@ async function runDiscoveryDigestImpl(channelOverride) {
       if (!transcriptText) continue;
 
       try {
-        const claudeRes = await anthropic.messages.create({
+        const claudeRes = await withRetry(() => anthropic.messages.create({
           model: CLAUDE_DIGEST_MODEL,
           max_tokens: 500,
           system: `You extract key takeaways and pain point quotes from sales discovery call transcripts. Be concise. Never use em dashes.`,
@@ -4378,7 +4395,7 @@ Reply in this exact format:
 TAKEAWAY: ...
 QUOTE: "..." -- [Speaker Name]`,
           }],
-        });
+        }));
         const text = claudeRes.content.find(b => b.type === 'text')?.text || '';
         const takeawayMatch = text.match(/TAKEAWAY:\s*(.+)/);
         const quoteMatch = text.match(/QUOTE:\s*(.+)/);

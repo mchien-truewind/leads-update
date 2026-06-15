@@ -3747,7 +3747,7 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
     mention_prefix = f"<@{config.slack_mention_user_id}> " if config.slack_mention_user_id else ""
 
     for candidate in candidates:
-        if clean_text(candidate.get("source", "")).lower() == SOURCE_SUPERPOSITION.lower():
+        if is_superposition_source(candidate.get("source", "")):
             continue
 
         thread_id = candidate.get("thread_id", "").strip()
@@ -3836,7 +3836,11 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
 
 
 def select_ingest_review_candidates(created_candidates: list[dict[str, str]]) -> list[dict[str, str]]:
-    return list(created_candidates)
+    return [
+        candidate
+        for candidate in created_candidates
+        if not is_superposition_source(candidate.get("source", ""))
+    ]
 
 
 def collect_review_candidates_for_slack(
@@ -3856,7 +3860,7 @@ def collect_review_candidates_for_slack(
         if decision:
             continue
         source = notion_prop_value(props.get(prop_map.source, {})).strip()
-        if clean_text(source).lower() == SOURCE_SUPERPOSITION.lower():
+        if is_superposition_source(source):
             continue
 
         thread_id = notion_prop_value(props.get(prop_map.gmail_thread_id, {})).strip()
@@ -4340,6 +4344,12 @@ ROLE_OPTIONS = ("BDR", "Growth Generalist", "AE", "Other")
 SOURCE_OPTIONS = ("Inbound", "Superposition")
 SOURCE_INBOUND = "Inbound"
 SOURCE_SUPERPOSITION = "Superposition"
+
+
+def is_superposition_source(source: str) -> bool:
+    return clean_text(source).lower() == SOURCE_SUPERPOSITION.lower()
+
+
 CUSTOM_GPT_FIRST_ROUND_ROLES = {"BDR", "AE"}
 STATUS_AWAITING_DECISION = "Awaiting Decision"
 STATUS_WAITING_ON_CUSTOM_GPT = "Waiting on CustomGPT"

@@ -328,6 +328,26 @@ class SlackMentionBehaviorTests(unittest.TestCase):
         self.assertEqual((posted, failed), (0, 0))
         post_message.assert_not_called()
 
+    def test_post_candidate_reviews_skips_superposition_source(self):
+        candidate = slack_candidate("thread-1")
+        candidate["source"] = " superposition "
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config()
+            config.slack_state_file = Path(tmpdir) / "slack-posted.json"
+
+            with mock.patch.object(cli, "requests", mock.Mock()), mock.patch.object(
+                cli, "load_recent_slack_posted_threads", return_value=(set(), {})
+            ), mock.patch.object(
+                cli.SlackClient, "resolve_channel_id", return_value="C123"
+            ), mock.patch.object(
+                cli.SlackClient, "post_message", side_effect=AssertionError("superposition candidate posted")
+            ) as post_message:
+                posted, failed = cli.post_candidate_reviews_to_slack(config, [candidate])
+
+        self.assertEqual((posted, failed), (0, 0))
+        post_message.assert_not_called()
+
     def test_ingest_slack_candidates_are_only_newly_created_candidates(self):
         created_candidates = [slack_candidate("new-thread")]
 
@@ -335,6 +355,15 @@ class SlackMentionBehaviorTests(unittest.TestCase):
 
         self.assertEqual(selected, created_candidates)
         self.assertIsNot(selected, created_candidates)
+
+    def test_ingest_slack_candidates_exclude_superposition_source(self):
+        inbound = slack_candidate("inbound-thread")
+        superposition = slack_candidate("superposition-thread")
+        superposition["source"] = cli.SOURCE_SUPERPOSITION
+
+        selected = cli.select_ingest_review_candidates([inbound, superposition])
+
+        self.assertEqual(selected, [inbound])
 
 
 class ProceedRoleRoutingTests(unittest.TestCase):

@@ -227,6 +227,8 @@ class Config:
     reject_template: str
     scheduling_template: str
     no_response_template: str
+    custom_gpt_no_response_template: str
+    custom_gpt_no_response_wait_hours: int
     reject_delay_hours: int
     reject_draft_auto_send_age_hours: int
     name_verifier_provider: str
@@ -531,6 +533,11 @@ def load_config() -> Config:
         no_response_template=(
             os.getenv("RECRUITING_NO_RESPONSE_TEMPLATE", "").strip() or DEFAULT_NO_RESPONSE_TEMPLATE
         ),
+        custom_gpt_no_response_template=(
+            os.getenv("RECRUITING_CUSTOM_GPT_NO_RESPONSE_TEMPLATE", "").strip()
+            or DEFAULT_CUSTOM_GPT_NO_RESPONSE_REJECTION_TEMPLATE
+        ),
+        custom_gpt_no_response_wait_hours=parse_env_int("RECRUITING_CUSTOM_GPT_NO_RESPONSE_WAIT_HOURS", 48),
         reject_delay_hours=parse_env_int("RECRUITING_REJECT_DELAY_HOURS", 24),
         reject_draft_auto_send_age_hours=parse_env_int("RECRUITING_REJECT_DRAFT_AUTO_SEND_AGE_HOURS", 48),
         name_verifier_provider=os.getenv("RECRUITING_NAME_VERIFIER_PROVIDER", "anthropic").strip().lower(),
@@ -4468,6 +4475,11 @@ def uses_custom_gpt_first_round(page_props: dict[str, Any], prop_map: NotionProp
     return bool(CUSTOM_GPT_FIRST_ROUND_ROLES.intersection(page_role_values(page_props, prop_map)))
 
 
+def custom_gpt_no_response_due(assignment_sent_at: datetime, now: datetime, wait_hours: int) -> bool:
+    wait_delta = timedelta(hours=max(int(wait_hours), 0))
+    return now.astimezone(timezone.utc) >= assignment_sent_at.astimezone(timezone.utc) + wait_delta
+
+
 def ensure_role_property_schema(
     notion: NotionClient,
     database_schema: dict[str, Any],
@@ -5382,6 +5394,9 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     non_scheduling_archive_failures = 0
     in_process_marked = 0
     no_response_drafts = 0
+    custom_gpt_no_response_sent = 0
+    custom_gpt_no_response_send_failures = 0
+    custom_gpt_no_response_skipped_young = 0
     scheduling_drafts = 0
     status_lookback_anchor = now_local(config.timezone_name) - timedelta(days=config.sent_status_lookback_days)
     hiring_label_id = ""
@@ -5692,6 +5707,55 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     update_payload[prop.status] = build_notion_value(
                         properties_schema[prop.status], STATUS_ROUND_1_SCHEDULING
                     )
+                elif custom_gpt_no_response_due(
+                    assignment_sent_at,
+                    now_local(config.timezone_name),
+                    config.custom_gpt_no_response_wait_hours,
+                ):
+                    first_name = extract_first_name(candidate_name, candidate_email)
+                    body = render_no_response_template(config.custom_gpt_no_response_template, first_name)
+                    sent_message_id = send_reply_email(
+                        gmail_service,
+                        sender_email=config.from_email,
+                        to_email=candidate_email,
+                        thread_id=reply_thread_id,
+                        body_text=body,
+                    )
+                    if sent_message_id:
+                        custom_gpt_no_response_sent += 1
+                        if prop.status in properties_schema:
+                            update_payload[prop.status] = build_notion_value(
+                                properties_schema[prop.status], STATUS_REJECTED
+                            )
+                        if prop.decision in properties_schema:
+                            update_payload[prop.decision] = build_notion_value(
+                                properties_schema[prop.decision], "Reject"
+                            )
+                        if prop.decision_time in properties_schema:
+                            update_payload[prop.decision_time] = build_notion_value(
+                                properties_schema[prop.decision_time], iso(now_local(config.timezone_name))
+                            )
+                        if prop.reject_draft_id in properties_schema:
+                            update_payload[prop.reject_draft_id] = build_notion_value(
+                                properties_schema[prop.reject_draft_id], ""
+                            )
+                        if prop.reject_send_at in properties_schema:
+                            update_payload[prop.reject_send_at] = build_notion_value(
+                                properties_schema[prop.reject_send_at], ""
+                            )
+                        closeout_labels = [label_id for label_id in (hiring_label_id, pipeline_label_id) if label_id]
+                        if closeout_labels:
+                            archived_count, archive_failures = remove_labels_from_threads(
+                                gmail_service,
+                                thread_ids=related_thread_ids,
+                                label_ids=closeout_labels,
+                            )
+                            reject_threads_archived += archived_count
+                            reject_archive_failures += archive_failures
+                    else:
+                        custom_gpt_no_response_send_failures += 1
+                else:
+                    custom_gpt_no_response_skipped_young += 1
             else:
                 if prop.status in properties_schema:
                     update_payload[prop.status] = build_notion_value(
@@ -6200,6 +6264,9 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         prop,
     )
     print(f"No response drafts created: {no_response_drafts}")
+    print(f"CustomGPT no-response closeouts sent: {custom_gpt_no_response_sent}")
+    print(f"CustomGPT no-response closeouts skipped (younger than threshold): {custom_gpt_no_response_skipped_young}")
+    print(f"CustomGPT no-response closeout send failures: {custom_gpt_no_response_send_failures}")
     print(f"Daily ATS follow-up posts created: {daily_review_posts}")
     print(f"Daily ATS follow-up candidates included: {daily_review_candidate_count}")
     print(f"Scheduling drafts created: {scheduling_drafts}")
@@ -6555,6 +6622,7 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
             config.openai_api_key if config.resume_extractor_provider == "openai" else False
         ),
         "no_response_wait_days": config.no_response_wait_days,
+        "custom_gpt_no_response_wait_hours": config.custom_gpt_no_response_wait_hours,
         "assignment_keywords": sorted(config.assignment_keywords),
         "sent_status_lookback_days": config.sent_status_lookback_days,
         "pipeline_label_name": config.pipeline_label_name,

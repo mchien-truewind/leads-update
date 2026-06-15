@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -187,6 +188,8 @@ def build_config(**overrides) -> cli.Config:
         "reject_template": "",
         "scheduling_template": "",
         "no_response_template": "",
+        "custom_gpt_no_response_template": "",
+        "custom_gpt_no_response_wait_hours": 48,
         "reject_delay_hours": 24,
         "reject_draft_auto_send_age_hours": 24,
         "name_verifier_provider": "",
@@ -390,6 +393,26 @@ class ProceedRoleRoutingTests(unittest.TestCase):
                 }
 
                 self.assertTrue(cli.uses_custom_gpt_first_round(page_props, prop_map))
+
+
+class CustomGptNoResponseDueTests(unittest.TestCase):
+    def test_custom_gpt_no_response_is_due_after_configured_hours(self):
+        assignment_sent_at = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+
+        self.assertFalse(
+            cli.custom_gpt_no_response_due(
+                assignment_sent_at,
+                assignment_sent_at + timedelta(hours=47, minutes=59),
+                48,
+            )
+        )
+        self.assertTrue(
+            cli.custom_gpt_no_response_due(
+                assignment_sent_at,
+                assignment_sent_at + timedelta(hours=48),
+                48,
+            )
+        )
 
 
 class ActiveAtsDigestTests(unittest.TestCase):

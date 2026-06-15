@@ -52,6 +52,7 @@ const {
   resolveDealHubSpotOwner,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
+  resolveProspectWorkflowOwner,
   matchingActivityKeywords,
   runStructuredDealCreateWorkflow,
   summarizeHubSpotStageCohortOutcomes,
@@ -261,8 +262,12 @@ function testDealOwnerResolution() {
     { id: '84547076', name: 'Sarah Elix', source: 'explicit deal owner' },
   );
   assert.deepStrictEqual(
-    resolveDealHubSpotOwner({ owner_name: 'Mercedes Chien', company: 'Acme' }, { id: '89305622', name: 'Xavier Marco', source: 'from Slack tag' }),
-    { id: '89305622', name: 'Xavier Marco', source: 'requester is deal owner' },
+    resolveDealHubSpotOwner({ owner_name: 'Alex Lee', company: 'Acme' }, { id: '89305622', name: 'Xavier Marco', source: 'from Slack tag' }),
+    { id: '559564379', name: 'Alex Lee', source: 'explicit deal owner' },
+  );
+  assert.deepStrictEqual(
+    resolveProspectWorkflowOwner({ company: 'Acme' }, { id: '559564379', name: 'Alex Lee', source: 'from Slack tag' }),
+    { id: '559564379', name: 'Alex Lee', source: 'from Slack tag' },
   );
   const hashed = resolveDealHubSpotOwner({ company: 'Hash Co', email: 'buyer@hashco.com' }, { id: '91143842', name: 'Jenilee Chen', source: 'from Slack tag' });
   assert.ok(['84547076', '89305622'].includes(hashed.id));
@@ -1225,6 +1230,49 @@ async function testStructuredDealWorkflowIgnoresAssociatedDealInDifferentPipelin
   }
 }
 
+async function testProspectWorkflowExplicitOwnerControlsContactAndDeal() {
+  seedStructuredDealWorkflowProperties();
+  const calls = [];
+
+  __setHubSpotRequestOverrideForTests(async (endpoint, method = 'GET', body = null) => {
+    calls.push({ endpoint, method, body });
+    if (endpoint === '/crm/v3/objects/contacts/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/contacts' && method === 'POST') return { id: '221459934277', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/contacts/221459934277' && method === 'PATCH') return { id: '221459934277', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/companies/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/companies' && method === 'POST') return { id: '54941778207', properties: body.properties };
+    if (endpoint === '/crm/v3/objects/deals/search') return { results: [] };
+    if (endpoint === '/crm/v3/objects/deals' && method === 'POST') return { id: '60896321436', properties: body.properties };
+    if (endpoint.includes('/associations/')) return { results: [] };
+    throw new Error(`Unexpected HubSpot mock call: ${method} ${endpoint}`);
+  });
+
+  try {
+    const result = await executeTool('hubspot_push_truewind_prospect', {
+      email: 'buyer@explicitowner.example',
+      company: 'Explicit Owner Co',
+      firstname: 'Pat',
+      lastname: 'Buyer',
+      linkedin_url: 'https://www.linkedin.com/in/pat-buyer/',
+      lead_source: 'Referral',
+      owner_name: 'Alex Lee',
+      slack_user_id: 'U_TEST',
+      check_duplicates: false,
+    });
+    assert.match(result, /Owner: Alex Lee \(explicit deal owner\)/);
+
+    const contactCreate = calls.find(call => call.endpoint === '/crm/v3/objects/contacts' && call.method === 'POST');
+    const dealCreate = calls.find(call => call.endpoint === '/crm/v3/objects/deals' && call.method === 'POST');
+    const contactConversion = calls.find(call => call.endpoint === '/crm/v3/objects/contacts/221459934277' && call.method === 'PATCH');
+
+    assert.strictEqual(contactCreate.body.properties.hubspot_owner_id, '559564379');
+    assert.strictEqual(dealCreate.body.properties.hubspot_owner_id, '559564379');
+    assert.strictEqual(contactConversion.body.properties.hubspot_owner_id, '559564379');
+  } finally {
+    __setHubSpotRequestOverrideForTests(null);
+  }
+}
+
 async function testProspectWorkflowBlocksOpenDuplicateDeal() {
   seedStructuredDealWorkflowProperties();
   const calls = [];
@@ -1310,6 +1358,7 @@ async function run() {
   await testStructuredDealWorkflowBlocksOpenDuplicateDeal();
   await testStructuredDealWorkflowAllowsExplicitDuplicateOverride();
   await testStructuredDealWorkflowIgnoresAssociatedDealInDifferentPipeline();
+  await testProspectWorkflowExplicitOwnerControlsContactAndDeal();
   await testProspectWorkflowBlocksOpenDuplicateDeal();
 }
 

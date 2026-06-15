@@ -977,7 +977,7 @@ function stableOwnerHash(value) {
 
 function resolveDealHubSpotOwner(input = {}, requesterOwner = null) {
   const explicitOwner = resolveExplicitHubSpotOwner(input);
-  if (explicitOwner && isAllowedDealOwner(explicitOwner)) {
+  if (explicitOwner) {
     return { ...explicitOwner, source: 'explicit deal owner' };
   }
   if (requesterOwner && isAllowedDealOwner(requesterOwner)) {
@@ -1031,6 +1031,17 @@ async function resolveRequesterHubSpotOwnerForProspect(input = {}) {
     owner_name: '',
     owner: '',
   });
+}
+
+function resolveProspectWorkflowOwner(input = {}, requesterOwner = null) {
+  const explicitOwner = resolveExplicitHubSpotOwner(input);
+  if (explicitOwner) {
+    return { ...explicitOwner, source: 'explicit deal owner' };
+  }
+  if (requesterOwner?.source === 'from Slack tag') {
+    return { ...requesterOwner };
+  }
+  return resolveDealHubSpotOwner(input, requesterOwner);
 }
 
 function getSlackMetadata(input = {}) {
@@ -2630,8 +2641,10 @@ async function runTruewindHubSpotProspectWorkflow(input) {
   }
   const parsedName = parseNameFromEmail(email);
   const inferred = inferCompanyFromEmail(email);
-  const contactOwner = await resolveRequesterHubSpotOwnerForProspect(input);
-  const dealOwner = resolveDealHubSpotOwner(input, contactOwner);
+  const requesterOwner = await resolveRequesterHubSpotOwnerForProspect(input);
+  const workflowOwner = resolveProspectWorkflowOwner(input, requesterOwner);
+  const contactOwner = workflowOwner;
+  const dealOwner = workflowOwner;
   const authorization = isHubSpotWriteAuthorized(input, contactOwner);
   if (!authorization.authorized) {
     return `Not authorized to write to HubSpot: ${authorization.reason}. Ask an admin to set HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS or HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS, or map your Slack account to a HubSpot owner.`;
@@ -2762,7 +2775,10 @@ async function runTruewindHubSpotProspectWorkflow(input) {
       }
     }
 
-    const conversionProps = { hs_lead_status: TRUEWIND_HUBSPOT.convertedLeadStatus };
+    const conversionProps = {
+      hs_lead_status: TRUEWIND_HUBSPOT.convertedLeadStatus,
+      hubspot_owner_id: contactOwner.id,
+    };
     if (shouldSetLifecycleToOpportunity(existingContact?.properties?.lifecyclestage)) {
       conversionProps.lifecyclestage = 'opportunity';
     }
@@ -5431,6 +5447,7 @@ module.exports = {
   postMqlDiscoveryReport,
   redactedToolInputForLog,
   resolveDealHubSpotOwner,
+  resolveProspectWorkflowOwner,
   runLeadStatusSyncForSlack,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,

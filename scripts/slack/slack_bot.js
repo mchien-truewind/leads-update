@@ -5535,6 +5535,24 @@ function startConnectionWatchdog(app, {
   return timer;
 }
 
+// Process role split. The interactive Socket Mode connection and the heavy
+// background workload (cron jobs + webhooks) compete for one Node event loop;
+// when a cron/large-payload stretch blocks the loop, the Socket Mode heartbeat
+// can miss its pong and the connection flaps, dropping mentions. Running them in
+// separate processes keeps the heartbeat responsive.
+//   BOT_ROLE=all    (default) socket + webhooks + crons in one process (legacy)
+//   BOT_ROLE=bot    Socket Mode interactive only (no crons)
+//   BOT_ROLE=worker crons + webhooks only (no Socket Mode)
+function resolveBotRoles(role) {
+  const normalized = String(role || 'all').trim().toLowerCase();
+  const effective = new Set(['all', 'bot', 'worker']).has(normalized) ? normalized : 'all';
+  return {
+    role: effective,
+    runsSocket: effective === 'all' || effective === 'bot',
+    runsWorker: effective === 'all' || effective === 'worker',
+  };
+}
+
 async function startSlackBot() {
   const shouldRunMqlDiscoveryReportCli = process.argv.includes('--run-mql-discovery-report');
   if (shouldRunMqlDiscoveryReportCli) {
@@ -5544,31 +5562,43 @@ async function startSlackBot() {
     return;
   }
 
+  const { role, runsSocket, runsWorker } = resolveBotRoles(process.env.BOT_ROLE);
+  console.log(`Starting (role='${role}', socket=${runsSocket}, worker=${runsWorker})`);
+
+  // HTTP server (health check + webhook routes) runs in every role. Webhook routes
+  // only receive traffic on the service the public domain points at (the worker).
   startHttpServer();
 
-  let slackStarted = false;
-  try {
-    await app.start();
-    slackStarted = true;
-    console.log('Slack bot is running in socket mode');
-  } catch (err) {
-    console.error('Slack socket mode failed to start; HTTP webhook routes remain available:', err.message);
+  if (runsSocket) {
+    let slackStarted = false;
+    try {
+      await app.start();
+      slackStarted = true;
+      console.log('Slack bot is running in socket mode');
+    } catch (err) {
+      console.error('Slack socket mode failed to start; HTTP webhook routes remain available:', err.message);
+    }
+    // Detect a wedged/flapping socket and self-heal via Railway restart.
+    if (slackStarted) startConnectionWatchdog(app);
+  } else {
+    console.log("Socket Mode disabled for this role; interactive Slack runs in the 'bot' service.");
   }
+
   console.log(`  Google Sheets: ready`);
   console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
   console.log(`  Firecrawl: ${FIRECRAWL_API_KEY ? 'ready' : 'NOT CONFIGURED'}`);
 
-  if (!slackStarted) return;
-
-  // Detect a wedged/flapping socket and self-heal via Railway restart.
-  startConnectionWatchdog(app);
-
-  // Schedule Slack posts only after Slack is connected.
-  scheduleMqlDiscoveryReport();
-  scheduleDailyProgress();
-  scheduleLeadStatusSync();
-
-  // Manual CLI trigger is handled before socket mode starts so it posts once and exits.
+  if (runsWorker) {
+    // Scheduled jobs post via the Slack Web API (app.client), so they run without
+    // Socket Mode. Keeping them in the worker (or single 'all') process means they
+    // never block the dedicated 'bot' process's Socket Mode heartbeat.
+    console.log(`Scheduling background jobs (role='${role}')`);
+    scheduleMqlDiscoveryReport();
+    scheduleDailyProgress();
+    scheduleLeadStatusSync();
+  } else {
+    console.log("Scheduled jobs disabled for this role; they run in the 'worker' service.");
+  }
 }
 
 if (require.main === module) {
@@ -5638,6 +5668,7 @@ module.exports = {
   runStructuredDealCreateWorkflow,
   shouldSetLifecycleToOpportunity,
   startSlackBot,
+  resolveBotRoles,
   summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
   findDuplicateOpenDeal,

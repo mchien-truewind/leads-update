@@ -240,6 +240,8 @@ async function testGtmSlackUsersMapToHubSpotOwners() {
     ['U09QC3B292R', '84547076', 'Sarah Elix'],
     ['U04BPMPR29G', '559564379', 'Alex Lee'],
     ['U0B4MRN83FE', '92555980', 'Amy Vetter'],
+    ['U0BAMU9DYR4', '93961770', 'Andrew Moyer'],
+    ['U0BARRLR6Q1', '93961773', 'Ari Nachman'],
     ['U0ABULY5TEK', '91143842', 'Jenilee Chen'],
   ];
 
@@ -302,11 +304,20 @@ function testDealOwnerResolution() {
     resolveProspectWorkflowOwner({ company: 'Acme' }, { id: '559564379', name: 'Alex Lee', source: 'from Slack tag' }),
     { id: '559564379', name: 'Alex Lee', source: 'from Slack tag' },
   );
-  const hashed = resolveDealHubSpotOwner({ company: 'Hash Co', email: 'buyer@hashco.com' }, { id: '91143842', name: 'Jenilee Chen', source: 'from Slack tag' });
-  assert.ok(['84547076', '89305622'].includes(hashed.id));
+  // A resolved requester (matched via Slack profile) owns the deal — even if they
+  // are not Sarah/Xavier. This is the "person creating the deal owns it" behavior.
   assert.deepStrictEqual(
-    resolveDealHubSpotOwner({ company: 'Hash Co', email: 'buyer@hashco.com' }, { id: '91143842', name: 'Jenilee Chen', source: 'from Slack tag' }),
-    hashed,
+    resolveDealHubSpotOwner({ company: 'Acme' }, { id: '93961770', name: 'Andrew Moyer', source: 'from Slack tag' }),
+    { id: '93961770', name: 'Andrew Moyer', source: 'requester is deal owner' },
+  );
+  // When the requester can't be identified (not resolved from Slack), fall back to
+  // the deterministic Sarah/Xavier split.
+  const hashed = resolveDealHubSpotOwner({ company: 'Hash Co', email: 'buyer@hashco.com' }, { id: '89305622', name: 'Xavier Marco', source: 'default' });
+  assert.ok(['84547076', '89305622'].includes(hashed.id));
+  assert.strictEqual(hashed.source, 'company split between Sarah/Xavier');
+  assert.deepStrictEqual(
+    resolveDealHubSpotOwner({ company: 'Hash Co', email: 'buyer@hashco.com' }, null),
+    resolveDealHubSpotOwner({ company: 'Hash Co', email: 'buyer@hashco.com' }, null),
   );
 }
 

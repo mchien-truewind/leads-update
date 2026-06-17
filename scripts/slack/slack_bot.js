@@ -165,6 +165,10 @@ const TRUEWIND_HUBSPOT = {
     brendan: { id: '91143844', name: 'Brendan Moody' },
     'sarah elix': { id: '84547076', name: 'Sarah Elix' },
     sarah: { id: '84547076', name: 'Sarah Elix' },
+    'andrew moyer': { id: '93961770', name: 'Andrew Moyer' },
+    andrew: { id: '93961770', name: 'Andrew Moyer' },
+    'ari nachman': { id: '93961773', name: 'Ari Nachman' },
+    ari: { id: '93961773', name: 'Ari Nachman' },
   },
 };
 
@@ -175,6 +179,8 @@ const DEFAULT_SLACK_TO_HUBSPOT_OWNER = {
   U09QC3B292R: { id: '84547076', name: 'Sarah Elix' },
   U04BPMPR29G: { id: '559564379', name: 'Alex Lee' },
   U0B4MRN83FE: { id: '92555980', name: 'Amy Vetter' },
+  U0BAMU9DYR4: { id: '93961770', name: 'Andrew Moyer' },
+  U0BARRLR6Q1: { id: '93961773', name: 'Ari Nachman' },
   U0ABULY5TEK: { id: '91143842', name: 'Jenilee Chen' },
 };
 
@@ -979,11 +985,6 @@ function resolveHubSpotOwner(input = {}) {
   };
 }
 
-function isAllowedDealOwner(owner = {}) {
-  const ownerId = String(owner.id || '').trim();
-  return ownerId === TRUEWIND_HUBSPOT.dealOwnerIds.sarah || ownerId === TRUEWIND_HUBSPOT.dealOwnerIds.xavier;
-}
-
 function stableOwnerHash(value) {
   const text = String(value || '').trim().toLowerCase();
   let hash = 0;
@@ -998,7 +999,10 @@ function resolveDealHubSpotOwner(input = {}, requesterOwner = null) {
   if (explicitOwner) {
     return { ...explicitOwner, source: 'explicit deal owner' };
   }
-  if (requesterOwner && isAllowedDealOwner(requesterOwner)) {
+  // Whoever requested the deal owns it, as long as we resolved them to a real
+  // HubSpot owner via their Slack profile. Falls through to the Sarah/Xavier
+  // split only when the requester can't be identified.
+  if (requesterOwner?.id && requesterOwner.source === 'from Slack tag') {
     return { ...requesterOwner, source: 'requester is deal owner' };
   }
 

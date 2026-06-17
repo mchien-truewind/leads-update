@@ -334,6 +334,44 @@ function testDealOwnerResolution() {
   );
 }
 
+async function testCreateDealToolDefaultsOwnerToRequester() {
+  const calls = [];
+  __setHubSpotRequestOverrideForTests(async (endpoint, method = 'GET', body = null) => {
+    calls.push({ endpoint, method, body });
+    if (endpoint.includes('/properties/')) {
+      return { name: endpoint.split('/').pop(), type: 'string', fieldType: 'text', modificationMetadata: { readOnlyValue: false, readOnlyDefinition: false } };
+    }
+    if (endpoint === '/crm/v3/objects/deals' && method === 'POST') {
+      return { id: '999', properties: body.properties };
+    }
+    throw new Error(`Unexpected HubSpot mock call: ${method} ${endpoint}`);
+  });
+  try {
+    // Free-form create by Alex Lee (U04BPMPR29G) with no explicit owner.
+    await executeTool('hubspot_create_deal', {
+      dealname: 'Acme Expansion',
+      dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
+      deal_source: 'Referral',
+    }, { slack_user_id: 'U04BPMPR29G', channel_id: 'C_TEST' });
+    const dealPost = calls.find((c) => c.endpoint === '/crm/v3/objects/deals' && c.method === 'POST');
+    assert.ok(dealPost, 'deal POST was made');
+    assert.strictEqual(dealPost.body.properties.hubspot_owner_id, '559564379'); // Alex owns it
+
+    // An explicitly provided owner is respected (not overwritten by the requester).
+    calls.length = 0;
+    await executeTool('hubspot_create_deal', {
+      dealname: 'Acme Expansion 2',
+      dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
+      deal_source: 'Referral',
+      properties: { hubspot_owner_id: '84547076' }, // explicit: Sarah
+    }, { slack_user_id: 'U04BPMPR29G', channel_id: 'C_TEST' });
+    const dealPost2 = calls.find((c) => c.endpoint === '/crm/v3/objects/deals' && c.method === 'POST');
+    assert.strictEqual(dealPost2.body.properties.hubspot_owner_id, '84547076'); // explicit wins
+  } finally {
+    __setHubSpotRequestOverrideForTests(null);
+  }
+}
+
 function testDealNotesPromptAndTools() {
   const toolNames = new Set(TOOLS.map((tool) => tool.name));
   assert.strictEqual(toolNames.has('grain_search_recordings'), true);
@@ -1401,6 +1439,7 @@ async function run() {
   testResolveBotRoles();
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
+  await testCreateDealToolDefaultsOwnerToRequester();
   testDealNotesPromptAndTools();
   testRecruitingAtsToolRegistrationAndPrompt();
   testRecruitingNotionPropertyHelpers();

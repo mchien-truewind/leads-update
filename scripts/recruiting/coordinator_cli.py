@@ -243,6 +243,9 @@ class Config:
     sent_status_lookback_days: int
     pipeline_label_name: str
     pdl_api_key: str
+    unipile_dsn: str
+    unipile_api_key: str
+    unipile_account_id: str
     slack_token: str
     slack_post_token: str
     slack_review_channel: str
@@ -555,6 +558,9 @@ def load_config() -> Config:
         sent_status_lookback_days=parse_env_int("RECRUITING_SENT_STATUS_LOOKBACK_DAYS", 5),
         pipeline_label_name=os.getenv("RECRUITING_GMAIL_PIPELINE_LABEL", "hiring-pipeline").strip(),
         pdl_api_key=get_env_first("PDL_API", "PDL_API_KEY"),
+        unipile_dsn=get_env_first("RECRUITING_UNIPILE_DSN", "UNIPILE_DSN"),
+        unipile_api_key=get_env_first("RECRUITING_UNIPILE_API_KEY", "UNIPILE_API_KEY"),
+        unipile_account_id=get_env_first("RECRUITING_UNIPILE_ACCOUNT_ID", "UNIPILE_ACCOUNT_ID"),
         slack_token=get_env_first("RECRUITING_SLACK_TOKEN", "SLACK_USER_TOKEN", "SLACK_BOT_TOKEN"),
         slack_post_token=get_env_first(
             "RECRUITING_SLACK_POST_TOKEN",
@@ -1865,6 +1871,123 @@ def google_search_linkedin_url(candidate_name: str, company: str, current_title:
                     return best_url, best_confidence
 
     return best_url, best_confidence
+
+
+def unipile_configured(config: Config) -> bool:
+    return bool(config.unipile_dsn and config.unipile_api_key and config.unipile_account_id)
+
+
+def linkedin_identifier_from_url(url: str) -> str:
+    match = re.search(r"linkedin\.com/(?:in|pub)/([^/?#]+)", clean_text(url), re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def unipile_search_linkedin_url(
+    config: Config, candidate_name: str, company: str, current_title: str
+) -> tuple[str, str]:
+    """Find a candidate's LinkedIn URL via the Unipile API (real LinkedIn search,
+    not HTML scraping). Mirrors the revve/gtm-os unipile-linkedin skill:
+    POST /api/v1/linkedin/search with {api: classic, category: people, keywords}."""
+    if requests is None or not unipile_configured(config) or not candidate_name.strip():
+        return "", ""
+    keywords = " ".join(part for part in [candidate_name.strip(), company.strip()] if part) or candidate_name.strip()
+    try:
+        response = requests.post(
+            f"{config.unipile_dsn.rstrip('/')}/api/v1/linkedin/search",
+            params={"account_id": config.unipile_account_id},
+            headers={"X-API-KEY": config.unipile_api_key, "Content-Type": "application/json", "accept": "application/json"},
+            json={"api": "classic", "category": "people", "keywords": keywords},
+            timeout=30,
+        )
+    except Exception:
+        return "", ""
+    if not response.ok:
+        return "", ""
+    try:
+        data = response.json()
+    except ValueError:
+        return "", ""
+
+    best_url, best_confidence, best_score = "", "", -1
+    for item in (data.get("items") or []):
+        if not isinstance(item, dict):
+            continue
+        public_identifier = clean_text(str(item.get("public_identifier", "") or ""))
+        if not public_identifier:
+            continue
+        candidate_url = f"https://www.linkedin.com/in/{public_identifier}"
+        page_text = " ".join(
+            str(item.get(key, "") or "")
+            for key in ("name", "first_name", "last_name", "headline", "location")
+        )
+        confidence, score = linkedin_confidence_for_result(
+            candidate_url,
+            candidate_name=candidate_name,
+            company=company,
+            current_title=current_title,
+            page_text=page_text,
+        )
+        if score > best_score:
+            best_score, best_url, best_confidence = score, candidate_url, confidence
+            if confidence == LINKEDIN_CONFIDENCE_HIGH:
+                return best_url, best_confidence
+    return best_url, best_confidence
+
+
+def find_linkedin_url_for_candidate(
+    config: Config, candidate_name: str, company: str, current_title: str
+) -> tuple[str, str]:
+    """Unipile-first LinkedIn URL discovery, falling back to the legacy web-search
+    scrape only when Unipile is not configured or returns nothing."""
+    if unipile_configured(config):
+        url, confidence = unipile_search_linkedin_url(config, candidate_name, company, current_title)
+        if url:
+            return url, confidence
+    return google_search_linkedin_url(candidate_name, company, current_title)
+
+
+def unipile_profile_title_company(config: Config, linkedin_url: str) -> tuple[str, str]:
+    """Fetch current title/company straight from LinkedIn via Unipile
+    (GET /api/v1/users/{identifier}). Conservative parse: only returns values from
+    structured experience entries, otherwise empty so the caller can fall back."""
+    if requests is None or not unipile_configured(config):
+        return "", ""
+    identifier = linkedin_identifier_from_url(linkedin_url)
+    if not identifier:
+        return "", ""
+    try:
+        response = requests.get(
+            f"{config.unipile_dsn.rstrip('/')}/api/v1/users/{identifier}",
+            params={"account_id": config.unipile_account_id},
+            headers={"X-API-KEY": config.unipile_api_key, "accept": "application/json"},
+            timeout=30,
+        )
+    except Exception:
+        return "", ""
+    if not response.ok:
+        return "", ""
+    try:
+        data = response.json()
+    except ValueError:
+        return "", ""
+    # Field names should be verified against a live Unipile profile response; this
+    # checks the common shapes and stays empty (→ PDL fallback) when unsure.
+    work = data.get("work_experience") or data.get("experience") or data.get("positions")
+    if isinstance(work, list) and work and isinstance(work[0], dict):
+        first = work[0]
+        title = clean_text(str(first.get("position") or first.get("title") or ""))
+        company = clean_text(str(first.get("company") or first.get("company_name") or ""))
+        return title, company
+    return "", ""
+
+
+def enrich_linkedin_title_company(config: Config, linkedin_url: str) -> tuple[str, str]:
+    """Prefer Unipile's real LinkedIn profile for title/company; fall back to PDL."""
+    if unipile_configured(config):
+        title, company = unipile_profile_title_company(config, linkedin_url)
+        if title or company:
+            return title, company
+    return enrich_title_company_from_linkedin(linkedin_url, config.pdl_api_key)
 
 
 def enrich_title_company_from_linkedin(linkedin_url: str, pdl_api_key: str) -> tuple[str, str]:
@@ -5367,7 +5490,8 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         # with "Unknown" or a non-name (e.g. a resume objective line) wastes the call
         # and tends to return the wrong profile.
         if not linkedin_url and candidate_name and candidate_name != "Unknown" and looks_like_person_name(candidate_name):
-            fallback_url, fallback_confidence = google_search_linkedin_url(
+            fallback_url, fallback_confidence = find_linkedin_url_for_candidate(
+                config,
                 candidate_name,
                 extractor_company or resume_company or existing_company,
                 extractor_title or resume_title or existing_current_title,
@@ -5389,9 +5513,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             and existing_company.lower() != "unknown"
         )
         if not can_skip_enrichment:
-            linkedin_title, linkedin_company = enrich_title_company_from_linkedin(
-                linkedin_url, config.pdl_api_key
-            )
+            linkedin_title, linkedin_company = enrich_linkedin_title_company(config, linkedin_url)
 
         resume_title_value = resume_title if resume_title and resume_title.lower() != "unknown" else ""
         resume_company_value = resume_company if resume_company and resume_company.lower() != "unknown" else ""

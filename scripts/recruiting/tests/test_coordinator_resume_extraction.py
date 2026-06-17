@@ -204,6 +204,9 @@ def build_config(**overrides) -> cli.Config:
         "sent_status_lookback_days": 7,
         "pipeline_label_name": "",
         "pdl_api_key": "",
+        "unipile_dsn": "",
+        "unipile_api_key": "",
+        "unipile_account_id": "",
         "slack_token": "xoxb-test",
         "slack_post_token": "xoxb-post-test",
         "slack_review_channel": "C123",
@@ -641,6 +644,40 @@ class NameAndExtractorWaterfallTests(unittest.TestCase):
         names = cli.likely_resume_name_lines(resume)
         self.assertNotIn("career AI data software", names)
         self.assertIn("Dikshith Reddy", names)
+
+    def test_unipile_configured_requires_all_three_values(self):
+        self.assertFalse(cli.unipile_configured(build_config()))
+        self.assertTrue(cli.unipile_configured(build_config(
+            unipile_dsn="https://api1.unipile.com:13111",
+            unipile_api_key="k",
+            unipile_account_id="acc_1",
+        )))
+
+    def test_linkedin_identifier_from_url(self):
+        self.assertEqual(cli.linkedin_identifier_from_url("https://www.linkedin.com/in/dikshithreddym"), "dikshithreddym")
+        self.assertEqual(cli.linkedin_identifier_from_url("https://linkedin.com/in/jane-doe/"), "jane-doe")
+        self.assertEqual(cli.linkedin_identifier_from_url("not-a-url"), "")
+
+    def test_unipile_search_parses_public_identifier(self):
+        cfg = build_config(
+            unipile_dsn="https://api1.unipile.com:13111",
+            unipile_api_key="k",
+            unipile_account_id="acc_1",
+        )
+        resp = mock.Mock(ok=True)
+        resp.json.return_value = {"items": [{"name": "Dikshith Reddy", "headline": "Account Executive at Stripe", "public_identifier": "dikshithreddym"}]}
+        with mock.patch.object(cli, "requests", mock.Mock(post=mock.Mock(return_value=resp))):
+            url, _conf = cli.unipile_search_linkedin_url(cfg, "Dikshith Reddy", "Stripe", "Account Executive")
+        self.assertEqual(url, "https://www.linkedin.com/in/dikshithreddym")
+
+    def test_find_linkedin_falls_back_to_scrape_when_unipile_unconfigured(self):
+        cfg = build_config()  # no unipile creds
+        with mock.patch.object(cli, "unipile_search_linkedin_url") as unipile, \
+             mock.patch.object(cli, "google_search_linkedin_url", return_value=("https://www.linkedin.com/in/scraped", "Low")) as scrape:
+            url, _ = cli.find_linkedin_url_for_candidate(cfg, "Jane Doe", "Acme", "AE")
+        unipile.assert_not_called()
+        scrape.assert_called_once()
+        self.assertEqual(url, "https://www.linkedin.com/in/scraped")
 
     def test_confidence_is_acceptable_handles_labels_and_numbers(self):
         self.assertTrue(cli.confidence_is_acceptable("high"))

@@ -545,7 +545,7 @@ def load_config() -> Config:
         name_verifier_model=os.getenv("RECRUITING_NAME_VERIFIER_MODEL", "claude-3-5-haiku-latest").strip(),
         resume_extractor_provider=os.getenv("RECRUITING_RESUME_EXTRACTOR_PROVIDER", "off").strip().lower(),
         resume_extractor_model=os.getenv("RECRUITING_RESUME_EXTRACTOR_MODEL", "gpt-4.1-mini").strip(),
-        resume_extractor_model_anthropic=os.getenv("RECRUITING_RESUME_EXTRACTOR_MODEL_ANTHROPIC", "claude-3-5-haiku-latest").strip(),
+        resume_extractor_model_anthropic=os.getenv("RECRUITING_RESUME_EXTRACTOR_MODEL_ANTHROPIC", "claude-haiku-4-5").strip(),
         anthropic_api_key=get_env_first("RECRUITING_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
         openai_api_key=get_env_first("RECRUITING_OPENAI_API_KEY", "OPENAI_API_KEY"),
         no_response_wait_days=parse_env_int("RECRUITING_NO_RESPONSE_WAIT_DAYS", 14),
@@ -1496,6 +1496,22 @@ def call_openai_resume_extractor(config: Config, resume_text: str, snippet: str)
     return _finalize_resume_extraction(content, source)
 
 
+def confidence_is_acceptable(raw: Any) -> bool:
+    # Models return confidence either as a label (low/medium/high) or a number
+    # (e.g. 0.95). Accept medium/high labels or a numeric score >= 0.6.
+    if isinstance(raw, bool):
+        return False
+    if isinstance(raw, (int, float)):
+        return float(raw) >= 0.6
+    text = clean_text(str(raw or "")).lower()
+    if text in {"medium", "high"}:
+        return True
+    try:
+        return float(text) >= 0.6
+    except ValueError:
+        return False
+
+
 def _finalize_resume_extraction(content: str, source: str) -> dict[str, Any]:
     try:
         parsed = json.loads(str(content).strip())
@@ -1516,7 +1532,7 @@ def _finalize_resume_extraction(content: str, source: str) -> dict[str, Any]:
     if (
         title
         and company
-        and confidence in {"medium", "high"}
+        and confidence_is_acceptable(parsed.get("confidence"))
         and extractor_evidence_supports_output(title, company, evidence, source)
     ):
         result["latest_current_title"] = title
@@ -1541,7 +1557,7 @@ def call_anthropic_resume_extractor(config: Config, resume_text: str, snippet: s
                 "Content-Type": "application/json",
             },
             json={
-                "model": config.resume_extractor_model_anthropic or "claude-3-5-haiku-latest",
+                "model": config.resume_extractor_model_anthropic or "claude-haiku-4-5",
                 "max_tokens": 600,
                 "temperature": 0,
                 "messages": [{"role": "user", "content": build_resume_extractor_prompt(source)}],

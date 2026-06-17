@@ -642,6 +642,15 @@ class NameAndExtractorWaterfallTests(unittest.TestCase):
         self.assertNotIn("career AI data software", names)
         self.assertIn("Dikshith Reddy", names)
 
+    def test_confidence_is_acceptable_handles_labels_and_numbers(self):
+        self.assertTrue(cli.confidence_is_acceptable("high"))
+        self.assertTrue(cli.confidence_is_acceptable("medium"))
+        self.assertTrue(cli.confidence_is_acceptable(0.95))   # models often return a number
+        self.assertTrue(cli.confidence_is_acceptable("0.8"))
+        self.assertFalse(cli.confidence_is_acceptable("low"))
+        self.assertFalse(cli.confidence_is_acceptable(0.3))
+        self.assertFalse(cli.confidence_is_acceptable(""))
+
     def test_resume_extractor_providers_waterfall(self):
         self.assertEqual(cli.resume_extractor_providers(_config(provider="auto")), ["anthropic", "openai"])
         self.assertEqual(cli.resume_extractor_providers(_config(provider="both")), ["anthropic", "openai"])

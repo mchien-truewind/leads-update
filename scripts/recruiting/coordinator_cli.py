@@ -235,6 +235,7 @@ class Config:
     name_verifier_model: str
     resume_extractor_provider: str
     resume_extractor_model: str
+    resume_extractor_model_anthropic: str
     anthropic_api_key: str
     openai_api_key: str
     no_response_wait_days: int
@@ -544,6 +545,7 @@ def load_config() -> Config:
         name_verifier_model=os.getenv("RECRUITING_NAME_VERIFIER_MODEL", "claude-3-5-haiku-latest").strip(),
         resume_extractor_provider=os.getenv("RECRUITING_RESUME_EXTRACTOR_PROVIDER", "off").strip().lower(),
         resume_extractor_model=os.getenv("RECRUITING_RESUME_EXTRACTOR_MODEL", "gpt-4.1-mini").strip(),
+        resume_extractor_model_anthropic=os.getenv("RECRUITING_RESUME_EXTRACTOR_MODEL_ANTHROPIC", "claude-3-5-haiku-latest").strip(),
         anthropic_api_key=get_env_first("RECRUITING_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
         openai_api_key=get_env_first("RECRUITING_OPENAI_API_KEY", "OPENAI_API_KEY"),
         no_response_wait_days=parse_env_int("RECRUITING_NO_RESPONSE_WAIT_DAYS", 14),
@@ -1440,10 +1442,14 @@ def capped_resume_extractor_source(resume_text: str, snippet: str, max_chars: in
 
 def build_resume_extractor_prompt(source: str) -> str:
     return (
-        "Extract the candidate's latest current role and company from the resume text. "
+        "Extract the candidate's full name and latest current role and company from the resume text. "
         "Use only the provided source. Prefer explicitly current or most recent experience. "
-        "Return only strict JSON with keys latest_current_title, latest_current_company, "
-        "confidence, and evidence. confidence must be one of low, medium, high. "
+        "Return only strict JSON with keys candidate_name, latest_current_title, latest_current_company, "
+        "confidence, and evidence. "
+        "candidate_name must be the person's actual full name (e.g. 'Dikshith Reddy M'), NOT an objective, "
+        "headline, summary, or job-search phrase such as 'seeking AI roles in Canada'. If the real name is "
+        "not clearly present, return an empty candidate_name. "
+        "confidence must be one of low, medium, high. "
         "evidence must be a short exact quote or list of exact quotes copied from the source "
         "that supports the extracted current role/company. If uncertain, use empty strings and low confidence.\n\n"
         f"Source:\n{source}"
@@ -1487,45 +1493,127 @@ def call_openai_resume_extractor(config: Config, resume_text: str, snippet: str)
         if isinstance(body.get("choices"), list)
         else ""
     )
+    return _finalize_resume_extraction(content, source)
+
+
+def _finalize_resume_extraction(content: str, source: str) -> dict[str, Any]:
     try:
         parsed = json.loads(str(content).strip())
     except ValueError:
+        parsed = extract_json_object(str(content))
+    if not isinstance(parsed, dict) or not parsed:
         return {}
-    if not isinstance(parsed, dict):
-        return {}
+
+    result: dict[str, Any] = {}
+    name = clean_candidate_name(str(parsed.get("candidate_name", "") or ""))
+    if name and looks_like_person_name(name):
+        result["candidate_name"] = name
 
     title = clean_text(str(parsed.get("latest_current_title", "") or ""))
     company = clean_text(str(parsed.get("latest_current_company", "") or ""))
     confidence = clean_text(str(parsed.get("confidence", "") or "")).lower()
     evidence = parsed.get("evidence")
-    if not title or not company:
+    if (
+        title
+        and company
+        and confidence in {"medium", "high"}
+        and extractor_evidence_supports_output(title, company, evidence, source)
+    ):
+        result["latest_current_title"] = title
+        result["latest_current_company"] = company
+        result["confidence"] = confidence
+        result["evidence"] = evidence
+    return result
+
+
+def call_anthropic_resume_extractor(config: Config, resume_text: str, snippet: str) -> dict[str, Any]:
+    if requests is None or not config.anthropic_api_key:
         return {}
-    if confidence not in {"medium", "high"}:
+    source = capped_resume_extractor_source(resume_text, snippet)
+    if not source.strip():
         return {}
-    if not extractor_evidence_supports_output(title, company, evidence, source):
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": config.anthropic_api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": config.resume_extractor_model_anthropic or "claude-3-5-haiku-latest",
+                "max_tokens": 600,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": build_resume_extractor_prompt(source)}],
+            },
+            timeout=45,
+        )
+    except Exception:
         return {}
-    return {
-        "latest_current_title": title,
-        "latest_current_company": company,
-        "confidence": confidence,
-        "evidence": evidence,
-    }
+    if not response.ok:
+        return {}
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    content = "\n".join(
+        str(item.get("text", ""))
+        for item in (body.get("content") or [])
+        if isinstance(item, dict) and item.get("type") == "text"
+    )
+    return _finalize_resume_extraction(content, source)
+
+
+def resume_extractor_providers(config: Config) -> list[str]:
+    provider = (config.resume_extractor_provider or "off").strip().lower()
+    if provider in {"", "off", "none", "false", "0"}:
+        return []
+    if provider in {"auto", "both", "claude_then_openai", "anthropic_then_openai"}:
+        return ["anthropic", "openai"]
+    if provider in {"anthropic", "claude"}:
+        return ["anthropic"]
+    if provider == "openai":
+        return ["openai"]
+    return []
+
+
+def extract_resume_fields(config: Config, resume_text: str, snippet: str) -> dict[str, Any]:
+    """Run the configured resume extractor(s) as a waterfall and merge results.
+
+    With provider 'auto'/'both', Claude runs first and OpenAI fills any field Claude
+    left empty. Returns a dict that may include candidate_name, latest_current_title,
+    and latest_current_company.
+    """
+    merged: dict[str, Any] = {}
+    for provider in resume_extractor_providers(config):
+        parsed = (
+            call_anthropic_resume_extractor(config, resume_text, snippet)
+            if provider == "anthropic"
+            else call_openai_resume_extractor(config, resume_text, snippet)
+        )
+        for key, value in (parsed or {}).items():
+            if value and not merged.get(key):
+                merged[key] = value
+        if (
+            merged.get("candidate_name")
+            and merged.get("latest_current_title")
+            and merged.get("latest_current_company")
+        ):
+            break
+    return merged
 
 
 def extract_latest_resume_role_company(config: Config, resume_text: str, snippet: str) -> tuple[str, str]:
-    provider = (config.resume_extractor_provider or "off").strip().lower()
-    if provider in {"", "off", "none", "false", "0"}:
-        return "", ""
-    if provider != "openai":
-        return "", ""
-
-    parsed = call_openai_resume_extractor(config, resume_text, snippet)
-    if not parsed:
-        return "", ""
+    parsed = extract_resume_fields(config, resume_text, snippet)
     return (
         clean_text(str(parsed.get("latest_current_title", "") or "")),
         clean_text(str(parsed.get("latest_current_company", "") or "")),
     )
+
+
+def extract_resume_candidate_name(config: Config, resume_text: str, snippet: str) -> str:
+    parsed = extract_resume_fields(config, resume_text, snippet)
+    return clean_text(str(parsed.get("candidate_name", "") or ""))
 
 
 def normalize_linkedin_url(url: str) -> str:
@@ -2329,6 +2417,31 @@ def first_name_from_linkedin_url(value: str) -> str:
     return tokens[0].capitalize()
 
 
+# Tokens that mark a line as an objective/headline/summary or a role descriptor
+# rather than a person's name. Guards against grabbing strings like
+# "career AI/data/software roles in Canada" as the candidate name.
+NON_NAME_TOKENS = frozenset({
+    "seeking", "objective", "objectives", "summary", "profile", "career", "careers",
+    "role", "roles", "position", "positions", "looking", "aspiring", "passionate",
+    "experienced", "professional", "professionals", "engineer", "developer", "manager",
+    "analyst", "intern", "student", "resume", "cv", "curriculum", "vitae", "data",
+    "software", "ai", "ml", "remote", "canada", "usa", "available", "open",
+})
+
+
+def looks_like_person_name(value: str) -> bool:
+    name = clean_text(value).strip("\"' ")
+    if not name or len(name) > 40 or any(ch.isdigit() for ch in name):
+        return False
+    words = name.split()
+    if not (1 <= len(words) <= 4):
+        return False
+    if any(word.lower().strip(".,") in NON_NAME_TOKENS for word in words):
+        return False
+    capitalized = sum(1 for word in words if word[:1].isupper())
+    return capitalized >= max(1, len(words) - 1)
+
+
 def likely_resume_name_lines(resume_text: str) -> list[str]:
     lines = [normalize_resume_line(line) for line in split_resume_lines(resume_text)]
     candidates: list[str] = []
@@ -2336,13 +2449,19 @@ def likely_resume_name_lines(resume_text: str) -> list[str]:
         if not line:
             continue
         lowered = line.lower()
-        if any(token in lowered for token in {"resume", "curriculum", "experience", "education", "linkedin", "email"}):
+        if any(token in lowered for token in {
+            "resume", "curriculum", "experience", "education", "linkedin", "email",
+            "objective", "summary", "profile", "seeking", "looking for",
+        }):
             continue
         if re.search(r"[@:/]|(?:\+?\d[\d\s().-]{6,})", line):
             continue
         words = re.findall(r"[A-Za-z][A-Za-z'’-]+", line)
-        if 1 <= len(words) <= 4 and sum(1 for word in words if word[:1].isupper()) >= 1:
-            candidates.append(" ".join(words))
+        if not (1 <= len(words) <= 4):
+            continue
+        candidate = " ".join(words)
+        if looks_like_person_name(candidate):
+            candidates.append(candidate)
     return candidates[:3]
 
 
@@ -5123,8 +5242,12 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
                 continue
             role, subject_candidate_name = parsed_subject
             candidate_name = subject_candidate_name
-        if role == "Unknown":
-            role = canonicalize_truewind_role(thread_body_text)
+        if role in {"Unknown", "Other"}:
+            # A stated position (e.g. "Account Executive") may appear anywhere in the
+            # subject or body even when the primary subject parse missed it.
+            rescanned = canonicalize_truewind_role(f"{subject}\n{thread_body_text}")
+            if rescanned not in {"Unknown", "Other"}:
+                role = rescanned
 
         resume_reference = extract_primary_resume_part_from_thread(thread)
         resume_part: dict[str, Any] | None = None
@@ -5175,7 +5298,16 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
 
         stage = classify_career_stage(resume_text or snippet)
         resume_title, resume_company = infer_current_title_and_company_from_resume(resume_text, snippet)
-        extractor_title, extractor_company = extract_latest_resume_role_company(config, resume_text, snippet)
+        extracted_fields = extract_resume_fields(config, resume_text, snippet)
+        extractor_title = clean_text(str(extracted_fields.get("latest_current_title", "") or ""))
+        extractor_company = clean_text(str(extracted_fields.get("latest_current_company", "") or ""))
+        # Prefer the LLM-extracted real name when the header/subject/heuristic name is
+        # missing, "Unknown", or doesn't look like a person (e.g. a resume objective line).
+        extractor_name = clean_candidate_name(str(extracted_fields.get("candidate_name", "") or ""))
+        if extractor_name and looks_like_person_name(extractor_name) and (
+            not candidate_name or candidate_name == "Unknown" or not looks_like_person_name(candidate_name)
+        ):
+            candidate_name = extractor_name
         location = classify_location(resume_text, snippet)
 
         existing_page = find_existing_candidate_page(

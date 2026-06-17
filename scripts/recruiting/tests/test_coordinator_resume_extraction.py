@@ -196,6 +196,7 @@ def build_config(**overrides) -> cli.Config:
         "name_verifier_model": "",
         "resume_extractor_provider": "off",
         "resume_extractor_model": "",
+        "resume_extractor_model_anthropic": "",
         "anthropic_api_key": "",
         "openai_api_key": "",
         "no_response_wait_days": 7,
@@ -622,6 +623,49 @@ class ActiveAtsDigestTests(unittest.TestCase):
 
         self.assertEqual(result, (1, 3))
         post_digest.assert_called_once()
+
+
+class NameAndExtractorWaterfallTests(unittest.TestCase):
+    def test_looks_like_person_name_accepts_real_names(self):
+        self.assertTrue(cli.looks_like_person_name("Dikshith Reddy M"))
+        self.assertTrue(cli.looks_like_person_name("Jordan Lee"))
+
+    def test_looks_like_person_name_rejects_objectives_and_headlines(self):
+        self.assertFalse(cli.looks_like_person_name("career AI data software"))
+        self.assertFalse(cli.looks_like_person_name("Seeking AI Roles In Canada"))
+        self.assertFalse(cli.looks_like_person_name("Senior Software Engineer"))
+        self.assertFalse(cli.looks_like_person_name("Phone 415 555 1212"))
+
+    def test_resume_name_lines_skip_objective_headline(self):
+        resume = "career AI/data/software roles in Canada\nDikshith Reddy M\nExperience\n"
+        names = cli.likely_resume_name_lines(resume)
+        self.assertNotIn("career AI data software", names)
+        self.assertIn("Dikshith Reddy", names)
+
+    def test_resume_extractor_providers_waterfall(self):
+        self.assertEqual(cli.resume_extractor_providers(_config(provider="auto")), ["anthropic", "openai"])
+        self.assertEqual(cli.resume_extractor_providers(_config(provider="both")), ["anthropic", "openai"])
+        self.assertEqual(cli.resume_extractor_providers(_config(provider="claude")), ["anthropic"])
+        self.assertEqual(cli.resume_extractor_providers(_config(provider="openai")), ["openai"])
+        self.assertEqual(cli.resume_extractor_providers(_config(provider="off")), [])
+
+    def test_extract_resume_fields_falls_back_claude_then_openai(self):
+        config = _config(provider="auto")
+        with mock.patch.object(cli, "call_anthropic_resume_extractor", return_value={"candidate_name": "Dikshith Reddy M"}) as anthropic, \
+             mock.patch.object(cli, "call_openai_resume_extractor", return_value={
+                 "latest_current_title": "Data Engineer",
+                 "latest_current_company": "Acme",
+             }) as openai:
+            fields = cli.extract_resume_fields(config, "resume", "snippet")
+        anthropic.assert_called_once()
+        openai.assert_called_once()  # called because Claude left title/company empty
+        self.assertEqual(fields.get("candidate_name"), "Dikshith Reddy M")
+        self.assertEqual(fields.get("latest_current_title"), "Data Engineer")
+        self.assertEqual(fields.get("latest_current_company"), "Acme")
+
+
+def _config(provider: str):
+    return build_config(resume_extractor_provider=provider)
 
 
 if __name__ == "__main__":

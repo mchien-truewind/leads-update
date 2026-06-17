@@ -5363,7 +5363,10 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         linkedin_confidence = (
             LINKEDIN_CONFIDENCE_HIGH if resume_linkedin_url else existing_linkedin_confidence
         )
-        if not linkedin_url:
+        # Only attempt a LinkedIn lookup when we have a real candidate name. Searching
+        # with "Unknown" or a non-name (e.g. a resume objective line) wastes the call
+        # and tends to return the wrong profile.
+        if not linkedin_url and candidate_name and candidate_name != "Unknown" and looks_like_person_name(candidate_name):
             fallback_url, fallback_confidence = google_search_linkedin_url(
                 candidate_name,
                 extractor_company or resume_company or existing_company,

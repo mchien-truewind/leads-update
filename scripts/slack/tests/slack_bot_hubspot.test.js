@@ -15,6 +15,7 @@ process.env.SLACK_TO_HUBSPOT_OWNER_JSON = JSON.stringify({
 const {
   TOOLS,
   TRUEWIND_HUBSPOT,
+  sanitizeToken,
   __setHubSpotRequestOverrideForTests,
   buildDealNoteBody,
   buildRecruitingCalendarInvite,
@@ -272,6 +273,15 @@ function testDynamicOwnerMatchByEmailAndName() {
     pickHubSpotOwnerForProfile({ email: 'stranger@example.com', realName: 'Random Person' }, owners),
     null,
   );
+}
+
+function testSanitizeTokenStripsWhitespace() {
+  // Mirrors the real prod failure: a token with an embedded newline + spaces.
+  assert.strictEqual(sanitizeToken('xoxp-abc\n  def'), 'xoxp-abcdef');
+  assert.strictEqual(sanitizeToken('  xoxb-123  '), 'xoxb-123');
+  assert.strictEqual(sanitizeToken('xapp-1-A0\t0'), 'xapp-1-A00');
+  assert.strictEqual(sanitizeToken(''), '');
+  assert.strictEqual(sanitizeToken(undefined), '');
 }
 
 function testLeadSourceDefaultsToOutbound() {
@@ -1363,6 +1373,7 @@ async function run() {
   await testExplicitOwnerOverridesSlackMapping();
   await testGtmSlackUsersMapToHubSpotOwners();
   testDynamicOwnerMatchByEmailAndName();
+  testSanitizeTokenStripsWhitespace();
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
   testDealNotesPromptAndTools();

@@ -16,6 +16,7 @@ const {
   TOOLS,
   TRUEWIND_HUBSPOT,
   sanitizeToken,
+  resolveBotRoles,
   __setHubSpotRequestOverrideForTests,
   buildDealNoteBody,
   buildRecruitingCalendarInvite,
@@ -273,6 +274,18 @@ function testDynamicOwnerMatchByEmailAndName() {
     pickHubSpotOwnerForProfile({ email: 'stranger@example.com', realName: 'Random Person' }, owners),
     null,
   );
+}
+
+function testResolveBotRoles() {
+  // Default / unknown → legacy single-process behavior (socket + worker).
+  assert.deepStrictEqual(resolveBotRoles(undefined), { role: 'all', runsSocket: true, runsWorker: true });
+  assert.deepStrictEqual(resolveBotRoles('all'), { role: 'all', runsSocket: true, runsWorker: true });
+  assert.deepStrictEqual(resolveBotRoles('nonsense'), { role: 'all', runsSocket: true, runsWorker: true });
+  // Dedicated interactive bot: socket only, no scheduled jobs.
+  assert.deepStrictEqual(resolveBotRoles('bot'), { role: 'bot', runsSocket: true, runsWorker: false });
+  assert.deepStrictEqual(resolveBotRoles(' BOT '), { role: 'bot', runsSocket: true, runsWorker: false });
+  // Dedicated worker: crons + webhooks, no socket.
+  assert.deepStrictEqual(resolveBotRoles('worker'), { role: 'worker', runsSocket: false, runsWorker: true });
 }
 
 function testSanitizeTokenStripsWhitespace() {
@@ -1374,6 +1387,7 @@ async function run() {
   await testGtmSlackUsersMapToHubSpotOwners();
   testDynamicOwnerMatchByEmailAndName();
   testSanitizeTokenStripsWhitespace();
+  testResolveBotRoles();
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
   testDealNotesPromptAndTools();

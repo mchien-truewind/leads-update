@@ -13,6 +13,24 @@ if (fs.existsSync(envPath)) {
   }
 }
 
+// Slack tokens never contain whitespace. A wrapped copy-paste into env config can
+// inject a stray newline/space mid-token, which makes the HTTP Authorization header
+// invalid ("Invalid character in header content") and silently fails Slack Web API
+// calls (including replies). Strip whitespace from credential vars in place so every
+// consumer gets a clean value, regardless of how the env was set.
+function sanitizeToken(value) {
+  return String(value == null ? '' : value).replace(/\s+/g, '');
+}
+for (const key of ['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_USER_TOKEN']) {
+  if (process.env[key]) {
+    const cleaned = sanitizeToken(process.env[key]);
+    if (cleaned !== process.env[key]) {
+      console.log(JSON.stringify({ event: 'sanitized_credential_env', key }));
+      process.env[key] = cleaned;
+    }
+  }
+}
+
 const { App: SlackBoltApp } = require('@slack/bolt');
 const Anthropic = require('@anthropic-ai/sdk').default;
 const { google } = require('googleapis');
@@ -5356,6 +5374,60 @@ function startHttpServer() {
   return server;
 }
 
+// Socket Mode can wedge after a network blip or a missed heartbeat ("A pong wasn't
+// received...") and the process stays alive while silently delivering nothing, so
+// mentions go unanswered. This watchdog (a) logs socket connect/disconnect events so
+// flapping is observable, and (b) probes the connection; after sustained failure it
+// exits non-zero so Railway's ON_FAILURE restart policy brings up a fresh, reconnected
+// process. Tunable via SLACK_WATCHDOG_INTERVAL_MS / SLACK_WATCHDOG_MAX_FAILURES.
+function startConnectionWatchdog(app, {
+  intervalMs = Number(process.env.SLACK_WATCHDOG_INTERVAL_MS || 30000),
+  maxFailures = Number(process.env.SLACK_WATCHDOG_MAX_FAILURES || 5),
+} = {}) {
+  // Best-effort: surface raw socket lifecycle so we can confirm/diagnose flapping.
+  try {
+    const socketClient = app.receiver?.client;
+    if (socketClient && typeof socketClient.on === 'function') {
+      for (const evt of ['disconnected', 'connecting', 'reconnecting', 'connected', 'error']) {
+        socketClient.on(evt, (info) => {
+          console.log(JSON.stringify({
+            event: 'slack_socket_lifecycle',
+            state: evt,
+            detail: info?.message || info?.code || undefined,
+          }));
+        });
+      }
+    }
+  } catch (err) {
+    console.error(`Could not attach Slack socket lifecycle listeners: ${err.message}`);
+  }
+
+  let consecutiveFailures = 0;
+  const timer = setInterval(async () => {
+    try {
+      await app.client.auth.test();
+      consecutiveFailures = 0;
+    } catch (error) {
+      consecutiveFailures += 1;
+      console.log(JSON.stringify({
+        event: 'slack_watchdog_check_failed',
+        consecutive_failures: consecutiveFailures,
+        error: error.data?.error || error.code || error.message,
+      }));
+      if (consecutiveFailures >= maxFailures) {
+        console.log(JSON.stringify({
+          event: 'slack_watchdog_exit',
+          consecutive_failures: consecutiveFailures,
+          reason: 'connection unhealthy; exiting so Railway restarts a fresh process',
+        }));
+        process.exit(1);
+      }
+    }
+  }, intervalMs);
+  timer.unref();
+  return timer;
+}
+
 async function startSlackBot() {
   const shouldRunMqlDiscoveryReportCli = process.argv.includes('--run-mql-discovery-report');
   if (shouldRunMqlDiscoveryReportCli) {
@@ -5381,6 +5453,9 @@ async function startSlackBot() {
 
   if (!slackStarted) return;
 
+  // Detect a wedged/flapping socket and self-heal via Railway restart.
+  startConnectionWatchdog(app);
+
   // Schedule Slack posts only after Slack is connected.
   scheduleMqlDiscoveryReport();
   scheduleDailyProgress();
@@ -5403,6 +5478,7 @@ if (require.main === module) {
 module.exports = {
   TOOLS,
   TRUEWIND_HUBSPOT,
+  sanitizeToken,
   buildDealNoteBody,
   buildRecruitingCalendarInvite,
   classifyProgressDealSource,

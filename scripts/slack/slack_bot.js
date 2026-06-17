@@ -1003,23 +1003,22 @@ async function resolveHubSpotOwnerForProspect(input = {}) {
 
   const metadata = getSlackMetadata(input);
   const slackUserId = String(input.slack_user_id || input.slackUserId || metadata.slack_user_id || '').trim();
-  let slackUserEmail = String(input.slack_user_email || input.slackUserEmail || '').trim().toLowerCase();
-  if (!slackUserEmail && slackUserId) {
-    slackUserEmail = (await getSlackUserEmail(slackUserId)).trim().toLowerCase();
-  }
-  if (slackUserEmail) {
-    try {
-      const owners = await hubspotRequest('/crm/v3/owners/?limit=100');
-      const owner = (owners.results || []).find((candidate) => (
-        String(candidate.email || '').trim().toLowerCase() === slackUserEmail
-      ));
-      if (owner?.id) {
-        const name = [owner.firstName, owner.lastName].filter(Boolean).join(' ') || owner.email || `HubSpot owner ${owner.id}`;
-        return { id: String(owner.id), name, source: 'from Slack tag' };
-      }
-    } catch (err) {
-      console.error(`Could not map Slack user email to HubSpot owner: ${err.message}`);
+
+  // An explicitly supplied email override (rare) still wins.
+  const explicitEmail = String(input.slack_user_email || input.slackUserEmail || '').trim().toLowerCase();
+  if (explicitEmail) {
+    const owners = await getHubSpotOwnersCached();
+    const owner = owners.find((candidate) => normalizeEmail(candidate.email) === explicitEmail);
+    if (owner?.id) {
+      const name = [owner.firstName, owner.lastName].filter(Boolean).join(' ') || owner.email || `HubSpot owner ${owner.id}`;
+      return { id: String(owner.id), name, source: 'from Slack tag' };
     }
+  }
+
+  // Resolve the requester's Slack ID to their real HubSpot owner (email, then name).
+  if (slackUserId) {
+    const matched = await matchHubSpotOwnerToSlackUser(slackUserId);
+    if (matched?.id) return { id: matched.id, name: matched.name, source: 'from Slack tag' };
   }
 
   return resolveHubSpotOwner(input);
@@ -1056,13 +1055,89 @@ function getSlackMetadata(input = {}) {
       if (key && value) metadata[key] = value;
     }
   }
+  // Server-injected trusted metadata (the real Slack identity behind the request)
+  // takes precedence over anything the model may have placed in the tool args.
+  const trusted = trustedSlackMetadata(input);
   return {
-    channel_id: input.channel_id || input.channelId || metadata.channel_id || '',
-    slack_user_id: input.slack_user_id || input.slackUserId || metadata.slack_user_id || '',
+    channel_id: trusted.channel_id || input.channel_id || input.channelId || metadata.channel_id || '',
+    slack_user_id: trusted.slack_user_id || input.slack_user_id || input.slackUserId || metadata.slack_user_id || '',
   };
 }
 
-function isHubSpotWriteAuthorized(input, owner) {
+const HUBSPOT_OWNERS_CACHE_TTL_MS = Number(process.env.HUBSPOT_OWNERS_CACHE_TTL_MS || 10 * 60 * 1000);
+let hubspotOwnersCache = { fetchedAt: 0, owners: [] };
+
+function normalizeNameForMatch(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+// Fetch all active HubSpot owners (paginated), cached briefly so the dynamic
+// auth/attribution path doesn't hit HubSpot on every write. Returns [] on failure
+// so callers degrade to the static allowlist rather than throwing.
+async function getHubSpotOwnersCached() {
+  const now = Date.now();
+  if (hubspotOwnersCache.owners.length && now - hubspotOwnersCache.fetchedAt < HUBSPOT_OWNERS_CACHE_TTL_MS) {
+    return hubspotOwnersCache.owners;
+  }
+  try {
+    const owners = [];
+    let after = '';
+    do {
+      const qs = after ? `&after=${encodeURIComponent(after)}` : '';
+      const res = await hubspotRequest(`/crm/v3/owners/?limit=100${qs}`);
+      for (const o of res.results || []) owners.push(o);
+      after = res.paging?.next?.after || '';
+    } while (after);
+    hubspotOwnersCache = { fetchedAt: now, owners };
+    return owners;
+  } catch (err) {
+    console.error(`Could not fetch HubSpot owners for dynamic auth: ${err.message}`);
+    return hubspotOwnersCache.owners; // stale-but-better-than-nothing, else []
+  }
+}
+
+const slackOwnerMatchCache = new Map();
+
+function hubspotOwnerDisplayName(o = {}) {
+  return [o.firstName, o.lastName].filter(Boolean).join(' ') || o.email || `HubSpot owner ${o.id}`;
+}
+
+// Pure matcher: given a Slack profile { email, realName } and the HubSpot owner
+// list, return the matching owner as { id, name } or null. Email match is
+// preferred; name match is the fallback when Slack and HubSpot emails differ.
+function pickHubSpotOwnerForProfile(profile = {}, owners = []) {
+  const email = normalizeEmail(profile.email);
+  let match = null;
+  if (email) {
+    match = owners.find((o) => normalizeEmail(o.email) === email);
+  }
+  if (!match && profile.realName) {
+    const wanted = normalizeNameForMatch(profile.realName);
+    match = owners.find((o) => normalizeNameForMatch(hubspotOwnerDisplayName(o)) === wanted);
+  }
+  return match?.id ? { id: String(match.id), name: hubspotOwnerDisplayName(match) } : null;
+}
+
+// Resolve a Slack user ID to a real HubSpot owner by looking up the teammate's
+// Slack profile (email + name) and matching it against the HubSpot owner list.
+// Returns { id, name, source } or null. Cached per Slack ID (positive matches only).
+async function matchHubSpotOwnerToSlackUser(slackUserId) {
+  const id = String(slackUserId || '').trim();
+  if (!id) return null;
+  if (slackOwnerMatchCache.has(id)) return slackOwnerMatchCache.get(id);
+
+  const profile = await getSlackUserProfile(id);
+  if (!profile.email && !profile.realName) return null;
+  const owners = await getHubSpotOwnersCached();
+  if (!owners.length) return null;
+
+  const picked = pickHubSpotOwnerForProfile(profile, owners);
+  const resolved = picked ? { ...picked, source: 'matched from Slack profile' } : null;
+  if (resolved) slackOwnerMatchCache.set(id, resolved);
+  return resolved;
+}
+
+async function isHubSpotWriteAuthorized(input, owner) {
   if (!HUBSPOT_WRITE_REQUIRE_AUTH) return { authorized: true, reason: 'auth disabled' };
   const metadata = getSlackMetadata(input);
   const slackUserId = String(metadata.slack_user_id || '').trim();
@@ -1078,6 +1153,14 @@ function isHubSpotWriteAuthorized(input, owner) {
   }
   if (owner?.source === 'from Slack tag') {
     return { authorized: true, reason: 'Slack user maps to HubSpot owner' };
+  }
+  // Dynamic: any teammate whose Slack profile resolves to a real HubSpot owner is
+  // authorized. This scales to the whole team without maintaining a static map.
+  if (slackUserId) {
+    const dynamicOwner = await matchHubSpotOwnerToSlackUser(slackUserId);
+    if (dynamicOwner?.id) {
+      return { authorized: true, reason: 'Slack user matched to a HubSpot owner' };
+    }
   }
   return {
     authorized: false,
@@ -2489,9 +2572,9 @@ async function runStructuredDealCreateWorkflow(input) {
     return `Error: ${missingDealSourceMessage()}`;
   }
 
-  const contactOwner = resolveHubSpotOwner({ context: input.context, slack_user_id: input.slack_user_id, channel_id: input.channel_id });
+  const contactOwner = await resolveHubSpotOwnerForProspect({ context: input.context, slack_user_id: input.slack_user_id, channel_id: input.channel_id });
   const dealOwner = resolveDealHubSpotOwner(input, contactOwner);
-  const authorization = isHubSpotWriteAuthorized(input, contactOwner);
+  const authorization = await isHubSpotWriteAuthorized(input, contactOwner);
   if (!authorization.authorized) {
     return `Error: not authorized to write to HubSpot: ${authorization.reason}. No HubSpot deal was created.`;
   }
@@ -2645,7 +2728,7 @@ async function runTruewindHubSpotProspectWorkflow(input) {
   const workflowOwner = resolveProspectWorkflowOwner(input, requesterOwner);
   const contactOwner = workflowOwner;
   const dealOwner = workflowOwner;
-  const authorization = isHubSpotWriteAuthorized(input, contactOwner);
+  const authorization = await isHubSpotWriteAuthorized(input, contactOwner);
   if (!authorization.authorized) {
     return `Not authorized to write to HubSpot: ${authorization.reason}. Ask an admin to set HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS or HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS, or map your Slack account to a HubSpot owner.`;
   }
@@ -3288,7 +3371,7 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
       'hubspot_create_note',
     ]);
     if (hubspotWriteTools.has(name)) {
-      const authorization = isHubSpotWriteAuthorized(input, resolveHubSpotOwner(input));
+      const authorization = await isHubSpotWriteAuthorized(toolInput, resolveHubSpotOwner(toolInput));
       if (!authorization.authorized) {
         return `Error: not authorized to write to HubSpot: ${authorization.reason}`;
       }
@@ -3784,19 +3867,39 @@ function stripMention(text) {
   return text.replace(/<@[A-Z0-9]+>/g, '').trim();
 }
 
-async function getSlackUserEmail(slackUserId) {
-  if (!slackUserId) return '';
+const slackUserProfileCache = new Map();
+
+// Resolve a Slack user ID to their profile (email + display name). Cached for the
+// process lifetime so repeated HubSpot writes by the same teammate don't re-hit
+// the Slack API. Returns { email, realName } with empty strings when unavailable.
+async function getSlackUserProfile(slackUserId) {
+  if (!slackUserId) return { email: '', realName: '' };
+  if (slackUserProfileCache.has(slackUserId)) return slackUserProfileCache.get(slackUserId);
+
   const tokens = [process.env.SLACK_BOT_TOKEN, process.env.SLACK_USER_TOKEN].filter(Boolean);
+  let profile = { email: '', realName: '' };
   for (const token of tokens) {
     try {
       const result = await app.client.users.info({ token, user: slackUserId });
-      const email = result.user?.profile?.email || '';
-      if (email) return email;
+      const user = result.user || {};
+      const p = user.profile || {};
+      profile = {
+        email: (p.email || '').trim(),
+        realName: (p.real_name || user.real_name || p.display_name || user.name || '').trim(),
+      };
+      if (profile.email || profile.realName) break;
     } catch (err) {
-      console.error(`Could not fetch Slack user email for ${slackUserId}: ${err.message}`);
+      console.error(`Could not fetch Slack user profile for ${slackUserId}: ${err.message}`);
     }
   }
-  return '';
+  // Only cache positive resolutions so a transient Slack failure isn't sticky.
+  if (profile.email || profile.realName) slackUserProfileCache.set(slackUserId, profile);
+  return profile;
+}
+
+async function getSlackUserEmail(slackUserId) {
+  const { email } = await getSlackUserProfile(slackUserId);
+  return email || '';
 }
 
 // Returns { messages, parentTs } where parentTs is the timestamp of the first/parent message
@@ -5429,6 +5532,7 @@ module.exports = {
   hubspotPropertyCache,
   hubspotRecordUrl,
   isHubSpotWriteAuthorized,
+  pickHubSpotOwnerForProfile,
   isReadOnlyHubSpotProperty,
   isRecruitingCalendarWriteAuthorized,
   hasRecruitingCalendarTitleInput,

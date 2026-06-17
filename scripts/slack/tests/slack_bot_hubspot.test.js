@@ -35,6 +35,7 @@ const {
   hubspotPropertyCache,
   hubspotRecordUrl,
   isHubSpotWriteAuthorized,
+  pickHubSpotOwnerForProfile,
   isReadOnlyHubSpotProperty,
   isRecruitingCalendarWriteAuthorized,
   hasRecruitingCalendarTitleInput,
@@ -221,16 +222,16 @@ async function testExplicitOwnerOverridesSlackMapping() {
     { id: '87811681', name: 'Mercedes Chien', source: 'explicit owner' },
   );
   assert.deepStrictEqual(
-    isHubSpotWriteAuthorized({ slack_user_id: 'U_TEST' }, owner),
+    await isHubSpotWriteAuthorized({ slack_user_id: 'U_TEST' }, owner),
     { authorized: true, reason: 'Slack user maps to HubSpot owner' },
   );
   assert.strictEqual(
-    isHubSpotWriteAuthorized({ slack_user_id: 'U_UNMAPPED' }, owner).authorized,
+    (await isHubSpotWriteAuthorized({ slack_user_id: 'U_UNMAPPED' }, owner)).authorized,
     false,
   );
 }
 
-function testGtmSlackUsersMapToHubSpotOwners() {
+async function testGtmSlackUsersMapToHubSpotOwners() {
   const expectedMappings = [
     ['U0ATZSNCE5T', '91143842', 'Jenilee Chen'],
     ['U0AURH4KMRN', '91143844', 'Brendan Moody'],
@@ -245,10 +246,32 @@ function testGtmSlackUsersMapToHubSpotOwners() {
     const owner = resolveHubSpotOwner({ slack_user_id: slackUserId });
     assert.deepStrictEqual(owner, { id: hubspotOwnerId, name, source: 'from Slack tag' });
     assert.deepStrictEqual(
-      isHubSpotWriteAuthorized({ slack_user_id: slackUserId }, owner),
+      await isHubSpotWriteAuthorized({ slack_user_id: slackUserId }, owner),
       { authorized: true, reason: 'Slack user maps to HubSpot owner' },
     );
   }
+}
+
+function testDynamicOwnerMatchByEmailAndName() {
+  const owners = [
+    { id: '111', email: 'andrew@trytruewind.com', firstName: 'Andrew', lastName: 'Moyer' },
+    { id: '222', email: 'ari@trytruewind.com', firstName: 'Ari', lastName: 'Nachman' },
+  ];
+  // Email match (preferred), case-insensitive.
+  assert.deepStrictEqual(
+    pickHubSpotOwnerForProfile({ email: 'ANDREW@trytruewind.com', realName: 'Andrew M' }, owners),
+    { id: '111', name: 'Andrew Moyer' },
+  );
+  // Name fallback when Slack email differs from the HubSpot owner email.
+  assert.deepStrictEqual(
+    pickHubSpotOwnerForProfile({ email: 'ari.personal@gmail.com', realName: 'ari nachman' }, owners),
+    { id: '222', name: 'Ari Nachman' },
+  );
+  // No match → null (caller falls back to allowlist/default).
+  assert.strictEqual(
+    pickHubSpotOwnerForProfile({ email: 'stranger@example.com', realName: 'Random Person' }, owners),
+    null,
+  );
 }
 
 function testLeadSourceDefaultsToOutbound() {
@@ -1338,7 +1361,8 @@ async function run() {
   testStructuredNotesCanBeMultiline();
   testDealNoteBodyEscapesAndIncludesFields();
   await testExplicitOwnerOverridesSlackMapping();
-  testGtmSlackUsersMapToHubSpotOwners();
+  await testGtmSlackUsersMapToHubSpotOwners();
+  testDynamicOwnerMatchByEmailAndName();
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
   testDealNotesPromptAndTools();

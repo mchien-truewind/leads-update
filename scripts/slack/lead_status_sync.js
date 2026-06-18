@@ -128,14 +128,35 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function parseRetryAfterMs(value) {
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  const dateMs = Date.parse(value);
+  return Number.isNaN(dateMs) ? 0 : Math.max(0, dateMs - Date.now());
+}
+
+function hubspotRetryDelayMs({ statusCode, retryAfterMs = 0, attempt }) {
+  if (retryAfterMs > 0) return Math.min(retryAfterMs, 30000);
+  if (statusCode === 429) return Math.min(2500 * (attempt + 1), 15000);
+  return Math.min(1000 * Math.pow(2, attempt), 15000);
+}
+
+function isRetryableHubSpotError(err) {
+  if (!err) return false;
+  if (err.statusCode === 429 || (err.statusCode >= 500 && err.statusCode < 600)) return true;
+  return !err.statusCode;
+}
+
 function makeDefaultConfig(env = process.env) {
+  const touchpointSource = normalizeTouchpointSource(env.LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE || DEFAULT_TOUCHPOINT_SOURCE);
   return {
     listId: env.LEAD_STATUS_SYNC_LIST_ID || DEFAULT_LIST_ID,
     targetChannel: env.LEAD_STATUS_SYNC_TARGET_CHANNEL || DEFAULT_TARGET_CHANNEL,
     triggerSecret: env.LEAD_STATUS_SYNC_TRIGGER_SECRET || env.LEAD_REPORT_TRIGGER_SECRET || '',
     lookbackHours: Number(env.LEAD_STATUS_SYNC_LOOKBACK_HOURS || DEFAULT_LOOKBACK_HOURS),
     touchpointDays: Number(env.LEAD_STATUS_SYNC_TOUCHPOINT_DAYS || DEFAULT_TOUCHPOINT_DAYS),
-    touchpointSource: normalizeTouchpointSource(env.LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE || DEFAULT_TOUCHPOINT_SOURCE),
+    touchpointSource,
     previewLimit: Number(env.LEAD_STATUS_SYNC_PREVIEW_LIMIT || 50),
     bdrOwnerIds: parseDelimitedList(env.LEAD_STATUS_SYNC_BDR_OWNER_IDS, DEFAULT_BDR_OWNER_IDS).map(String),
     bdrEmails: parseDelimitedList(env.LEAD_STATUS_SYNC_BDR_EMAILS, DEFAULT_BDR_EMAILS).map(email => email.toLowerCase()),
@@ -146,7 +167,7 @@ function makeDefaultConfig(env = process.env) {
     ).map(String),
     searchDelayMs: Number(env.LEAD_STATUS_SYNC_SEARCH_DELAY_MS || 250),
     generalDelayMs: Number(env.LEAD_STATUS_SYNC_GENERAL_DELAY_MS || 80),
-    engagementConcurrency: Number(env.LEAD_STATUS_SYNC_ENGAGEMENT_CONCURRENCY || 6),
+    engagementConcurrency: Number(env.LEAD_STATUS_SYNC_ENGAGEMENT_CONCURRENCY || (touchpointSource === 'engagements' ? 6 : 2)),
   };
 }
 
@@ -161,22 +182,39 @@ async function hubspotFetch(path, options = {}, config = {}) {
   if (!token) throw new Error('Missing HubSpot token for lead status sync');
 
   for (let attempt = 0; attempt < 7; attempt += 1) {
-    const response = await fetch(`https://api.hubapi.com${path}`, {
-      ...options,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        ...(options.headers || {}),
-      },
-    });
+    let response;
+    try {
+      response = await fetch(`https://api.hubapi.com${path}`, {
+        ...options,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          ...(options.headers || {}),
+        },
+      });
+    } catch (err) {
+      if (isRetryableHubSpotError(err) && attempt < 6) {
+        await sleep(hubspotRetryDelayMs({
+          statusCode: err.statusCode,
+          retryAfterMs: err.retryAfterMs,
+          attempt,
+        }));
+        continue;
+      }
+      throw err;
+    }
     const text = await response.text();
     let body;
     try { body = text ? JSON.parse(text) : {}; } catch { body = text; }
 
     if (response.ok) return body;
     if ((response.status === 429 || response.status >= 500) && attempt < 6) {
-      await sleep(1000 * Math.pow(2, attempt));
+      await sleep(hubspotRetryDelayMs({
+        statusCode: response.status,
+        retryAfterMs: parseRetryAfterMs(response.headers.get('retry-after')),
+        attempt,
+      }));
       continue;
     }
     const message = typeof body === 'string' ? body : (body.message || JSON.stringify(body));
@@ -186,7 +224,23 @@ async function hubspotFetch(path, options = {}, config = {}) {
 }
 
 function makeHttpsHubSpotFetch(token) {
-  return function request(path, options = {}) {
+  async function request(path, options = {}) {
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+      try {
+        return await requestOnce(path, options);
+      } catch (err) {
+        if (!isRetryableHubSpotError(err) || attempt >= 6) throw err;
+        await sleep(hubspotRetryDelayMs({
+          statusCode: err.statusCode,
+          retryAfterMs: err.retryAfterMs,
+          attempt,
+        }));
+      }
+    }
+    throw new Error(`HubSpot request exhausted retries: ${path}`);
+  }
+
+  function requestOnce(path, options = {}) {
     return new Promise((resolve, reject) => {
       const url = new URL(`https://api.hubapi.com${path}`);
       const req = https.request({
@@ -207,7 +261,10 @@ function makeHttpsHubSpotFetch(token) {
           try { body = data ? JSON.parse(data) : {}; } catch { body = data; }
           if (res.statusCode < 200 || res.statusCode >= 300) {
             const msg = typeof body === 'string' ? body : (body.message || JSON.stringify(body));
-            reject(new Error(`HubSpot ${res.statusCode}: ${msg}`));
+            const err = new Error(`HubSpot ${res.statusCode}: ${msg}`);
+            err.statusCode = res.statusCode;
+            err.retryAfterMs = parseRetryAfterMs(res.headers['retry-after']);
+            reject(err);
             return;
           }
           resolve(body);
@@ -217,7 +274,9 @@ function makeHttpsHubSpotFetch(token) {
       if (options.body) req.write(options.body);
       req.end();
     });
-  };
+  }
+
+  return request;
 }
 
 async function getListMemberIds(hubspot, listId, config) {
@@ -1123,6 +1182,7 @@ module.exports = {
   classifyLeadStatus,
   countNoteTouchpoints90d,
   formatLeadStatusSyncSummary,
+  hubspotFetch,
   includeTouchpointEngagement,
   makeDefaultConfig,
   normalizeTouchpointSource,

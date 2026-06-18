@@ -7,7 +7,9 @@ const {
   classifyTouchpointNote,
   classifyLeadStatus,
   formatLeadStatusSyncSummary,
+  hubspotFetch,
   includeTouchpointEngagement,
+  makeDefaultConfig,
   summarizeNoteTouchpoints,
   runLeadStatusSync,
 } = require('../lead_status_sync');
@@ -504,6 +506,53 @@ function testSummaryIncludesKeyCounts() {
   assert.match(text, /Total touchpoints: 12/);
 }
 
+function testNotesModeDefaultsToLowerConcurrency() {
+  assert.strictEqual(makeDefaultConfig({ LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE: 'engagements' }).engagementConcurrency, 6);
+  assert.strictEqual(makeDefaultConfig({ LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE: 'notes' }).engagementConcurrency, 2);
+  assert.strictEqual(
+    makeDefaultConfig({
+      LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE: 'notes',
+      LEAD_STATUS_SYNC_ENGAGEMENT_CONCURRENCY: '4',
+    }).engagementConcurrency,
+    4,
+  );
+}
+
+async function testHubSpotFetchRetriesTransientFailures() {
+  const originalFetch = global.fetch;
+  let attempts = 0;
+  global.fetch = async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      const err = new Error('fetch failed');
+      err.retryAfterMs = 1;
+      throw err;
+    }
+    if (attempts === 2) {
+      return {
+        ok: false,
+        status: 429,
+        headers: { get: name => (String(name).toLowerCase() === 'retry-after' ? '0.001' : '') },
+        text: async () => JSON.stringify({ message: 'You have reached your ten_secondly_rolling limit.' }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => '' },
+      text: async () => JSON.stringify({ ok: true }),
+    };
+  };
+
+  try {
+    const result = await hubspotFetch('/crm/v3/objects/contacts/1', {}, { hubspotToken: 'test-token' });
+    assert.deepStrictEqual(result, { ok: true });
+    assert.strictEqual(attempts, 3);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
 async function run() {
   testTouchpointFiltering();
   testNoteTouchpointClassification();
@@ -514,6 +563,8 @@ async function run() {
   await testIncrementalSyncUsesRecentNooksNotInterestedCalls();
   await testNotesModeUsesAssociatedNotesForTouchpoints();
   testSummaryIncludesKeyCounts();
+  testNotesModeDefaultsToLowerConcurrency();
+  await testHubSpotFetchRetriesTransientFailures();
 }
 
 run()

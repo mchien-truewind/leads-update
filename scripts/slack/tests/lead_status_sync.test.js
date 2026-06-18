@@ -4,9 +4,11 @@ const {
   DISQUALIFIED_REASONS,
   STATUS,
   buildContactUpdate,
+  classifyTouchpointNote,
   classifyLeadStatus,
   formatLeadStatusSyncSummary,
   includeTouchpointEngagement,
+  summarizeNoteTouchpoints,
   runLeadStatusSync,
 } = require('../lead_status_sync');
 
@@ -31,6 +33,18 @@ function engagement(overrides = {}) {
       direction: 'OUTGOING',
       from: { email: 'bdr@example.com' },
       ...overrides.metadata,
+    },
+  };
+}
+
+function note(id, properties = {}) {
+  return {
+    id: String(id),
+    properties: {
+      hs_timestamp: String(Date.parse('2026-05-20T12:00:00.000Z')),
+      hubspot_owner_id: '100',
+      hs_note_body: 'Email sent to prospect',
+      ...properties,
     },
   };
 }
@@ -111,6 +125,52 @@ function testLeadClassification() {
       forceDisqualifiedReason: true,
     },
   );
+}
+
+function testNoteTouchpointClassification() {
+  const sinceMs = Date.parse('2026-02-20T00:00:00.000Z');
+
+  assert.deepStrictEqual(
+    classifyTouchpointNote(note(1, { hs_note_body: '<p>Email sent to prospect</p>' }), sinceMs, TEST_CONFIG),
+    {
+      include: true,
+      reason: 'email_sent',
+      channel: 'email',
+      dedupeKey: classifyTouchpointNote(note(1, { hs_note_body: '<p>Email sent to prospect</p>' }), sinceMs, TEST_CONFIG).dedupeKey,
+    },
+  );
+  assert.strictEqual(
+    classifyTouchpointNote(note(2, { hs_note_body: 'Email opened by prospect' }), sinceMs, TEST_CONFIG).reason,
+    'email_open',
+  );
+  assert.strictEqual(
+    classifyTouchpointNote(note(3, { hs_note_body: 'Sent LinkedIn message through HeyReach' }), sinceMs, TEST_CONFIG).channel,
+    'message',
+  );
+  assert.strictEqual(
+    classifyTouchpointNote(note(4, { hubspot_owner_id: '999', hs_note_body: 'Email sent to prospect' }), sinceMs, TEST_CONFIG).channel,
+    'email',
+  );
+  assert.strictEqual(
+    classifyTouchpointNote(note(5, { hs_timestamp: String(Date.parse('2026-01-01T00:00:00.000Z')) }), sinceMs, TEST_CONFIG).reason,
+    'outside_window',
+  );
+}
+
+function testNoteTouchpointSummaryDedupesAndTracksExclusions() {
+  const sinceMs = Date.parse('2026-02-20T00:00:00.000Z');
+  const summary = summarizeNoteTouchpoints([
+    note(1, { hs_note_body: 'Email sent to prospect' }),
+    note(2, { hs_note_body: 'Email sent to prospect' }),
+    note(3, { hs_note_body: 'Email opened by prospect' }),
+    note(4, { hs_note_body: 'Prospect replied with thanks' }),
+  ], sinceMs, TEST_CONFIG);
+
+  assert.strictEqual(summary.count, 1);
+  assert.strictEqual(summary.duplicates, 1);
+  assert.strictEqual(summary.excluded.duplicate, 1);
+  assert.strictEqual(summary.excluded.email_open, 1);
+  assert.strictEqual(summary.excluded.inbound_reply, 1);
 }
 
 function testUpdateBuilderOnlyMovesForwardAndMaintainsTouchpoints() {
@@ -308,6 +368,111 @@ async function testIncrementalSyncUsesRecentNooksNotInterestedCalls() {
   });
 }
 
+async function testNotesModeUsesAssociatedNotesForTouchpoints() {
+  const updates = [];
+  const calls = [];
+
+  async function hubspot(path, options = {}) {
+    calls.push({ path, options });
+    if (path.startsWith('/crm/v3/lists/694/memberships/join-order')) {
+      return { results: [{ recordId: '1' }] };
+    }
+    if (path === '/crm/v3/objects/contacts/search') {
+      const body = JSON.parse(options.body);
+      const field = body.filterGroups[0].filters[0].propertyName;
+      return field === 'notes_last_updated' ? { results: [{ id: '1' }] } : { results: [] };
+    }
+    if (path === '/crm/v3/objects/calls/search') {
+      return { results: [] };
+    }
+    if (path === '/crm/v3/objects/contacts/batch/read') {
+      return {
+        results: [
+          contact(1, {
+            hs_lead_status: STATUS.NEW,
+            bdr_touchpoints_90d: '0',
+          }),
+        ],
+      };
+    }
+    if (path.startsWith('/crm/v4/objects/contacts/1/associations/notes')) {
+      return {
+        results: [{ toObjectId: 'n1' }, { toObjectId: 'n2' }, { toObjectId: 'n3' }],
+      };
+    }
+    if (path.startsWith('/crm/v4/objects/contacts/1/associations/calls')) {
+      return {
+        results: [{ toObjectId: 'c1' }],
+      };
+    }
+    if (path === '/crm/v3/objects/notes/batch/read') {
+      return {
+        results: [
+          note('n1', { hs_note_body: 'Email sent to prospect' }),
+          note('n2', { hs_note_body: 'Email opened by prospect' }),
+          note('n3', { hs_note_body: 'Sent LinkedIn message through HeyReach' }),
+        ],
+      };
+    }
+    if (path === '/crm/v3/objects/calls/batch/read') {
+      return {
+        results: [
+          {
+            id: 'c1',
+            properties: {
+              hs_timestamp: String(Date.parse('2026-05-20T12:30:00.000Z')),
+              hs_call_direction: 'OUTBOUND',
+              hs_call_status: 'COMPLETED',
+              hs_call_title: '[Nooks Call] - Left voicemail - Example Person',
+            },
+          },
+        ],
+      };
+    }
+    if (path === '/crm/v3/objects/contacts/batch/update') {
+      updates.push(...JSON.parse(options.body).inputs);
+      return {};
+    }
+    throw new Error(`Unexpected HubSpot call: ${path}`);
+  }
+
+  const stats = await runLeadStatusSync({
+    mode: 'incremental',
+    listId: '694',
+    now: new Date('2026-05-20T13:00:00.000Z'),
+    lookbackHours: 28,
+    touchpointDays: 90,
+    touchpointSource: 'notes',
+    bdrOwnerIds: ['100'],
+    bdrEmails: ['bdr@example.com'],
+    searchDelayMs: 0,
+    generalDelayMs: 0,
+    engagementConcurrency: 1,
+    hubspot,
+    skipSlack: true,
+    logger: { log() {} },
+  });
+
+  assert.strictEqual(stats.touchpointSource, 'notes');
+  assert.strictEqual(stats.notesScanned, 3);
+  assert.strictEqual(stats.notesCounted, 2);
+  assert.strictEqual(stats.callsScanned, 1);
+  assert.strictEqual(stats.callsCounted, 1);
+  assert.strictEqual(stats.noteExclusions.email_open, 1);
+  assert.strictEqual(stats.touchpointUpdates, 1);
+  assert.deepStrictEqual(updates[0].properties, {
+    hs_lead_status: STATUS.WORKING,
+    bdr_touchpoints_90d: '3',
+    bdr_touchpoints_90d_updated_at: String(Date.parse('2026-05-20T13:00:00.000Z')),
+  });
+  assert.strictEqual(stats.preview[0].touchpointSource, 'notes');
+  assert.strictEqual(stats.preview[0].noteEvidence.length, 3);
+  assert.ok(calls.some(call => call.path.startsWith('/crm/v4/objects/contacts/1/associations/notes')));
+  assert.ok(calls.some(call => call.path === '/crm/v3/objects/notes/batch/read'));
+  assert.ok(calls.some(call => call.path.startsWith('/crm/v4/objects/contacts/1/associations/calls')));
+  assert.ok(calls.some(call => call.path === '/crm/v3/objects/calls/batch/read'));
+}
+
 function testSummaryIncludesKeyCounts() {
   const text = formatLeadStatusSyncSummary({
     mode: 'incremental',
@@ -317,6 +482,12 @@ function testSummaryIncludesKeyCounts() {
     updatedContacts: 3,
     statusUpdates: 2,
     touchpointUpdates: 3,
+    touchpointSource: 'notes',
+    notesScanned: 9,
+    notesCounted: 6,
+    callsScanned: 3,
+    callsCounted: 2,
+    duplicateNotes: 1,
     errors: 0,
     transitions: { [`${STATUS.NEW} -> ${STATUS.WORKING}`]: 2 },
     disqualifiedReasons: {},
@@ -327,15 +498,21 @@ function testSummaryIncludesKeyCounts() {
 
   assert.match(text, /Lead status sync complete \(incremental, dry run\)/);
   assert.match(text, /Status changes: 2/);
+  assert.match(text, /Touchpoint source: notes/);
+  assert.match(text, /Notes scanned: 9/);
+  assert.match(text, /Calls counted: 2/);
   assert.match(text, /Total touchpoints: 12/);
 }
 
 async function run() {
   testTouchpointFiltering();
+  testNoteTouchpointClassification();
+  testNoteTouchpointSummaryDedupesAndTracksExclusions();
   testLeadClassification();
   testUpdateBuilderOnlyMovesForwardAndMaintainsTouchpoints();
   await testIncrementalSyncUsesRecentCandidatesAndAllowedEngagements();
   await testIncrementalSyncUsesRecentNooksNotInterestedCalls();
+  await testNotesModeUsesAssociatedNotesForTouchpoints();
   testSummaryIncludesKeyCounts();
 }
 

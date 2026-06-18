@@ -182,7 +182,9 @@ curl -H "x-mql-discovery-report-token: $MQL_DISCOVERY_REPORT_TRIGGER_SECRET" \
 
 The Railway Slack bot also runs a daily HubSpot contact sync for list `694` (`[GTM Team] All Open Leads`) at 7:30 PM Pacific and posts a summary to `#slack-testing`.
 
-The sync is deterministic and does not call an LLM. Daily incremental runs search recent HubSpot activity timestamp fields with a 28-hour lookback, intersect those contacts with list `694`, then inspect only allowed contact engagements for those candidates. Allowed touchpoints are outbound `EMAIL`, outbound `CALL`, `MEETING`, and `TASK` engagements owned by the configured BDRs or sent from configured BDR emails. Segment/list membership changes do not count as touchpoints. Full-list mode is available by manual trigger, or by setting an optional weekly full-run weekday.
+The sync is deterministic and does not call an LLM. Daily incremental runs search recent HubSpot activity timestamp fields with a 28-hour lookback, intersect those contacts with list `694`, then inspect only allowed contact activity for those candidates.
+
+The default production touchpoint source remains legacy HubSpot engagements until note-mode dry runs are approved. In legacy mode, allowed touchpoints are outbound `EMAIL`, outbound `CALL`, `MEETING`, and `TASK` engagements owned by the configured BDRs or sent from configured BDR emails. In note mode, the sync reads contact-associated HubSpot notes and calls, then counts activity-level touchpoints in the last 90 days: calls, email-sent notes, and LinkedIn/message-sent notes. Email opens, clicks, bounces, sequence/list/system events, inbound replies, and duplicates do not count. Segment/list membership changes do not count as touchpoints. Full-list mode is available by manual trigger, or by setting an optional weekly full-run weekday.
 
 Status rules:
 - New: `No one has contacted them` when there is no counted outreach activity.
@@ -206,6 +208,8 @@ LEAD_STATUS_SYNC_TARGET_CHANNEL=slack-testing
 LEAD_STATUS_SYNC_LIST_ID=694
 LEAD_STATUS_SYNC_LOOKBACK_HOURS=28
 LEAD_STATUS_SYNC_TOUCHPOINT_DAYS=90
+LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE=engagements  # engagements (default), notes, or hybrid
+LEAD_STATUS_SYNC_PREVIEW_LIMIT=50
 LEAD_STATUS_SYNC_BDR_OWNER_IDS=84547076,89305622,91143842,91143844
 LEAD_STATUS_SYNC_BDR_EMAILS=sarah@trytruewind.com,xavier@trytruewind.com,jenilee@trytruewind.com,brendan@trytruewind.com
 LEAD_STATUS_SYNC_TARGET_HOUR=19
@@ -218,6 +222,13 @@ Manual dry run from Railway:
 ```sh
 curl -H "x-lead-status-sync-token: $LEAD_STATUS_SYNC_TRIGGER_SECRET" \
   "https://leads-update-production.up.railway.app/run-lead-status-sync?dryRun=1&skipSlack=1"
+```
+
+Manual note-mode dry run for Phase 1 audit:
+
+```sh
+curl -H "x-lead-status-sync-token: $LEAD_STATUS_SYNC_TRIGGER_SECRET" \
+  "https://leads-update-production.up.railway.app/run-lead-status-sync?dryRun=1&skipSlack=1&touchpointSource=notes"
 ```
 
 Manual full run:

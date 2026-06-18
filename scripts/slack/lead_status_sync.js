@@ -4,6 +4,7 @@ const DEFAULT_LIST_ID = '694';
 const DEFAULT_TARGET_CHANNEL = 'slack-testing';
 const DEFAULT_LOOKBACK_HOURS = 28;
 const DEFAULT_TOUCHPOINT_DAYS = 90;
+const DEFAULT_TOUCHPOINT_SOURCE = 'engagements';
 const DEFAULT_BDR_OWNER_IDS = ['84547076', '89305622', '91143842', '91143844'];
 const DEFAULT_NOOKS_NOT_INTERESTED_DISPOSITION_IDS = ['739e9efc-95d4-448d-9440-7a14287a02fa'];
 const DEFAULT_BDR_EMAILS = [
@@ -83,6 +84,24 @@ const CONTACT_PROPERTIES = [
 
 const ALLOWED_ENGAGEMENT_TYPES = new Set(['EMAIL', 'CALL', 'MEETING', 'TASK']);
 const INBOUND_DIRECTIONS = new Set(['INCOMING', 'INBOUND']);
+const NOTE_EXCLUSION_PATTERNS = [
+  { reason: 'email_open', pattern: /\b(email\s+)?open(?:ed)?\b/i },
+  { reason: 'email_click', pattern: /\bclick(?:ed)?\b/i },
+  { reason: 'bounce', pattern: /\b(bounce|bounced|hard bounce|soft bounce)\b/i },
+  { reason: 'sequence_or_list', pattern: /\b(sequence|enroll(?:ed|ment)?|unenroll(?:ed|ment)?|list membership|workflow)\b/i },
+  { reason: 'inbound_reply', pattern: /\b(replied|reply|responded|response from|emailed back|wrote back|inbound)\b/i },
+];
+const EMAIL_SENT_PATTERNS = [
+  /\b(email|sales email|outbound email)\b[^.\n]{0,80}\b(sent|delivered)\b/i,
+  /\b(sent|delivered)\b[^.\n]{0,80}\b(email|sales email|outbound email)\b/i,
+  /\bemailed\b/i,
+];
+const MESSAGE_SENT_PATTERNS = [
+  /\b(linkedin|heyreach)\b[^.\n]{0,100}\b(message|dm|inmail|connection request|connect request)\b[^.\n]{0,80}\b(sent|delivered)\b/i,
+  /\b(sent|delivered)\b[^.\n]{0,80}\b(linkedin|heyreach)\b[^.\n]{0,80}\b(message|dm|inmail|connection request|connect request)\b/i,
+  /\bmessage\s+sent\b/i,
+  /\bsent\s+(?:a\s+)?message\b/i,
+];
 
 function parseDelimitedList(value, fallback = []) {
   const parsed = String(value || '')
@@ -116,6 +135,8 @@ function makeDefaultConfig(env = process.env) {
     triggerSecret: env.LEAD_STATUS_SYNC_TRIGGER_SECRET || env.LEAD_REPORT_TRIGGER_SECRET || '',
     lookbackHours: Number(env.LEAD_STATUS_SYNC_LOOKBACK_HOURS || DEFAULT_LOOKBACK_HOURS),
     touchpointDays: Number(env.LEAD_STATUS_SYNC_TOUCHPOINT_DAYS || DEFAULT_TOUCHPOINT_DAYS),
+    touchpointSource: normalizeTouchpointSource(env.LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE || DEFAULT_TOUCHPOINT_SOURCE),
+    previewLimit: Number(env.LEAD_STATUS_SYNC_PREVIEW_LIMIT || 50),
     bdrOwnerIds: parseDelimitedList(env.LEAD_STATUS_SYNC_BDR_OWNER_IDS, DEFAULT_BDR_OWNER_IDS).map(String),
     bdrEmails: parseDelimitedList(env.LEAD_STATUS_SYNC_BDR_EMAILS, DEFAULT_BDR_EMAILS).map(email => email.toLowerCase()),
     enableNooksNotInterestedSync: String(env.LEAD_STATUS_SYNC_ENABLE_NOOKS_NOT_INTERESTED || 'true').toLowerCase() !== 'false',
@@ -127,6 +148,12 @@ function makeDefaultConfig(env = process.env) {
     generalDelayMs: Number(env.LEAD_STATUS_SYNC_GENERAL_DELAY_MS || 80),
     engagementConcurrency: Number(env.LEAD_STATUS_SYNC_ENGAGEMENT_CONCURRENCY || 6),
   };
+}
+
+function normalizeTouchpointSource(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['notes', 'engagements', 'hybrid'].includes(normalized)) return normalized;
+  return DEFAULT_TOUCHPOINT_SOURCE;
 }
 
 async function hubspotFetch(path, options = {}, config = {}) {
@@ -338,6 +365,105 @@ function metadataEmail(metadata) {
   return String(metadata?.from?.email || metadata?.fromEmail || metadata?.senderEmail || '').toLowerCase();
 }
 
+function stripHubSpotHtml(value) {
+  return String(value || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function noteTimestampMs(note) {
+  const properties = note.properties || {};
+  const raw = properties.hs_timestamp || properties.hs_createdate || properties.createdate || note.createdAt;
+  if (!raw) return 0;
+  if (/^\d+$/.test(String(raw))) return Number(raw);
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function noteOwnerId(note) {
+  return String(note.properties?.hubspot_owner_id || '');
+}
+
+function noteBody(note) {
+  return stripHubSpotHtml(note.properties?.hs_note_body || note.properties?.hs_body || '');
+}
+
+function noteTouchpointChannel(text) {
+  if (EMAIL_SENT_PATTERNS.some(pattern => pattern.test(text))) return 'email';
+  if (MESSAGE_SENT_PATTERNS.some(pattern => pattern.test(text))) return 'message';
+  return '';
+}
+
+function classifyTouchpointNote(note, sinceMs, config) {
+  const timestamp = noteTimestampMs(note);
+  if (!timestamp || timestamp < sinceMs) return { include: false, reason: 'outside_window' };
+
+  const text = noteBody(note);
+  if (!text) return { include: false, reason: 'empty_note' };
+  for (const exclusion of NOTE_EXCLUSION_PATTERNS) {
+    if (exclusion.pattern.test(text)) return { include: false, reason: exclusion.reason };
+  }
+
+  const channel = noteTouchpointChannel(text);
+  if (!channel) return { include: false, reason: 'unmatched_note_pattern' };
+  return {
+    include: true,
+    reason: `${channel}_sent`,
+    channel,
+    dedupeKey: noteDedupeKey(note, channel, text),
+  };
+}
+
+function callTimestampMs(call) {
+  const properties = call.properties || {};
+  const raw = properties.hs_timestamp || properties.hs_createdate || properties.createdate || call.createdAt;
+  if (!raw) return 0;
+  if (/^\d+$/.test(String(raw))) return Number(raw);
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function callTitle(call) {
+  return stripHubSpotHtml(call.properties?.hs_call_title || call.properties?.hs_call_body || '');
+}
+
+function classifyTouchpointCall(call, sinceMs) {
+  const timestamp = callTimestampMs(call);
+  if (!timestamp || timestamp < sinceMs) return { include: false, reason: 'outside_window' };
+  const direction = String(call.properties?.hs_call_direction || '').toUpperCase();
+  if (INBOUND_DIRECTIONS.has(direction)) return { include: false, reason: 'inbound_call' };
+  return {
+    include: true,
+    reason: 'call',
+    channel: 'call',
+    dedupeKey: `call:${call.id || callTitle(call)}:${timestamp}`,
+  };
+}
+
+function noteDedupeKey(note, channel, text = noteBody(note)) {
+  const timestamp = noteTimestampMs(note);
+  const bucketMs = timestamp ? Math.floor(timestamp / (5 * 60 * 1000)) * 5 * 60 * 1000 : 0;
+  const owner = noteOwnerId(note) || 'unknown';
+  const normalizedText = text.toLowerCase().replace(/\s+/g, ' ').slice(0, 160);
+  let hash = 0;
+  for (let i = 0; i < normalizedText.length; i += 1) {
+    hash = ((hash << 5) - hash) + normalizedText.charCodeAt(i);
+    hash |= 0;
+  }
+  return `${channel}:${owner}:${bucketMs}:${Math.abs(hash)}`;
+}
+
 function isBdrEngagement(engagement, metadata, config) {
   const ownerId = String(engagement.ownerId || '');
   if (ownerId && config.bdrOwnerIds.includes(ownerId)) return true;
@@ -373,6 +499,205 @@ async function countTouchpoints90d(hubspot, contactId, sinceMs, config) {
     if (config.generalDelayMs) await sleep(Math.min(config.generalDelayMs, 50));
   } while (offset);
   return count;
+}
+
+async function readContactNoteAssociations(hubspot, contactId, config) {
+  const noteIds = [];
+  let after = '';
+  do {
+    const qs = new URLSearchParams({ limit: '500' });
+    if (after) qs.set('after', after);
+    const data = await hubspot(`/crm/v4/objects/contacts/${contactId}/associations/notes?${qs}`);
+    for (const row of data.results || []) {
+      const id = row.toObjectId || row.id;
+      if (id) noteIds.push(String(id));
+    }
+    after = data.paging?.next?.after || '';
+    if (config.generalDelayMs) await sleep(Math.min(config.generalDelayMs, 50));
+  } while (after);
+  return [...new Set(noteIds)];
+}
+
+async function readContactActivityAssociations(hubspot, contactId, activityType, config) {
+  const ids = [];
+  let after = '';
+  do {
+    const qs = new URLSearchParams({ limit: '500' });
+    if (after) qs.set('after', after);
+    const data = await hubspot(`/crm/v4/objects/contacts/${contactId}/associations/${activityType}?${qs}`);
+    for (const row of data.results || []) {
+      const id = row.toObjectId || row.id;
+      if (id) ids.push(String(id));
+    }
+    after = data.paging?.next?.after || '';
+    if (config.generalDelayMs) await sleep(Math.min(config.generalDelayMs, 50));
+  } while (after);
+  return [...new Set(ids)];
+}
+
+async function batchReadNotes(hubspot, noteIds, config) {
+  const notes = [];
+  for (let i = 0; i < noteIds.length; i += 100) {
+    const data = await hubspot('/crm/v3/objects/notes/batch/read', {
+      method: 'POST',
+      body: JSON.stringify({
+        properties: [
+          'hs_note_body',
+          'hs_timestamp',
+          'hs_createdate',
+          'hubspot_owner_id',
+          'hs_created_by_user_id',
+        ],
+        inputs: noteIds.slice(i, i + 100).map(id => ({ id })),
+      }),
+    });
+    notes.push(...(data.results || []));
+    if (config.generalDelayMs) await sleep(config.generalDelayMs);
+  }
+  return notes;
+}
+
+async function batchReadCalls(hubspot, callIds, config) {
+  const calls = [];
+  for (let i = 0; i < callIds.length; i += 100) {
+    const data = await hubspot('/crm/v3/objects/calls/batch/read', {
+      method: 'POST',
+      body: JSON.stringify({
+        properties: [
+          'hs_call_title',
+          'hs_call_body',
+          'hs_call_direction',
+          'hs_call_status',
+          'hs_timestamp',
+          'hs_createdate',
+          'hs_object_source_detail_1',
+        ],
+        inputs: callIds.slice(i, i + 100).map(id => ({ id })),
+      }),
+    });
+    calls.push(...(data.results || []));
+    if (config.generalDelayMs) await sleep(config.generalDelayMs);
+  }
+  return calls;
+}
+
+function summarizeNoteTouchpoints(notes, sinceMs, config) {
+  const counted = [];
+  const excluded = {};
+  const seen = new Set();
+  let duplicates = 0;
+
+  for (const note of notes) {
+    const classification = classifyTouchpointNote(note, sinceMs, config);
+    if (!classification.include) {
+      addCount(excluded, classification.reason);
+      continue;
+    }
+    if (seen.has(classification.dedupeKey)) {
+      duplicates += 1;
+      addCount(excluded, 'duplicate');
+      continue;
+    }
+    seen.add(classification.dedupeKey);
+    counted.push({
+      id: String(note.id),
+      channel: classification.channel,
+      reason: classification.reason,
+      timestamp: noteTimestampMs(note),
+      ownerId: noteOwnerId(note),
+    });
+  }
+
+  return {
+    count: counted.length,
+    counted,
+    excluded,
+    duplicates,
+    notesScanned: notes.length,
+  };
+}
+
+function summarizeCallTouchpoints(calls, sinceMs) {
+  const counted = [];
+  const excluded = {};
+  const seen = new Set();
+  let duplicates = 0;
+
+  for (const call of calls) {
+    const classification = classifyTouchpointCall(call, sinceMs);
+    if (!classification.include) {
+      addCount(excluded, classification.reason);
+      continue;
+    }
+    if (seen.has(classification.dedupeKey)) {
+      duplicates += 1;
+      addCount(excluded, 'duplicate');
+      continue;
+    }
+    seen.add(classification.dedupeKey);
+    counted.push({
+      id: String(call.id),
+      channel: classification.channel,
+      reason: classification.reason,
+      timestamp: callTimestampMs(call),
+    });
+  }
+
+  return {
+    count: counted.length,
+    counted,
+    excluded,
+    duplicates,
+    callsScanned: calls.length,
+  };
+}
+
+async function countNoteTouchpoints90d(hubspot, contactId, sinceMs, config) {
+  const noteIds = await readContactNoteAssociations(hubspot, contactId, config);
+  const callIds = await readContactActivityAssociations(hubspot, contactId, 'calls', config);
+  const callSummary = callIds.length
+    ? summarizeCallTouchpoints(await batchReadCalls(hubspot, callIds, config), sinceMs)
+    : { count: 0, counted: [], excluded: {}, duplicates: 0, callsScanned: 0 };
+  if (!noteIds.length) {
+    return {
+      count: callSummary.count,
+      counted: callSummary.counted,
+      excluded: callSummary.excluded,
+      duplicates: callSummary.duplicates,
+      notesScanned: 0,
+      callsScanned: callSummary.callsScanned,
+    };
+  }
+  const noteSummary = summarizeNoteTouchpoints(await batchReadNotes(hubspot, noteIds, config), sinceMs, config);
+  return {
+    count: noteSummary.count + callSummary.count,
+    counted: [...noteSummary.counted, ...callSummary.counted].sort((a, b) => a.timestamp - b.timestamp),
+    excluded: mergeCountMaps(noteSummary.excluded, callSummary.excluded),
+    duplicates: noteSummary.duplicates + callSummary.duplicates,
+    notesScanned: noteSummary.notesScanned,
+    callsScanned: callSummary.callsScanned,
+  };
+}
+
+function mergeCountMaps(...maps) {
+  const merged = {};
+  for (const map of maps) {
+    for (const [key, count] of Object.entries(map || {})) addCount(merged, key, count);
+  }
+  return merged;
+}
+
+async function calculateTouchpoints90d(hubspot, contactId, sinceMs, config) {
+  if (config.touchpointSource === 'notes') {
+    const noteSummary = await countNoteTouchpoints90d(hubspot, contactId, sinceMs, config);
+    return { count: noteSummary.count, source: 'notes', noteSummary };
+  }
+  if (config.touchpointSource === 'hybrid') {
+    const noteSummary = await countNoteTouchpoints90d(hubspot, contactId, sinceMs, config);
+    if (noteSummary.notesScanned > 0) return { count: noteSummary.count, source: 'notes', noteSummary };
+    return { count: await countTouchpoints90d(hubspot, contactId, sinceMs, config), source: 'engagements_fallback', noteSummary };
+  }
+  return { count: await countTouchpoints90d(hubspot, contactId, sinceMs, config), source: 'engagements' };
 }
 
 async function mapLimit(items, limit, fn) {
@@ -558,6 +883,12 @@ function formatLeadStatusSyncSummary(stats) {
     `Contacts updated: ${stats.updatedContacts}`,
     `Status changes: ${stats.statusUpdates}`,
     `Touchpoint field changes: ${stats.touchpointUpdates}`,
+    `Touchpoint source: ${stats.touchpointSource || 'engagements'}`,
+    `Notes scanned: ${stats.notesScanned || 0}`,
+    `Notes counted: ${stats.notesCounted || 0}`,
+    `Calls scanned: ${stats.callsScanned || 0}`,
+    `Calls counted: ${stats.callsCounted || 0}`,
+    `Duplicate notes excluded: ${stats.duplicateNotes || 0}`,
     `Nooks not interested calls: ${stats.nooksNotInterestedCalls || 0}`,
     `Nooks not interested contacts: ${stats.nooksNotInterestedContacts || 0}`,
     `Errors: ${stats.errors}`,
@@ -578,6 +909,7 @@ function formatLeadStatusSyncSummary(stats) {
 
 async function runLeadStatusSync(options = {}) {
   const config = { ...makeDefaultConfig(options.env || process.env), ...options };
+  config.touchpointSource = normalizeTouchpointSource(config.touchpointSource);
   const logger = config.logger || console;
   const mode = config.mode || 'incremental';
   const now = config.now || new Date();
@@ -636,6 +968,14 @@ async function runLeadStatusSync(options = {}) {
     errors: 0,
     nooksNotInterestedCalls,
     nooksNotInterestedContacts: nooksNotInterestedContactIds.size,
+    touchpointSource: config.touchpointSource,
+    notesScanned: 0,
+    notesCounted: 0,
+    callsScanned: 0,
+    callsCounted: 0,
+    duplicateNotes: 0,
+    noteExclusions: {},
+    preview: [],
     transitions: {},
     disqualifiedReasons: {},
     workingTouchpointContacts: 0,
@@ -645,7 +985,18 @@ async function runLeadStatusSync(options = {}) {
 
   await mapLimit(contacts, config.engagementConcurrency, async (contact) => {
     try {
-      const touchpointCount = await countTouchpoints90d(hubspot, contact.id, touchpointSinceMs, config);
+      const touchpointResult = await calculateTouchpoints90d(hubspot, contact.id, touchpointSinceMs, config);
+      const touchpointCount = touchpointResult.count;
+      if (touchpointResult.noteSummary) {
+        stats.notesScanned += touchpointResult.noteSummary.notesScanned;
+        stats.notesCounted += touchpointResult.noteSummary.counted.filter(item => item.channel !== 'call').length;
+        stats.callsScanned += touchpointResult.noteSummary.callsScanned || 0;
+        stats.callsCounted += touchpointResult.noteSummary.counted.filter(item => item.channel === 'call').length;
+        stats.duplicateNotes += touchpointResult.noteSummary.duplicates;
+        for (const [reason, count] of Object.entries(touchpointResult.noteSummary.excluded)) {
+          addCount(stats.noteExclusions, reason, count);
+        }
+      }
       const classification = classifyLeadStatus(contact, touchpointCount, {
         nooksNotInterested: nooksNotInterestedContactIds.has(String(contact.id)),
       });
@@ -674,6 +1025,19 @@ async function runLeadStatusSync(options = {}) {
         if (Object.prototype.hasOwnProperty.call(update, 'bdr_touchpoints_90d')) {
           stats.touchpointUpdates += 1;
         }
+      }
+      if (stats.preview.length < Math.max(0, config.previewLimit)) {
+        stats.preview.push({
+          id: String(contact.id),
+          currentStatus,
+          targetStatus: update.hs_lead_status || currentStatus || '',
+          touchpoints90d: touchpointCount,
+          touchpointSource: touchpointResult.source,
+          update,
+          classificationReason: classification.reason || '',
+          noteEvidence: (touchpointResult.noteSummary?.counted || []).slice(0, 5),
+          noteExclusions: touchpointResult.noteSummary?.excluded || {},
+        });
       }
     } catch (err) {
       errors.push({ id: contact.id, error: err.message });
@@ -708,6 +1072,17 @@ function parseCliArgs(argv) {
     else if (arg === '--incremental' || arg === '--mode=incremental') args.mode = 'incremental';
     else if (arg === '--dry-run') args.dryRun = true;
     else if (arg === '--skip-slack') args.skipSlack = true;
+    else if (arg === '--touchpoint-source') {
+      args.touchpointSource = normalizeTouchpointSource(argv[i + 1]);
+      i += 1;
+    } else if (arg.startsWith('--touchpoint-source=')) {
+      args.touchpointSource = normalizeTouchpointSource(arg.split('=')[1]);
+    } else if (arg === '--preview-limit') {
+      args.previewLimit = Number(argv[i + 1]);
+      i += 1;
+    } else if (arg.startsWith('--preview-limit=')) {
+      args.previewLimit = Number(arg.split('=')[1]);
+    }
     else if (arg === '--lookback-hours') {
       args.lookbackHours = Number(argv[i + 1]);
       i += 1;
@@ -743,10 +1118,15 @@ module.exports = {
   STATUS,
   buildContactUpdate,
   canMoveToStatus,
+  calculateTouchpoints90d,
+  classifyTouchpointNote,
   classifyLeadStatus,
+  countNoteTouchpoints90d,
   formatLeadStatusSyncSummary,
   includeTouchpointEngagement,
   makeDefaultConfig,
+  normalizeTouchpointSource,
   parseCliArgs,
+  summarizeNoteTouchpoints,
   runLeadStatusSync,
 };

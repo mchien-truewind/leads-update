@@ -5255,21 +5255,33 @@ async function postLeadStatusSyncMessage(text, channelName = LEAD_STATUS_SYNC_TA
   });
 }
 
-async function runLeadStatusSyncForSlack(options = {}) {
-  const stats = await runLeadStatusSync({
-    ...options,
-    targetChannel: options.targetChannel || LEAD_STATUS_SYNC_TARGET_CHANNEL,
-    hubspot: options.hubspot || hubspotRequestFromFetchOptions,
-    postSlackMessage: options.postSlackMessage || postLeadStatusSyncMessage,
-    logger: console,
-  });
+let leadStatusSyncInFlight = null;
 
-  console.log(
-    `Lead status sync: mode=${stats.mode} candidates=${stats.candidateCount} `
-    + `updates=${stats.updatedContacts} status=${stats.statusUpdates} `
-    + `touchpoints=${stats.touchpointUpdates} errors=${stats.errors}`,
-  );
-  return stats;
+async function runLeadStatusSyncForSlack(options = {}) {
+  if (leadStatusSyncInFlight) {
+    throw new Error('Lead status sync already running; wait for the current run to finish before starting another.');
+  }
+  leadStatusSyncInFlight = (async () => {
+    const stats = await runLeadStatusSync({
+      ...options,
+      targetChannel: options.targetChannel || LEAD_STATUS_SYNC_TARGET_CHANNEL,
+      hubspot: options.hubspot || hubspotRequestFromFetchOptions,
+      postSlackMessage: options.postSlackMessage || postLeadStatusSyncMessage,
+      logger: console,
+    });
+
+    console.log(
+      `Lead status sync: mode=${stats.mode} candidates=${stats.candidateCount} `
+      + `updates=${stats.updatedContacts} status=${stats.statusUpdates} `
+      + `touchpoints=${stats.touchpointUpdates} errors=${stats.errors}`,
+    );
+    return stats;
+  })();
+  try {
+    return await leadStatusSyncInFlight;
+  } finally {
+    leadStatusSyncInFlight = null;
+  }
 }
 
 async function postMqlDiscoveryReport(options = {}) {
@@ -5505,6 +5517,7 @@ function startHttpServer() {
           mode: qs.get('mode') === 'full' ? 'full' : 'incremental',
           dryRun: qs.get('dryRun') === '1' || qs.get('dryRun') === 'true',
           skipSlack: qs.get('skipSlack') === '1' || qs.get('skipSlack') === 'true',
+          touchpointSource: qs.get('touchpointSource') || undefined,
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(stats));

@@ -209,6 +209,7 @@ LEAD_STATUS_SYNC_LIST_ID=694
 LEAD_STATUS_SYNC_LOOKBACK_HOURS=28
 LEAD_STATUS_SYNC_TOUCHPOINT_DAYS=90
 LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE=engagements  # engagements (default), notes, or hybrid
+LEAD_STATUS_SYNC_HUBSPOT_REQUEST_DELAY_MS=150  # note/hybrid default; set lower/higher only after dry-run evidence
 LEAD_STATUS_SYNC_PREVIEW_LIMIT=50
 LEAD_STATUS_SYNC_BDR_OWNER_IDS=84547076,89305622,91143842,91143844
 LEAD_STATUS_SYNC_BDR_EMAILS=sarah@trytruewind.com,xavier@trytruewind.com,jenilee@trytruewind.com,brendan@trytruewind.com

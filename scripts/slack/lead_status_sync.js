@@ -168,6 +168,9 @@ function makeDefaultConfig(env = process.env) {
     searchDelayMs: Number(env.LEAD_STATUS_SYNC_SEARCH_DELAY_MS || 250),
     generalDelayMs: Number(env.LEAD_STATUS_SYNC_GENERAL_DELAY_MS || 80),
     engagementConcurrency: Number(env.LEAD_STATUS_SYNC_ENGAGEMENT_CONCURRENCY || (touchpointSource === 'engagements' ? 6 : 2)),
+    hubspotRequestDelayMs: !String(env.LEAD_STATUS_SYNC_HUBSPOT_REQUEST_DELAY_MS || '').trim()
+      ? undefined
+      : Number(env.LEAD_STATUS_SYNC_HUBSPOT_REQUEST_DELAY_MS),
   };
 }
 
@@ -277,6 +280,31 @@ function makeHttpsHubSpotFetch(token) {
   }
 
   return request;
+}
+
+function makeRateLimitedHubSpot(hubspot, delayMs) {
+  const parsedDelayMs = Number(delayMs);
+  const spacingMs = Number.isFinite(parsedDelayMs) ? Math.max(0, parsedDelayMs) : 0;
+  if (!spacingMs) return hubspot;
+
+  let queue = Promise.resolve();
+  let lastStartedAt = 0;
+
+  return async function rateLimitedHubSpot(path, options = {}) {
+    const previous = queue;
+    let release;
+    queue = new Promise(resolve => { release = resolve; });
+    await previous;
+
+    try {
+      const elapsed = Date.now() - lastStartedAt;
+      if (elapsed < spacingMs) await sleep(spacingMs - elapsed);
+      lastStartedAt = Date.now();
+      return await hubspot(path, options);
+    } finally {
+      release();
+    }
+  };
 }
 
 async function getListMemberIds(hubspot, listId, config) {
@@ -969,17 +997,26 @@ function formatLeadStatusSyncSummary(stats) {
 async function runLeadStatusSync(options = {}) {
   const config = { ...makeDefaultConfig(options.env || process.env), ...options };
   config.touchpointSource = normalizeTouchpointSource(config.touchpointSource);
+  const parsedRequestDelayMs = Number(config.hubspotRequestDelayMs);
+  if (!Number.isFinite(parsedRequestDelayMs) || parsedRequestDelayMs < 0) {
+    config.hubspotRequestDelayMs = config.touchpointSource === 'engagements' ? 0 : 150;
+  } else {
+    config.hubspotRequestDelayMs = parsedRequestDelayMs;
+  }
   const logger = config.logger || console;
   const mode = config.mode || 'incremental';
   const now = config.now || new Date();
   const lookbackMs = Math.max(1, config.lookbackHours) * 60 * 60 * 1000;
   const touchpointSinceMs = now.getTime() - (Math.max(1, config.touchpointDays) * 24 * 60 * 60 * 1000);
   const calculatedAtMs = now.getTime();
-  const hubspot = config.hubspot
+  const rawHubspot = config.hubspot
     || (config.hubspotToken
       ? makeHttpsHubSpotFetch(config.hubspotToken)
       : (path, requestOptions = {}) => hubspotFetch(path, requestOptions, config));
+  const hubspot = makeRateLimitedHubSpot(rawHubspot, config.hubspotRequestDelayMs);
   const postSlackMessage = config.postSlackMessage;
+
+  logger.log?.(`Lead status sync: HubSpot request delay=${config.hubspotRequestDelayMs}ms`);
 
   const listIds = await getListMemberIds(hubspot, config.listId, config);
   const listSet = new Set(listIds);
@@ -1184,6 +1221,7 @@ module.exports = {
   formatLeadStatusSyncSummary,
   hubspotFetch,
   includeTouchpointEngagement,
+  makeRateLimitedHubSpot,
   makeDefaultConfig,
   normalizeTouchpointSource,
   parseCliArgs,

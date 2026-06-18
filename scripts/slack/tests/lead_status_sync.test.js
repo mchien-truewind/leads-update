@@ -10,6 +10,7 @@ const {
   hubspotFetch,
   includeTouchpointEngagement,
   makeDefaultConfig,
+  makeRateLimitedHubSpot,
   summarizeNoteTouchpoints,
   runLeadStatusSync,
 } = require('../lead_status_sync');
@@ -512,6 +513,13 @@ function testNotesModeDefaultsToLowerConcurrency() {
   assert.strictEqual(
     makeDefaultConfig({
       LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE: 'notes',
+      LEAD_STATUS_SYNC_HUBSPOT_REQUEST_DELAY_MS: '',
+    }).hubspotRequestDelayMs,
+    undefined,
+  );
+  assert.strictEqual(
+    makeDefaultConfig({
+      LEAD_STATUS_SYNC_TOUCHPOINT_SOURCE: 'notes',
       LEAD_STATUS_SYNC_ENGAGEMENT_CONCURRENCY: '4',
     }).engagementConcurrency,
     4,
@@ -553,6 +561,40 @@ async function testHubSpotFetchRetriesTransientFailures() {
   }
 }
 
+async function testRateLimitedHubSpotSerializesRequests() {
+  const starts = [];
+  const hubspot = makeRateLimitedHubSpot(async () => {
+    starts.push(Date.now());
+    return { ok: true };
+  }, 5);
+
+  await Promise.all([
+    hubspot('/a'),
+    hubspot('/b'),
+    hubspot('/c'),
+  ]);
+
+  assert.strictEqual(starts.length, 3);
+  assert.ok(starts[1] - starts[0] >= 4);
+  assert.ok(starts[2] - starts[1] >= 4);
+}
+
+async function testRateLimitedHubSpotReleasesAfterError() {
+  const calls = [];
+  const hubspot = makeRateLimitedHubSpot(async (path) => {
+    calls.push(path);
+    if (path === '/fail') throw new Error('temporary failure');
+    return { ok: true };
+  }, 1);
+
+  const first = hubspot('/fail').catch(err => err.message);
+  const second = hubspot('/ok');
+
+  assert.strictEqual(await first, 'temporary failure');
+  assert.deepStrictEqual(await second, { ok: true });
+  assert.deepStrictEqual(calls, ['/fail', '/ok']);
+}
+
 async function run() {
   testTouchpointFiltering();
   testNoteTouchpointClassification();
@@ -565,6 +607,8 @@ async function run() {
   testSummaryIncludesKeyCounts();
   testNotesModeDefaultsToLowerConcurrency();
   await testHubSpotFetchRetriesTransientFailures();
+  await testRateLimitedHubSpotSerializesRequests();
+  await testRateLimitedHubSpotReleasesAfterError();
 }
 
 run()

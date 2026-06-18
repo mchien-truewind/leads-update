@@ -5381,280 +5381,286 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     internal_domains.discard("")
 
     for item in messages:
-        thread_id = item.get("threadId", "")
-        if not thread_id or thread_id in processed_threads:
-            continue
-        processed_threads.add(thread_id)
+        try:
+            thread_id = item.get("threadId", "")
+            if not thread_id or thread_id in processed_threads:
+                continue
+            processed_threads.add(thread_id)
 
-        thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
-        thread_messages = sorted_thread_messages(thread)
-        if not thread_messages:
-            skipped += 1
-            continue
-        thread_recruiter_sender_emails: set[str] = set()
-        for message in thread_messages:
-            sender_name, sender_email = parseaddr(header_map(message).get("from", ""))
-            sender_email = normalize_email(sender_email)
-            if sender_is_recruiter_submission(
-                sender_email,
-                config.recruiter_sender_emails,
-                sender_name=sender_name,
-                recruiter_sender_names=config.recruiter_sender_names,
-            ):
-                thread_recruiter_sender_emails.add(sender_email)
-
-        recruiter_candidate = parse_recruiter_candidate_from_thread(
-            thread,
-            recruiter_sender_emails=config.recruiter_sender_emails,
-            recruiter_sender_names=config.recruiter_sender_names,
-            internal_domains=internal_domains,
-        )
-        ats_source = SOURCE_SUPERPOSITION if recruiter_candidate else SOURCE_INBOUND
-        if recruiter_candidate:
-            candidate_name, candidate_email, recruiter_role, subject = recruiter_candidate
-            application_message = sorted_thread_messages(thread)[0]
-        else:
-            application_message = select_application_message_from_thread(
-                thread, internal_domains=internal_domains
-            )
-            if application_message is None:
+            thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+            thread_messages = sorted_thread_messages(thread)
+            if not thread_messages:
                 skipped += 1
                 continue
+            thread_recruiter_sender_emails: set[str] = set()
+            for message in thread_messages:
+                sender_name, sender_email = parseaddr(header_map(message).get("from", ""))
+                sender_email = normalize_email(sender_email)
+                if sender_is_recruiter_submission(
+                    sender_email,
+                    config.recruiter_sender_emails,
+                    sender_name=sender_name,
+                    recruiter_sender_names=config.recruiter_sender_names,
+                ):
+                    thread_recruiter_sender_emails.add(sender_email)
 
-            candidate_name, candidate_email, subject = parse_candidate_from_message(
-                application_message,
+            recruiter_candidate = parse_recruiter_candidate_from_thread(
+                thread,
+                recruiter_sender_emails=config.recruiter_sender_emails,
+                recruiter_sender_names=config.recruiter_sender_names,
                 internal_domains=internal_domains,
             )
-            candidate_domain = email_domain(candidate_email)
-            if candidate_domain in internal_domains:
+            ats_source = SOURCE_SUPERPOSITION if recruiter_candidate else SOURCE_INBOUND
+            if recruiter_candidate:
+                candidate_name, candidate_email, recruiter_role, subject = recruiter_candidate
+                application_message = sorted_thread_messages(thread)[0]
+            else:
+                application_message = select_application_message_from_thread(
+                    thread, internal_domains=internal_domains
+                )
+                if application_message is None:
+                    skipped += 1
+                    continue
+
+                candidate_name, candidate_email, subject = parse_candidate_from_message(
+                    application_message,
+                    internal_domains=internal_domains,
+                )
+                candidate_domain = email_domain(candidate_email)
+                if candidate_domain in internal_domains:
+                    skipped += 1
+                    continue
+            if should_auto_archive_sender(candidate_email):
+                remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=[label_id])
                 skipped += 1
                 continue
-        if should_auto_archive_sender(candidate_email):
-            remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=[label_id])
-            skipped += 1
-            continue
 
-        thread_body_text = "\n".join(extract_message_body_text(msg) for msg in thread_messages)
+            thread_body_text = "\n".join(extract_message_body_text(msg) for msg in thread_messages)
 
-        if recruiter_candidate:
-            role = recruiter_role
-        else:
-            parsed_subject = parse_required_subject(subject, candidate_name)
-            if not parsed_subject:
+            if recruiter_candidate:
+                role = recruiter_role
+            else:
+                parsed_subject = parse_required_subject(subject, candidate_name)
+                if not parsed_subject:
+                    skipped += 1
+                    subject_format_skipped += 1
+                    continue
+                role, subject_candidate_name = parsed_subject
+                candidate_name = subject_candidate_name
+            if role in {"Unknown", "Other"}:
+                # A stated position (e.g. "Account Executive") may appear anywhere in the
+                # subject or body even when the primary subject parse missed it.
+                rescanned = canonicalize_truewind_role(f"{subject}\n{thread_body_text}")
+                if rescanned not in {"Unknown", "Other"}:
+                    role = rescanned
+
+            resume_reference = extract_primary_resume_part_from_thread(thread)
+            resume_part: dict[str, Any] | None = None
+            attachment_message_id = ""
+            if resume_reference:
+                attachment_message_id, resume_part = resume_reference
+
+            resume_link = extract_resume_link_from_thread(thread)
+
+            filename = (resume_part.get("filename") or "resume").strip() if resume_part else "resume"
+            raw = b""
+            resume_text = ""
+            if resume_part and attachment_message_id:
+                raw = gmail_message_attachment_bytes(gmail_service, attachment_message_id, resume_part)
+                resume_text = extract_resume_text(filename, raw)
+            elif not resume_link and role == "Unknown":
+                # If there is no resume content and no role signal, this is likely a non-applicant thread.
                 skipped += 1
-                subject_format_skipped += 1
                 continue
-            role, subject_candidate_name = parsed_subject
-            candidate_name = subject_candidate_name
-        if role in {"Unknown", "Other"}:
-            # A stated position (e.g. "Account Executive") may appear anywhere in the
-            # subject or body even when the primary subject parse missed it.
-            rescanned = canonicalize_truewind_role(f"{subject}\n{thread_body_text}")
-            if rescanned not in {"Unknown", "Other"}:
-                role = rescanned
 
-        resume_reference = extract_primary_resume_part_from_thread(thread)
-        resume_part: dict[str, Any] | None = None
-        attachment_message_id = ""
-        if resume_reference:
-            attachment_message_id, resume_part = resume_reference
+            if not candidate_email and resume_text:
+                excluded_emails = {normalize_email(item) for item in config.recruiter_sender_emails}
+                excluded_emails |= thread_recruiter_sender_emails
+                for email in EMAIL_RE.findall(resume_text):
+                    normalized = normalize_email(email)
+                    if normalized in excluded_emails:
+                        continue
+                    if email_domain(normalized) in internal_domains:
+                        continue
+                    candidate_email = normalized
+                    break
+            if (not candidate_name or candidate_name == "Unknown") and resume_text:
+                resume_names = likely_resume_name_lines(resume_text)
+                if resume_names:
+                    candidate_name = clean_candidate_name(resume_names[0])
+            if not candidate_email:
+                skipped += 1
+                continue
+            if recruiter_candidate and not candidate_name:
+                skipped += 1
+                continue
+            if config.hiring_alias and candidate_email == config.hiring_alias:
+                skipped += 1
+                continue
 
-        resume_link = extract_resume_link_from_thread(thread)
+            snippet = application_message.get("snippet", "")
+            message_body_text = thread_body_text
 
-        filename = (resume_part.get("filename") or "resume").strip() if resume_part else "resume"
-        raw = b""
-        resume_text = ""
-        if resume_part and attachment_message_id:
-            raw = gmail_message_attachment_bytes(gmail_service, attachment_message_id, resume_part)
-            resume_text = extract_resume_text(filename, raw)
-        elif not resume_link and role == "Unknown":
-            # If there is no resume content and no role signal, this is likely a non-applicant thread.
-            skipped += 1
-            continue
+            stage = classify_career_stage(resume_text or snippet)
+            resume_title, resume_company = infer_current_title_and_company_from_resume(resume_text, snippet)
+            extracted_fields = extract_resume_fields(config, resume_text, snippet)
+            extractor_title = clean_text(str(extracted_fields.get("latest_current_title", "") or ""))
+            extractor_company = clean_text(str(extracted_fields.get("latest_current_company", "") or ""))
+            # Prefer the LLM-extracted real name when the header/subject/heuristic name is
+            # missing, "Unknown", or doesn't look like a person (e.g. a resume objective line).
+            extractor_name = clean_candidate_name(str(extracted_fields.get("candidate_name", "") or ""))
+            if extractor_name and looks_like_person_name(extractor_name) and (
+                not candidate_name or candidate_name == "Unknown" or not looks_like_person_name(candidate_name)
+            ):
+                candidate_name = extractor_name
+            location = classify_location(resume_text, snippet)
 
-        if not candidate_email and resume_text:
-            excluded_emails = {normalize_email(item) for item in config.recruiter_sender_emails}
-            excluded_emails |= thread_recruiter_sender_emails
-            for email in EMAIL_RE.findall(resume_text):
-                normalized = normalize_email(email)
-                if normalized in excluded_emails:
-                    continue
-                if email_domain(normalized) in internal_domains:
-                    continue
-                candidate_email = normalized
-                break
-        if (not candidate_name or candidate_name == "Unknown") and resume_text:
-            resume_names = likely_resume_name_lines(resume_text)
-            if resume_names:
-                candidate_name = clean_candidate_name(resume_names[0])
-        if not candidate_email:
-            skipped += 1
-            continue
-        if recruiter_candidate and not candidate_name:
-            skipped += 1
-            continue
-        if config.hiring_alias and candidate_email == config.hiring_alias:
-            skipped += 1
-            continue
-
-        snippet = application_message.get("snippet", "")
-        message_body_text = thread_body_text
-
-        stage = classify_career_stage(resume_text or snippet)
-        resume_title, resume_company = infer_current_title_and_company_from_resume(resume_text, snippet)
-        extracted_fields = extract_resume_fields(config, resume_text, snippet)
-        extractor_title = clean_text(str(extracted_fields.get("latest_current_title", "") or ""))
-        extractor_company = clean_text(str(extracted_fields.get("latest_current_company", "") or ""))
-        # Prefer the LLM-extracted real name when the header/subject/heuristic name is
-        # missing, "Unknown", or doesn't look like a person (e.g. a resume objective line).
-        extractor_name = clean_candidate_name(str(extracted_fields.get("candidate_name", "") or ""))
-        if extractor_name and looks_like_person_name(extractor_name) and (
-            not candidate_name or candidate_name == "Unknown" or not looks_like_person_name(candidate_name)
-        ):
-            candidate_name = extractor_name
-        location = classify_location(resume_text, snippet)
-
-        existing_page = find_existing_candidate_page(
-            notion, database_schema, prop_map, thread_id, candidate_email
-        )
-        existing_resume_url = ""
-        existing_linkedin_url = ""
-        existing_linkedin_confidence = ""
-        existing_current_title = ""
-        existing_company = ""
-        existing_date_first_entered = ""
-        if existing_page:
-            props = existing_page.get("properties", {})
-            existing_resume_url = notion_prop_value(
-                props.get(prop_map.resume_url, {})
-            ).strip()
-            existing_linkedin_url = notion_prop_value(
-                props.get(prop_map.linkedin_url, {})
-            ).strip()
-            existing_linkedin_confidence = notion_prop_value(
-                props.get(prop_map.linkedin_confidence, {})
-            ).strip()
-            existing_current_title = notion_prop_value(
-                props.get(prop_map.current_title, {})
-            ).strip()
-            existing_company = notion_prop_value(
-                props.get(prop_map.company, {})
-            ).strip()
-            existing_date_first_entered = notion_prop_value(
-                props.get(prop_map.date_first_entered, {})
-            ).strip()
-
-        resume_linkedin_url = extract_linkedin_url(
-            resume_text, snippet, filename, raw, message_body_text
-        )
-        linkedin_url = resume_linkedin_url or existing_linkedin_url
-        linkedin_confidence = (
-            LINKEDIN_CONFIDENCE_HIGH if resume_linkedin_url else existing_linkedin_confidence
-        )
-        # Only attempt a LinkedIn lookup when we have a real candidate name. Searching
-        # with "Unknown" or a non-name (e.g. a resume objective line) wastes the call
-        # and tends to return the wrong profile.
-        if not linkedin_url and candidate_name and candidate_name != "Unknown" and looks_like_person_name(candidate_name):
-            fallback_url, fallback_confidence = find_linkedin_url_for_candidate(
-                config,
-                candidate_name,
-                extractor_company or resume_company or existing_company,
-                extractor_title or resume_title or existing_current_title,
+            existing_page = find_existing_candidate_page(
+                notion, database_schema, prop_map, thread_id, candidate_email
             )
-            if fallback_url:
-                linkedin_url = fallback_url
-                linkedin_confidence = fallback_confidence or LINKEDIN_CONFIDENCE_LOW
-        elif not linkedin_confidence:
-            linkedin_confidence = LINKEDIN_CONFIDENCE_MEDIUM
+            existing_resume_url = ""
+            existing_linkedin_url = ""
+            existing_linkedin_confidence = ""
+            existing_current_title = ""
+            existing_company = ""
+            existing_date_first_entered = ""
+            if existing_page:
+                props = existing_page.get("properties", {})
+                existing_resume_url = notion_prop_value(
+                    props.get(prop_map.resume_url, {})
+                ).strip()
+                existing_linkedin_url = notion_prop_value(
+                    props.get(prop_map.linkedin_url, {})
+                ).strip()
+                existing_linkedin_confidence = notion_prop_value(
+                    props.get(prop_map.linkedin_confidence, {})
+                ).strip()
+                existing_current_title = notion_prop_value(
+                    props.get(prop_map.current_title, {})
+                ).strip()
+                existing_company = notion_prop_value(
+                    props.get(prop_map.company, {})
+                ).strip()
+                existing_date_first_entered = notion_prop_value(
+                    props.get(prop_map.date_first_entered, {})
+                ).strip()
 
-        linkedin_title = ""
-        linkedin_company = ""
-        can_skip_enrichment = (
-            existing_linkedin_url
-            and existing_linkedin_url == linkedin_url
-            and existing_current_title
-            and existing_company
-            and existing_current_title.lower() != "unknown"
-            and existing_company.lower() != "unknown"
-        )
-        if not can_skip_enrichment:
-            linkedin_title, linkedin_company = enrich_linkedin_title_company(config, linkedin_url)
-
-        resume_title_value = resume_title if resume_title and resume_title.lower() != "unknown" else ""
-        resume_company_value = resume_company if resume_company and resume_company.lower() != "unknown" else ""
-        extractor_title_value = (
-            extractor_title if extractor_title and extractor_title.lower() != "unknown" else ""
-        )
-        extractor_company_value = (
-            extractor_company if extractor_company and extractor_company.lower() != "unknown" else ""
-        )
-        current_title = (
-            extractor_title_value or resume_title_value or linkedin_title or existing_current_title or "Unknown"
-        )
-        company = (
-            extractor_company_value or resume_company_value or linkedin_company or existing_company or "Unknown"
-        )
-        resume_url = existing_resume_url
-        if not resume_url:
-            if raw:
-                resume_url = upload_resume_to_drive(drive_service, filename, raw, config.drive_folder_id)
-            elif resume_link:
-                resume_url = resume_link
-        computed_first_entered = thread_first_entered_cache.get(thread_id, "")
-        if not computed_first_entered:
-            first_dt = thread_first_message_datetime(gmail_service, thread_id) or message_internal_datetime(
-                application_message
+            resume_linkedin_url = extract_linkedin_url(
+                resume_text, snippet, filename, raw, message_body_text
             )
-            computed_first_entered = iso(first_dt) if first_dt else ""
-            thread_first_entered_cache[thread_id] = computed_first_entered
-        date_first_entered = existing_date_first_entered or computed_first_entered
-        existing_first_dt = parse_iso_datetime(existing_date_first_entered, config.timezone_name)
-        computed_first_dt = parse_iso_datetime(computed_first_entered, config.timezone_name)
-        if existing_first_dt and computed_first_dt and computed_first_dt < existing_first_dt:
-            date_first_entered = computed_first_entered
-
-        page_id, was_created = upsert_candidate_page(
-            notion,
-            database_schema,
-            prop_map,
-            candidate_name=candidate_name,
-            candidate_email=candidate_email,
-            source=ats_source,
-            role=role,
-            resume_url=resume_url,
-            career_stage=stage,
-            linkedin_url=linkedin_url,
-            linkedin_confidence=linkedin_confidence,
-            company=company,
-            current_title=current_title,
-            location=location,
-            date_first_entered=date_first_entered,
-            gmail_thread_id=thread_id,
-            synced_at_iso=iso(now_local(config.timezone_name)),
-            existing_page=existing_page,
-        )
-
-        processed += 1
-        if was_created:
-            created += 1
-            created_candidates.append(
-                {
-                    "candidate_name": candidate_name,
-                    "source": ats_source,
-                    "role": role,
-                    "current_title": current_title,
-                    "company": company,
-                    "career_stage": stage,
-                    "location": location,
-                    "linkedin_url": linkedin_url,
-                    "resume_url": resume_url,
-                    "thread_id": thread_id,
-                    "notion_url": notion_page_url(page_id),
-                }
+            linkedin_url = resume_linkedin_url or existing_linkedin_url
+            linkedin_confidence = (
+                LINKEDIN_CONFIDENCE_HIGH if resume_linkedin_url else existing_linkedin_confidence
             )
-        else:
-            updated += 1
+            # Only attempt a LinkedIn lookup when we have a real candidate name. Searching
+            # with "Unknown" or a non-name (e.g. a resume objective line) wastes the call
+            # and tends to return the wrong profile.
+            if not linkedin_url and candidate_name and candidate_name != "Unknown" and looks_like_person_name(candidate_name):
+                fallback_url, fallback_confidence = find_linkedin_url_for_candidate(
+                    config,
+                    candidate_name,
+                    extractor_company or resume_company or existing_company,
+                    extractor_title or resume_title or existing_current_title,
+                )
+                if fallback_url:
+                    linkedin_url = fallback_url
+                    linkedin_confidence = fallback_confidence or LINKEDIN_CONFIDENCE_LOW
+            elif not linkedin_confidence:
+                linkedin_confidence = LINKEDIN_CONFIDENCE_MEDIUM
 
+            linkedin_title = ""
+            linkedin_company = ""
+            can_skip_enrichment = (
+                existing_linkedin_url
+                and existing_linkedin_url == linkedin_url
+                and existing_current_title
+                and existing_company
+                and existing_current_title.lower() != "unknown"
+                and existing_company.lower() != "unknown"
+            )
+            if not can_skip_enrichment:
+                linkedin_title, linkedin_company = enrich_linkedin_title_company(config, linkedin_url)
+
+            resume_title_value = resume_title if resume_title and resume_title.lower() != "unknown" else ""
+            resume_company_value = resume_company if resume_company and resume_company.lower() != "unknown" else ""
+            extractor_title_value = (
+                extractor_title if extractor_title and extractor_title.lower() != "unknown" else ""
+            )
+            extractor_company_value = (
+                extractor_company if extractor_company and extractor_company.lower() != "unknown" else ""
+            )
+            current_title = (
+                extractor_title_value or resume_title_value or linkedin_title or existing_current_title or "Unknown"
+            )
+            company = (
+                extractor_company_value or resume_company_value or linkedin_company or existing_company or "Unknown"
+            )
+            resume_url = existing_resume_url
+            if not resume_url:
+                if raw:
+                    resume_url = upload_resume_to_drive(drive_service, filename, raw, config.drive_folder_id)
+                elif resume_link:
+                    resume_url = resume_link
+            computed_first_entered = thread_first_entered_cache.get(thread_id, "")
+            if not computed_first_entered:
+                first_dt = thread_first_message_datetime(gmail_service, thread_id) or message_internal_datetime(
+                    application_message
+                )
+                computed_first_entered = iso(first_dt) if first_dt else ""
+                thread_first_entered_cache[thread_id] = computed_first_entered
+            date_first_entered = existing_date_first_entered or computed_first_entered
+            existing_first_dt = parse_iso_datetime(existing_date_first_entered, config.timezone_name)
+            computed_first_dt = parse_iso_datetime(computed_first_entered, config.timezone_name)
+            if existing_first_dt and computed_first_dt and computed_first_dt < existing_first_dt:
+                date_first_entered = computed_first_entered
+
+            page_id, was_created = upsert_candidate_page(
+                notion,
+                database_schema,
+                prop_map,
+                candidate_name=candidate_name,
+                candidate_email=candidate_email,
+                source=ats_source,
+                role=role,
+                resume_url=resume_url,
+                career_stage=stage,
+                linkedin_url=linkedin_url,
+                linkedin_confidence=linkedin_confidence,
+                company=company,
+                current_title=current_title,
+                location=location,
+                date_first_entered=date_first_entered,
+                gmail_thread_id=thread_id,
+                synced_at_iso=iso(now_local(config.timezone_name)),
+                existing_page=existing_page,
+            )
+
+            processed += 1
+            if was_created:
+                created += 1
+                created_candidates.append(
+                    {
+                        "candidate_name": candidate_name,
+                        "source": ats_source,
+                        "role": role,
+                        "current_title": current_title,
+                        "company": company,
+                        "career_stage": stage,
+                        "location": location,
+                        "linkedin_url": linkedin_url,
+                        "resume_url": resume_url,
+                        "thread_id": thread_id,
+                        "notion_url": notion_page_url(page_id),
+                    }
+                )
+            else:
+                updated += 1
+
+        except Exception as exc:
+            # One malformed applicant must not abort the whole ingest cycle.
+            skipped += 1
+            print(f"[ingest] skipped thread {item.get('threadId', '?')} after unhandled error: {exc}")
+            continue
     source_backfilled = backfill_missing_source_values(
         notion,
         database_schema,

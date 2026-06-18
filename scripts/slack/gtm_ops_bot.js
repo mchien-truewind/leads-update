@@ -37,6 +37,7 @@ const STALE_MS = Math.max(INTERVAL_MIN * 3, 15) * 60000;
 let lastSuccessAt = Date.now(); // seed at boot so the staleness check has a baseline
 let lastError = null;
 let cycles = 0;
+let everSucceeded = false; // distinguishes "never succeeded yet" from "was healthy, now wedged"
 
 function log(...a) { console.log(new Date().toISOString(), '[gtm-ops]', ...a); }
 
@@ -82,8 +83,12 @@ function startHealthServer() {
 // (hung fetch, stuck loop) — exit so Railway's restart policy brings up a fresh process.
 function startStalenessWatchdog() {
   const timer = setInterval(() => {
-    if (Date.now() - lastSuccessAt > STALE_MS) {
-      log(`no successful cycle in ${Math.round((Date.now() - lastSuccessAt) / 60000)}min (stale > ${Math.round(STALE_MS / 60000)}min); exiting for restart`);
+    // Until the first cycle ever succeeds, allow a longer grace (cold-start scans, a HubSpot
+    // rate-limit/outage) so a slow first run isn't killed into a tight crash-loop. Once we've
+    // seen one success, hold the worker to the normal staleness bound.
+    const limit = everSucceeded ? STALE_MS : Math.max(STALE_MS, INTERVAL_MIN * 60000 * 4);
+    if (Date.now() - lastSuccessAt > limit) {
+      log(`no successful cycle in ${Math.round((Date.now() - lastSuccessAt) / 60000)}min (limit ${Math.round(limit / 60000)}min); exiting for restart`);
       process.exit(1);
     }
   }, 60000);
@@ -103,6 +108,7 @@ async function main() {
       await runCycle();
       lastSuccessAt = Date.now();
       lastError = null;
+      everSucceeded = true;
       cycles++;
     } catch (e) {
       lastError = e && e.message ? e.message : String(e);

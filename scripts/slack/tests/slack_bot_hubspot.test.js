@@ -382,6 +382,10 @@ function testDuplicateOverrideKeyword() {
   assert.strictEqual(shouldCheckDuplicates({ notes: 'override' }), false);
   // substring shouldn't trigger it (word boundary)
   assert.strictEqual(shouldCheckDuplicates({ context: 'overridden config' }), true);
+  // negated "override" must NOT bypass the guard (the dangerous false-positive).
+  assert.strictEqual(shouldCheckDuplicates({ context: 'do not override the existing deal' }), true);
+  assert.strictEqual(shouldCheckDuplicates({ context: "don't override this" }), true);
+  assert.strictEqual(shouldCheckDuplicates({ context: 'create without override' }), true);
 }
 
 async function testCreateDealToolBlocksOpenDuplicate() {

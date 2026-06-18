@@ -580,17 +580,51 @@ test('sales admin marks a meeting cancelled when Calendly (source of truth) says
     : []);
   const ae = workflow.config.roster[0];
   const meetings = [
-    { id: 'm1', properties: { hs_meeting_title: 'Truewind Intro Meeting', hs_meeting_start_time: '2026-06-18T12:00:00Z' } },
+    // 30s skew from the Calendly start — must still match within the ±60s tolerance.
+    { id: 'm1', properties: { hs_meeting_title: 'Truewind Intro Meeting', hs_meeting_start_time: '2026-06-18T12:00:30Z' } },
     { id: 'm2', properties: { hs_meeting_title: 'Real call', hs_meeting_start_time: '2026-06-18T18:00:00Z' } },
   ];
 
   await workflow.annotateCalendlyStatus(ae, meetings, { start: new Date('2026-06-18T00:00:00Z'), end: new Date('2026-06-19T00:00:00Z') });
 
-  // Calendly's canceled verdict overrides HubSpot's stale record (by exact start time).
+  // Calendly's canceled verdict overrides HubSpot's stale record (matched within ±60s).
   assert.equal(meetings[0]._calendlyStatus, 'canceled');
   assert.equal(classifyMeetingStatus(meetings[0]), 'cancelled');
   assert.equal(meetings[1]._calendlyStatus, undefined);
   assert.equal(classifyMeetingStatus(meetings[1]), 'scheduled');
+});
+
+test('sales admin post-prompt marker is anchored to deal/contact and found via them (never meetings)', async () => {
+  const assocCalls = [];
+  const notesById = {};
+  let noteSeq = 0;
+  const client = new HubSpotSalesAdminClient({
+    hubspotRequest: async (path, method = 'GET', body = null) => {
+      if (path === '/crm/v3/objects/notes' && method === 'POST') {
+        const id = `note-${++noteSeq}`;
+        notesById[id] = body.properties.hs_note_body;
+        return { id };
+      }
+      const put = path.match(/\/crm\/v4\/objects\/notes\/([^/]+)\/associations\/default\/([^/]+)\/([^/]+)/);
+      if (put && method === 'PUT') { assocCalls.push({ noteId: put[1], toType: put[2], toId: put[3] }); return {}; }
+      const get = path.match(/\/crm\/v4\/objects\/([^/]+)\/([^/]+)\/associations\/([^/?]+)/);
+      if (get && method === 'GET') {
+        const [, fromType, fromId, toType] = get;
+        return { results: assocCalls.filter(a => a.toType === fromType && a.toId === fromId && toType === 'notes').map(a => ({ toObjectId: a.noteId })) };
+      }
+      const obj = path.match(/\/crm\/v3\/objects\/notes\/([^/?]+)/);
+      if (obj && method === 'GET') return { id: obj[1], properties: { hs_note_body: notesById[obj[1]] || '' } };
+      throw new Error(`unexpected ${method} ${path}`);
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const meeting = { id: 'm1', _deals: [{ id: 'd1' }], _contacts: [{ id: 'c1' }], _companies: [] };
+  await client.createPostPromptMarker({ marker: 'MARK-m1', meeting, ae: { name: 'A', email: 'a@b.com' }, promptKey: 'pk' });
+  assert.ok(assocCalls.some(a => a.toType === 'deals' && a.toId === 'd1'), 'marker note anchored to deal');
+  assert.ok(assocCalls.some(a => a.toType === 'contacts' && a.toId === 'c1'), 'marker note anchored to contact');
+  assert.ok(!assocCalls.some(a => a.toType === 'meetings'), 'marker note must NOT associate to a meeting');
+  assert.strictEqual(await client.hasMeetingNoteContaining(meeting, 'MARK-m1'), true, 'marker found via deal/contact notes');
+  assert.strictEqual(await client.hasMeetingNoteContaining(meeting, 'OTHER'), false);
 });
 
 test('sales admin day fetch dedupes duplicate HubSpot meeting records', async () => {
@@ -790,8 +824,8 @@ test('sales admin post-meeting scan skips meetings with HubSpot prompt marker af
   workflow.fetchGrainForMeeting = async () => {
     throw new Error('should not fetch Grain when HubSpot marker exists');
   };
-  workflow.hubspot.hasMeetingNoteContaining = async (meetingId, marker) => {
-    markerChecks.push({ meetingId, marker });
+  workflow.hubspot.hasMeetingNoteContaining = async (meeting, marker) => {
+    markerChecks.push({ meetingId: meeting.id, marker });
     return true;
   };
   workflow.hubspot.createPostPromptMarker = async () => {

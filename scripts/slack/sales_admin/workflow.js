@@ -1011,15 +1011,18 @@ class SalesAdminWorkflow {
   // reads require the organization URI alongside the user URI; fetch it once and cache.
   async getCalendlyOrganization() {
     if (this.config.calendlyOrganization) return this.config.calendlyOrganization;
-    if (this._calendlyOrgUri !== undefined) return this._calendlyOrgUri;
-    this._calendlyOrgUri = '';
+    if (this._calendlyOrgUri) return this._calendlyOrgUri;
     try {
       const me = await calendlyHttpGetJson(`${this.config.calendlyBaseUrl}/users/me`, this.config.calendlyToken);
-      this._calendlyOrgUri = me?.resource?.current_organization || '';
+      const org = me?.resource?.current_organization || '';
+      if (org) this._calendlyOrgUri = org; // cache only a real org; otherwise retry next call
+      return org;
     } catch (err) {
+      // Do NOT cache a transient failure — caching '' here would silently disable
+      // Calendly verification for the whole process run.
       this.logger.warn(`Sales admin Calendly org lookup failed: ${err.message}`);
+      return '';
     }
-    return this._calendlyOrgUri;
   }
 
   async fetchCalendlyEvents({ userUri, status, minStart, maxStart }) {
@@ -1046,11 +1049,12 @@ class SalesAdminWorkflow {
     if (!this.config.calendlyToken || !userUri || !meetings.length) return meetings;
     try {
       const canceled = await this.fetchCalendlyEvents({ userUri, status: 'canceled', minStart: start, maxStart: end });
-      const canceledStartMs = new Set(canceled.map(event => Date.parse(event.start_time)).filter(Number.isFinite));
-      if (!canceledStartMs.size) return meetings;
+      const canceledStartMs = canceled.map(event => Date.parse(event.start_time)).filter(Number.isFinite);
+      if (!canceledStartMs.length) return meetings;
       for (const meeting of meetings) {
         const startMs = Date.parse(meeting.properties?.hs_meeting_start_time || '');
-        if (Number.isFinite(startMs) && canceledStartMs.has(startMs)) meeting._calendlyStatus = 'canceled';
+        // Match within 60s — Calendly and HubSpot synced start times can differ sub-minute.
+        if (Number.isFinite(startMs) && canceledStartMs.some(c => Math.abs(c - startMs) <= 60000)) meeting._calendlyStatus = 'canceled';
       }
     } catch (err) {
       this.logger.warn(`Sales admin Calendly verification skipped for ${ae.name}: ${err.message}`);
@@ -1274,7 +1278,7 @@ class SalesAdminWorkflow {
             }
             const marker = postPromptMarker(meeting.id, ae.hubspotOwnerId);
             if (!force) {
-              const alreadyPrompted = await this.hubspot.hasMeetingNoteContaining(meeting.id, marker).catch(err => {
+              const alreadyPrompted = await this.hubspot.hasMeetingNoteContaining(meeting, marker).catch(err => {
                 this.logger.warn(`Sales admin post prompt marker check failed for meeting ${meeting.id}: ${err.message}`);
                 return false;
               });
@@ -1569,10 +1573,15 @@ function scheduleSalesAdminWorkflow(workflow) {
     workflow.logger.log('  Sales admin: disabled');
     return [];
   }
+  // Idempotency: never double-schedule if called twice.
+  if (workflow._scheduled) return workflow._scheduledTimers || [];
+  workflow._scheduled = true;
   const timers = [];
+  // unref so these timers never keep the process alive on their own.
+  const track = (timer) => { if (timer && typeof timer.unref === 'function') timer.unref(); timers.push(timer); return timer; };
   const scheduleMorning = () => {
     const delay = msUntilNextLocalTime({ timeZone: workflow.config.timezone, hour: workflow.config.morningHour, minute: workflow.config.morningMinute });
-    timers.push(setTimeout(async () => {
+    track(setTimeout(async () => {
       await workflow.runMorningSummaries().catch(err => workflow.logger.error(`Sales admin morning scheduled run failed: ${err.message}`));
       scheduleMorning();
     }, delay));
@@ -1581,15 +1590,25 @@ function scheduleSalesAdminWorkflow(workflow) {
   scheduleMorning();
   const scheduleTomorrow = () => {
     const delay = msUntilNextLocalTime({ timeZone: workflow.config.timezone, hour: workflow.config.tomorrowHour, minute: workflow.config.tomorrowMinute });
-    timers.push(setTimeout(async () => {
+    track(setTimeout(async () => {
       await workflow.runTomorrowSummaries().catch(err => workflow.logger.error(`Sales admin tomorrow scheduled run failed: ${err.message}`));
       scheduleTomorrow();
     }, delay));
     workflow.logger.log(`  Sales admin tomorrow summary scheduled in ${Math.round(delay / 60000)} min`);
   };
   scheduleTomorrow();
-  timers.push(setInterval(() => workflow.runCancellationScan().catch(err => workflow.logger.error(`Sales admin cancellation scheduled run failed: ${err.message}`)), workflow.config.cancelScanMin * 60 * 1000));
-  timers.push(setInterval(() => workflow.runPostMeetingScan().catch(err => workflow.logger.error(`Sales admin post-meeting scheduled run failed: ${err.message}`)), workflow.config.scanIntervalMin * 60 * 1000));
+  // Self-rescheduling scans: the next run is only queued AFTER the current one settles,
+  // so a slow scan can never overlap/stack (which would starve this process).
+  const scheduleScan = (run, intervalMs, label) => {
+    const tick = async () => {
+      try { await run(); } catch (err) { workflow.logger.error(`${label} failed: ${err.message}`); }
+      track(setTimeout(tick, intervalMs));
+    };
+    track(setTimeout(tick, intervalMs));
+  };
+  scheduleScan(() => workflow.runCancellationScan(), workflow.config.cancelScanMin * 60 * 1000, 'Sales admin cancellation scheduled run');
+  scheduleScan(() => workflow.runPostMeetingScan(), workflow.config.scanIntervalMin * 60 * 1000, 'Sales admin post-meeting scheduled run');
+  workflow._scheduledTimers = timers;
   return timers;
 }
 

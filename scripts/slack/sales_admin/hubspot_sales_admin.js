@@ -280,10 +280,26 @@ class HubSpotSalesAdminClient {
     return note;
   }
 
-  async hasMeetingNoteContaining(meetingId, marker) {
-    if (!meetingId || !marker) return false;
-    const noteIds = await this.getAssociations('meetings', meetingId, 'notes');
-    for (const noteId of noteIds.slice(0, 100)) {
+  // Notes can't be associated to meetings in HubSpot, so the post-prompt marker note is
+  // anchored to the meeting's deal/contact/company instead. Look it up via those records
+  // (the marker text embeds the meeting id, so it stays meeting-specific).
+  async hasMeetingNoteContaining(meeting, marker) {
+    if (!meeting || !marker) return false;
+    const anchors = [
+      ...(meeting._deals || []).slice(0, 3).map(deal => ['deals', deal.id || deal]),
+      ...(meeting._contacts || []).slice(0, 5).map(contact => ['contacts', contact.id || contact]),
+      ...(meeting._companies || []).slice(0, 3).map(company => ['companies', company.id || company]),
+    ];
+    const noteIds = new Set();
+    for (const [type, id] of anchors) {
+      if (!id) continue;
+      const ids = await this.getAssociations(type, id, 'notes').catch(err => {
+        this.logger.warn(`Sales admin note lookup failed for ${type} ${id}: ${err.message}`);
+        return [];
+      });
+      for (const noteId of ids) noteIds.add(noteId);
+    }
+    for (const noteId of [...noteIds].slice(0, 100)) {
       try {
         const note = await this.getObject('notes', noteId, ['hs_note_body']);
         if (String(note.properties?.hs_note_body || '').includes(marker)) return true;
@@ -297,6 +313,9 @@ class HubSpotSalesAdminClient {
   async createPostPromptMarker({ marker, meeting, ae, slackChannel, slackTs, promptKey, grainUrl = '', grainSource = '' }) {
     return this.createNote({
       meeting,
+      contacts: meeting?._contacts || [],
+      companies: meeting?._companies || [],
+      deals: meeting?._deals || [],
       body: [
         'Sales Admin post-meeting prompt sent',
         `Marker: ${marker}`,

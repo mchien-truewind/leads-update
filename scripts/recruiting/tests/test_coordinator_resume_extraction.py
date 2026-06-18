@@ -653,6 +653,13 @@ class NameAndExtractorWaterfallTests(unittest.TestCase):
             unipile_account_id="acc_1",
         )))
 
+    def test_parse_title_company_from_headline(self):
+        self.assertEqual(cli.parse_title_company_from_headline("Account Executive at Stripe"), ("Account Executive", "Stripe"))
+        self.assertEqual(cli.parse_title_company_from_headline("AE @ Stripe | helping teams scale"), ("AE", "Stripe"))
+        self.assertEqual(cli.parse_title_company_from_headline("Senior PM at Acme, Remote"), ("Senior PM", "Acme"))
+        self.assertEqual(cli.parse_title_company_from_headline("Aspiring data scientist"), ("", ""))
+        self.assertEqual(cli.parse_title_company_from_headline(""), ("", ""))
+
     def test_linkedin_identifier_from_url(self):
         self.assertEqual(cli.linkedin_identifier_from_url("https://www.linkedin.com/in/dikshithreddym"), "dikshithreddym")
         self.assertEqual(cli.linkedin_identifier_from_url("https://linkedin.com/in/jane-doe/"), "jane-doe")

@@ -932,7 +932,15 @@ function inferCompanyFromEmail(email) {
   return { company: titleCase(root), domain };
 }
 
+function hasDuplicateOverrideKeyword(input = {}) {
+  // A user can bypass the open-duplicate guard by typing the word "override".
+  // Detected in code (not just the prompt) so the bypass is deterministic.
+  const text = String(input.context || input.context_text || input.notes || input.message || '').toLowerCase();
+  return /\boverride\b/.test(text);
+}
+
 function shouldCheckDuplicates(input = {}) {
+  if (hasDuplicateOverrideKeyword(input)) return false;
   return input.check_duplicates !== false && String(input.check_duplicates || '').toLowerCase() !== 'false';
 }
 
@@ -1508,7 +1516,7 @@ function formatDuplicateDealError(deal) {
       owner: hubSpotOwnerNameFromId(props.hubspot_owner_id),
       url: hubspotRecordUrl('deals', deal.id),
     },
-    message: 'An open deal already exists for this company. Would you like to update it instead?',
+    message: 'An open deal already exists for this company in the active pipeline (stages MQL through Proposal). Do not create a new deal — coordinate with the deal owner to update the existing one. If you intend to create a separate deal anyway, reply with the word "override".',
   };
 }
 
@@ -3175,7 +3183,7 @@ const TOOLS = [
   },
   {
     name: 'hubspot_create_deal',
-    description: 'Create a new deal in HubSpot. Requires explicit deal_source from the user. If the user did not provide a source, ask for it before calling this tool. Active Pipeline ID is 105321581. Stages: MQL=1307720553, SQL=190380582, Full Product Demo=190380583, POC=190380586, Proposal=190380584, Won=1166230571, Closed/Lost=190380587.',
+    description: 'Create a new deal in HubSpot. Requires explicit deal_source from the user. If the user did not provide a source, ask for it before calling this tool. Active Pipeline ID is 105321581. Stages: MQL=1307720553, SQL=190380582, Full Product Demo=190380583, POC=190380586, Proposal=190380584, Won=1166230571, Closed/Lost=190380587. The backend BLOCKS creation if an open deal already exists for the company in the active pipeline (stages MQL..Proposal); always pass company_name (and email/company_id/contact_id when known). If the result is duplicate_deal_exists, relay its message to the user and do NOT create the deal unless they reply with "override".',
     input_schema: {
       type: 'object',
       properties: {
@@ -3184,7 +3192,12 @@ const TOOLS = [
         dealstage: { type: 'string', description: 'Stage ID' },
         deal_source: { type: 'string', description: 'Required explicit deal source from the user. Do not infer or default it. Use one of the current HubSpot deal_source property options.' },
         amount: { type: 'number', description: 'Deal amount' },
-        context: { type: 'string', description: 'Original Slack request/context for write authorization.' },
+        company_name: { type: 'string', description: 'Company name for the deal. Always pass when known — the backend uses it to detect an existing open deal for the same company before creating a duplicate.' },
+        email: { type: 'string', description: 'Primary contact email, used to detect an existing open deal by the company email domain.' },
+        company_id: { type: 'string', description: 'HubSpot company ID if known, to check its associated open deals for duplicates.' },
+        contact_id: { type: 'string', description: 'HubSpot contact ID if known, to check associated open deals for duplicates.' },
+        check_duplicates: { type: 'boolean', description: 'Defaults to true. The backend blocks creation if an open deal already exists for the company in the active pipeline (stages MQL..Proposal). Set to false ONLY when the user explicitly types "override" to create a separate second deal.' },
+        context: { type: 'string', description: 'Original Slack request/context for write authorization and for the "override" keyword check.' },
         channel_id: { type: 'string', description: 'Slack channel ID for write authorization.' },
         slack_user_id: { type: 'string', description: 'Slack user ID for write authorization.' },
         properties: {
@@ -3509,6 +3522,19 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
       if (input.amount) props.amount = String(input.amount);
       if (input.properties) Object.assign(props, input.properties);
       props.deal_source = dealSource;
+      // Block creating a second deal when an open one already exists for this
+      // company in the active pipeline (stages MQL..Proposal; Closed/Won and
+      // Closed/Lost are ignored). A user bypasses with the "override" keyword,
+      // honored by shouldCheckDuplicates.
+      if (shouldCheckDuplicates(input)) {
+        const duplicateDeal = await findDuplicateOpenDeal({
+          companyName: input.company_name || input.company || '',
+          email: input.email || '',
+          contactId: input.contact_id || '',
+          companyId: input.company_id || '',
+        });
+        if (duplicateDeal) return JSON.stringify(formatDuplicateDealError(duplicateDeal));
+      }
       // Default the deal owner to the requesting teammate unless an owner was
       // explicitly provided. Mirrors the structured deal flows so every creation
       // path assigns the deal to whoever asked for it (explicit > requester > split).
@@ -3802,7 +3828,7 @@ Rules enforced by the backend tool:
 - Company is required, but the tool can infer it from LinkedIn or a non-generic email domain. Only ask if the tool says company is unclear.
 - The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to lifecycle opportunity and lead status internal value MQL (HubSpot label Converted).
 - Pass the full Slack request/thread in the context field for write authorization and notes context, but pass the user's explicit source in lead_source/deal_source.
-- The backend checks for open duplicate deals by company name, company association, contact email, and non-generic contact email domain before creating a deal. Leave check_duplicates unset or true by default. Only set check_duplicates=false when the user explicitly asks for a separate second deal despite an existing open deal.
+- The backend checks for open duplicate deals by company name, company association, contact email, and non-generic contact email domain before creating a deal — on hubspot_push_truewind_prospect AND hubspot_create_deal. "Open" means the active pipeline, stages MQL through Proposal (Closed/Won and Closed/Lost do not block). Leave check_duplicates unset or true by default. If a tool returns duplicate_deal_exists, relay its message: tell the user to coordinate with the deal owner on the existing deal, and that they can reply with the word "override" to create a separate deal anyway. Only set check_duplicates=false (or proceed) when the user has typed "override".
 - If the request includes notes, referral context, meeting-booked text, or deal/prospect type, pass notes, meeting_booked, and type into hubspot_push_truewind_prospect. The backend creates a HubSpot note object associated to the deal, contact, and company and reports the note ID or exact note error.
 - Pass channel_id and slack_user_id from Slack metadata on every HubSpot write tool call. The backend uses them for HubSpot write authorization and owner mapping. If the user explicitly names an owner, pass owner_name; explicit owner_name overrides Slack owner mapping. Otherwise it looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
 - Never ask for deal stage, owner, ERP, or name/title unless the backend tool explicitly needs clarification. Always ask for deal source before deal creation when the user has not provided one.
@@ -5679,6 +5705,7 @@ module.exports = {
   resolveHubSpotOwnerForProspect,
   runStructuredDealCreateWorkflow,
   shouldSetLifecycleToOpportunity,
+  shouldCheckDuplicates,
   startSlackBot,
   resolveBotRoles,
   summarizeHubSpotStageCohortOutcomes,

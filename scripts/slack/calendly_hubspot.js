@@ -166,6 +166,88 @@ async function calendlyRequest(uri) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic host -> HubSpot owner resolution.
+// The CONFIG.ownerByCalendlyUserUri / organizerNameByCalendlyUserUri seeds were
+// hardcoded to 3 hosts, so demos booked with any other team member were dropped
+// (filter.ok=false) and never got owner = host. Instead of maintaining that list
+// by hand, we augment it at runtime: enumerate the Calendly org's members and
+// match each member's email to a HubSpot owner. Runs lazily on the first webhook
+// and refreshes on a TTL. Best-effort: on any failure we keep the existing map.
+// ---------------------------------------------------------------------------
+const OWNER_MAP_TTL_MS = Number(process.env.CALENDLY_OWNER_MAP_TTL_MS || 6 * 60 * 60 * 1000);
+let ownerMapLoadedAt = 0;
+let ownerMapInFlight = null;
+
+async function fetchHubSpotOwnersByEmail() {
+  const byEmail = new Map();
+  let after = '';
+  do {
+    const qs = `limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`;
+    const page = await hubspotRequest(`/crm/v3/owners?${qs}`);
+    for (const o of page.results || []) {
+      const email = lower(o.email);
+      if (email) byEmail.set(email, { id: String(o.id), name: clean(`${o.firstName || ''} ${o.lastName || ''}`) });
+    }
+    after = page.paging?.next?.after || '';
+  } while (after);
+  return byEmail;
+}
+
+async function fetchCalendlyOrgMembers() {
+  const me = await calendlyRequest('https://api.calendly.com/users/me');
+  const org = clean(me?.resource?.current_organization);
+  if (!org) return [];
+  const members = [];
+  let url = `https://api.calendly.com/organization_memberships?organization=${encodeURIComponent(org)}&count=100`;
+  while (url) {
+    const page = await calendlyRequest(url);
+    for (const m of page.collection || []) {
+      const user = m.user || {};
+      const uri = typeof user === 'string' ? clean(user) : clean(user.uri);
+      const email = lower(typeof user === 'string' ? '' : user.email);
+      const name = clean(typeof user === 'string' ? '' : user.name);
+      if (uri && email) members.push({ uri, email, name });
+    }
+    url = page.pagination?.next_page || '';
+  }
+  return members;
+}
+
+async function refreshCalendlyOwnerMap(config = CONFIG) {
+  const [owners, members] = await Promise.all([fetchHubSpotOwnersByEmail(), fetchCalendlyOrgMembers()]);
+  let added = 0;
+  for (const member of members) {
+    if (config.ownerByCalendlyUserUri.has(member.uri)) continue; // keep seeded entries as-is
+    const owner = owners.get(member.email);
+    if (!owner) continue; // Calendly member with no matching HubSpot owner (e.g. unlicensed) -> can't assign
+    config.ownerByCalendlyUserUri.set(member.uri, owner.id);
+    if (!config.organizerNameByCalendlyUserUri.has(member.uri)) {
+      config.organizerNameByCalendlyUserUri.set(member.uri, member.name || owner.name);
+    }
+    added += 1;
+  }
+  if (added) console.log(`[calendly] owner map augmented: +${added} host(s) (total ${config.ownerByCalendlyUserUri.size})`);
+  return added;
+}
+
+// Refresh at most once per TTL; de-dupes concurrent webhooks. Never throws.
+async function ensureCalendlyOwnerMap(config = CONFIG) {
+  if (Date.now() - ownerMapLoadedAt < OWNER_MAP_TTL_MS) return;
+  if (ownerMapInFlight) return ownerMapInFlight;
+  ownerMapInFlight = (async () => {
+    try {
+      await refreshCalendlyOwnerMap(config);
+      ownerMapLoadedAt = Date.now();
+    } catch (err) {
+      console.error('[calendly] owner map refresh failed (keeping existing map):', err.message);
+    } finally {
+      ownerMapInFlight = null;
+    }
+  })();
+  return ownerMapInFlight;
+}
+
 function sendText(res, statusCode, text) {
   res.writeHead(statusCode, { 'content-type': 'text/plain' });
   res.end(text);
@@ -800,6 +882,7 @@ async function processCalendlyWebhook(body) {
     if (!isCalendlyApiUri(eventUri)) return { action: 'ignored_bad_event_uri' };
 
     const scheduledEvent = await calendlyRequest(eventUri);
+    await ensureCalendlyOwnerMap(); // resolve any team member as host, not just the seeded few
     const filter = shouldProcessScheduledEvent(scheduledEvent);
     if (!filter.ok) {
       return {
@@ -867,6 +950,8 @@ async function handleCalendlyHubSpotWebhook(req, res, { logger = console } = {})
 module.exports = {
   CONFIG,
   CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY,
+  ensureCalendlyOwnerMap,
+  refreshCalendlyOwnerMap,
   buildDealName,
   buildCalendlyContactProperties,
   findAllowedHostUserUri,

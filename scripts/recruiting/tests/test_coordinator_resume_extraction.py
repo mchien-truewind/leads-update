@@ -645,6 +645,33 @@ class NameAndExtractorWaterfallTests(unittest.TestCase):
         self.assertNotIn("career AI data software", names)
         self.assertIn("Dikshith Reddy", names)
 
+    def test_consensus_first_name_requires_three_agreeing_sources(self):
+        # 3 sources agree -> returns the name
+        ev = {"email": ["Jane"], "resume": ["jane"], "linkedin": ["Jane"], "linkedin_slug": [], "ats": ["Wrongname"]}
+        self.assertEqual(cli.derive_consensus_first_name(ev, min_sources=3), "Jane")
+        # only 2 agree -> no consensus
+        ev2 = {"email": ["Jane"], "resume": ["jane"], "linkedin": ["Bob"], "linkedin_slug": [], "ats": []}
+        self.assertEqual(cli.derive_consensus_first_name(ev2, min_sources=3), "")
+        # generic tokens never count
+        ev3 = {"email": ["there"], "resume": ["there"], "linkedin": ["there"], "ats": [], "linkedin_slug": []}
+        self.assertEqual(cli.derive_consensus_first_name(ev3, min_sources=3), "")
+        self.assertEqual(cli.derive_consensus_first_name({}, min_sources=3), "")
+
+    def test_name_verifier_consensus_requires_both_agents(self):
+        cfg = build_config(anthropic_api_key="a", openai_api_key="o")
+        kw = dict(candidate_name="Jane Doe", candidate_email="jane@x.co", greeting_first_name="Jane",
+                  evidence={"email": ["Jane"]}, deterministic_allowed=True, deterministic_reason="ok")
+        # both approve -> True
+        with mock.patch.object(cli, "call_anthropic_name_verifier", return_value=(True, "ok")), \
+             mock.patch.object(cli, "call_openai_name_verifier", return_value=(True, "ok")):
+            ok, _ = cli.call_rejection_name_verifier_consensus(cfg, **kw)
+        self.assertTrue(ok)
+        # one rejects -> False (fail closed)
+        with mock.patch.object(cli, "call_anthropic_name_verifier", return_value=(True, "ok")), \
+             mock.patch.object(cli, "call_openai_name_verifier", return_value=(False, "mismatch")):
+            ok, _ = cli.call_rejection_name_verifier_consensus(cfg, **kw)
+        self.assertFalse(ok)
+
     def test_unipile_configured_requires_all_three_values(self):
         self.assertFalse(cli.unipile_configured(build_config()))
         self.assertTrue(cli.unipile_configured(build_config(

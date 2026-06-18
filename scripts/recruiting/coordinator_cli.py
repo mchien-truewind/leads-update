@@ -2763,7 +2763,7 @@ def build_name_verifier_prompt(payload: dict[str, Any]) -> str:
     )
 
 
-def call_anthropic_name_verifier(config: Config, payload: dict[str, Any]) -> tuple[bool, str]:
+def call_anthropic_name_verifier(config: Config, payload: dict[str, Any], *, model: str = "") -> tuple[bool, str]:
     if requests is None or not config.anthropic_api_key:
         return False, "Anthropic verifier unavailable"
     response = requests.post(
@@ -2774,7 +2774,7 @@ def call_anthropic_name_verifier(config: Config, payload: dict[str, Any]) -> tup
             "Content-Type": "application/json",
         },
         json={
-            "model": config.name_verifier_model or "claude-sonnet-4-6",
+            "model": model or config.name_verifier_model or "claude-haiku-4-5",
             "max_tokens": 300,
             "temperature": 0,
             "messages": [{"role": "user", "content": build_name_verifier_prompt(payload)}],
@@ -2796,7 +2796,7 @@ def call_anthropic_name_verifier(config: Config, payload: dict[str, Any]) -> tup
     return bool(parsed.get("allow_auto_send")), clean_text(str(parsed.get("reason", "") or "no reason"))
 
 
-def call_openai_name_verifier(config: Config, payload: dict[str, Any]) -> tuple[bool, str]:
+def call_openai_name_verifier(config: Config, payload: dict[str, Any], *, model: str = "") -> tuple[bool, str]:
     if requests is None or not config.openai_api_key:
         return False, "OpenAI verifier unavailable"
     response = requests.post(
@@ -2806,7 +2806,7 @@ def call_openai_name_verifier(config: Config, payload: dict[str, Any]) -> tuple[
             "Content-Type": "application/json",
         },
         json={
-            "model": config.name_verifier_model or "gpt-4o-mini",
+            "model": model or config.name_verifier_model or "gpt-4o-mini",
             "temperature": 0,
             "messages": [{"role": "user", "content": build_name_verifier_prompt(payload)}],
         },
@@ -2852,6 +2852,71 @@ def call_rejection_name_verifier_subagent(
         return call_anthropic_name_verifier(config, payload)
     except Exception as exc:
         return False, f"{provider} verifier failed: {exc.__class__.__name__}"
+
+
+# Generic salutation tokens that must never be treated as a real first name.
+GENERIC_FIRST_NAME_TOKENS = frozenset({
+    "there", "candidate", "team", "hi", "hello", "applicant", "all", "everyone",
+})
+
+
+def derive_consensus_first_name(
+    evidence: dict[str, list[str]], *, min_sources: int = 3
+) -> str:
+    """Return a corrected first name only when at least `min_sources` independent
+    evidence sources (email, resume, linkedin, linkedin_slug, ats) agree on the
+    same normalized first name. Returns "" when there is no strong consensus, so the
+    caller leaves the draft for human review. Generic salutation tokens are ignored."""
+    by_norm: dict[str, dict[str, str]] = {}
+    for source, names in (evidence or {}).items():
+        for name in names or []:
+            norm = normalize_first_name_for_verification(name)
+            if not norm or norm in GENERIC_FIRST_NAME_TOKENS:
+                continue
+            by_norm.setdefault(norm, {})[source] = clean_text(name)
+    best_norm, best_count = "", 0
+    for norm, sources in by_norm.items():
+        if len(sources) > best_count:
+            best_norm, best_count = norm, len(sources)
+    if not best_norm or best_count < min_sources:
+        return ""
+    # Prefer a nicely-cased representative from the most authoritative source.
+    preferred = by_norm[best_norm]
+    for source in ("email", "ats", "linkedin", "resume", "linkedin_slug"):
+        if source in preferred and preferred[source]:
+            return preferred[source]
+    return next(iter(preferred.values()))
+
+
+def call_rejection_name_verifier_consensus(
+    config: Config,
+    *,
+    candidate_name: str,
+    candidate_email: str,
+    greeting_first_name: str,
+    evidence: dict[str, list[str]],
+    deterministic_allowed: bool,
+    deterministic_reason: str,
+) -> tuple[bool, str]:
+    """Two independent agents (Claude + OpenAI) must BOTH approve the corrected
+    draft. Fails closed if either provider is unavailable or errors."""
+    payload = {
+        "candidate_email": candidate_email,
+        "notion_candidate_name": candidate_name,
+        "greeting_first_name": greeting_first_name,
+        "evidence": evidence,
+        "deterministic_allowed": deterministic_allowed,
+        "deterministic_reason": deterministic_reason,
+    }
+    try:
+        claude_ok, claude_reason = call_anthropic_name_verifier(config, payload, model="claude-haiku-4-5")
+    except Exception as exc:
+        claude_ok, claude_reason = False, f"anthropic error: {exc.__class__.__name__}"
+    try:
+        openai_ok, openai_reason = call_openai_name_verifier(config, payload, model="gpt-4o-mini")
+    except Exception as exc:
+        openai_ok, openai_reason = False, f"openai error: {exc.__class__.__name__}"
+    return (claude_ok and openai_ok), f"claude={claude_ok}({claude_reason}); openai={openai_ok}({openai_reason})"
 
 
 def notify_rejection_name_verification_failure(
@@ -6309,16 +6374,55 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         draft_body=draft_body,
                         evidence=name_evidence,
                     )
-                    subagent_ok, subagent_reason = call_rejection_name_verifier_subagent(
-                        config,
-                        candidate_name=candidate_name,
-                        candidate_email=candidate_email,
-                        greeting_first_name=greeting_first_name,
-                        evidence=name_evidence,
-                        deterministic_allowed=deterministic_ok,
-                        deterministic_reason=deterministic_reason,
-                    )
-                    name_ok = subagent_ok
+                    # Wrong/missing greeting: attempt a consensus auto-repair (>=3 evidence
+                    # sources must agree on the real first name), then require BOTH agents to
+                    # confirm. If consensus is weak, fall through to the normal single-agent
+                    # gate, which leaves it for human review.
+                    repaired_name = False
+                    if not deterministic_ok:
+                        corrected_first_name = derive_consensus_first_name(name_evidence, min_sources=3)
+                        if corrected_first_name and (
+                            normalize_first_name_for_verification(corrected_first_name)
+                            != normalize_first_name_for_verification(greeting_first_name)
+                        ):
+                            repaired_body = apply_email_greeting(draft_body, corrected_first_name)
+                            if repaired_body != draft_body and update_gmail_draft_body_text(
+                                gmail_service, draft=draft, body_text=repaired_body
+                            ):
+                                draft_body = repaired_body
+                                can_send_existing_draft = True
+                                repaired_name = True
+                                print(
+                                    "Reject draft greeting auto-repaired by consensus: "
+                                    f"{candidate_name} <{candidate_email}> -> 'Hi {corrected_first_name}'"
+                                )
+                                deterministic_ok, greeting_first_name, deterministic_reason = run_rejection_name_verification_agent(
+                                    draft_body=draft_body,
+                                    evidence=name_evidence,
+                                )
+                    if repaired_name:
+                        consensus_ok, subagent_reason = call_rejection_name_verifier_consensus(
+                            config,
+                            candidate_name=candidate_name,
+                            candidate_email=candidate_email,
+                            greeting_first_name=greeting_first_name,
+                            evidence=name_evidence,
+                            deterministic_allowed=deterministic_ok,
+                            deterministic_reason=deterministic_reason,
+                        )
+                        name_ok = deterministic_ok and consensus_ok
+                        subagent_reason = f"auto-repaired greeting; {subagent_reason}"
+                    else:
+                        subagent_ok, subagent_reason = call_rejection_name_verifier_subagent(
+                            config,
+                            candidate_name=candidate_name,
+                            candidate_email=candidate_email,
+                            greeting_first_name=greeting_first_name,
+                            evidence=name_evidence,
+                            deterministic_allowed=deterministic_ok,
+                            deterministic_reason=deterministic_reason,
+                        )
+                        name_ok = subagent_ok
                     if not name_ok:
                         reject_drafts_auto_send_skipped_name += 1
                         failure_reason = (

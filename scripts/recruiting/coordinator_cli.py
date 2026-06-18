@@ -1970,15 +1970,35 @@ def unipile_profile_title_company(config: Config, linkedin_url: str) -> tuple[st
         data = response.json()
     except ValueError:
         return "", ""
-    # Field names should be verified against a live Unipile profile response; this
-    # checks the common shapes and stays empty (→ PDL fallback) when unsure.
+    # Prefer structured experience when the response carries it (some account
+    # tiers / endpoints do); otherwise parse the LinkedIn headline, which the basic
+    # /users response does return (e.g. "Account Executive at Stripe").
     work = data.get("work_experience") or data.get("experience") or data.get("positions")
     if isinstance(work, list) and work and isinstance(work[0], dict):
         first = work[0]
         title = clean_text(str(first.get("position") or first.get("title") or ""))
         company = clean_text(str(first.get("company") or first.get("company_name") or ""))
-        return title, company
-    return "", ""
+        if title or company:
+            return title, company
+    return parse_title_company_from_headline(str(data.get("headline", "") or ""))
+
+
+def parse_title_company_from_headline(headline: str) -> tuple[str, str]:
+    """Best-effort split of a LinkedIn headline into (title, company).
+    "Account Executive at Stripe" -> ("Account Executive", "Stripe").
+    "AE @ Stripe | helping teams" -> ("AE", "Stripe"). Returns empty when there is
+    no clear "<title> at/@ <company>" so the caller falls back to PDL."""
+    text = clean_text(headline)
+    if not text:
+        return "", ""
+    # Headlines often pack extra after a separator; keep the first segment.
+    segment = re.split(r"\s*[|•·]\s*", text)[0].strip()
+    parts = re.split(r"\s+(?:at|@)\s+", segment, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return "", ""
+    title = clean_text(parts[0])
+    company = clean_text(re.split(r"\s*[|•·,]\s*", parts[1])[0])
+    return title, company
 
 
 def enrich_linkedin_title_company(config: Config, linkedin_url: str) -> tuple[str, str]:

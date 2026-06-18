@@ -545,7 +545,7 @@ def load_config() -> Config:
         reject_delay_hours=parse_env_int("RECRUITING_REJECT_DELAY_HOURS", 24),
         reject_draft_auto_send_age_hours=parse_env_int("RECRUITING_REJECT_DRAFT_AUTO_SEND_AGE_HOURS", 48),
         name_verifier_provider=os.getenv("RECRUITING_NAME_VERIFIER_PROVIDER", "anthropic").strip().lower(),
-        name_verifier_model=os.getenv("RECRUITING_NAME_VERIFIER_MODEL", "claude-3-5-haiku-latest").strip(),
+        name_verifier_model=os.getenv("RECRUITING_NAME_VERIFIER_MODEL", "claude-haiku-4-5").strip(),
         resume_extractor_provider=os.getenv("RECRUITING_RESUME_EXTRACTOR_PROVIDER", "off").strip().lower(),
         resume_extractor_model=os.getenv("RECRUITING_RESUME_EXTRACTOR_MODEL", "gpt-4.1-mini").strip(),
         resume_extractor_model_anthropic=os.getenv("RECRUITING_RESUME_EXTRACTOR_MODEL_ANTHROPIC", "claude-haiku-4-5").strip(),

@@ -9,6 +9,9 @@
   "scripts": {
     "start": "node scripts/slack/slack_bot.js",
     "sales-admin": "node scripts/slack/sales_admin_bot.js",
+    "gtm-ops": "node scripts/slack/gtm_ops_bot.js",
+    "gtm-ops:backfill": "node scripts/slack/gtm_ops/backfill.js",
+    "gtm-ops:backfill:live": "DRY_RUN=false node scripts/slack/gtm_ops/backfill.js",
     "lead-status-sync": "node scripts/slack/lead_status_sync.js",
     "lead-status-sync:dry-run": "node scripts/slack/lead_status_sync.js --dry-run --skip-slack",
     "lead-status-sync:full": "node scripts/slack/lead_status_sync.js --full",

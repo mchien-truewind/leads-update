@@ -934,9 +934,13 @@ function inferCompanyFromEmail(email) {
 
 function hasDuplicateOverrideKeyword(input = {}) {
   // A user can bypass the open-duplicate guard by typing the word "override".
-  // Detected in code (not just the prompt) so the bypass is deterministic.
+  // Detected in code (not just the prompt) so the bypass is deterministic. Ignore
+  // negated prose like "do not override" / "don't override" so an explicit refusal
+  // doesn't accidentally disable the guard.
   const text = String(input.context || input.context_text || input.notes || input.message || '').toLowerCase();
-  return /\boverride\b/.test(text);
+  if (!/\boverride\b/.test(text)) return false;
+  if (/\b(?:not|never|no|n['’]?t|without|cannot|can['’]?t|do\s+not|don['’]?t)\b[\s\w,'’-]{0,20}\boverride\b/.test(text)) return false;
+  return true;
 }
 
 function shouldCheckDuplicates(input = {}) {
@@ -3491,7 +3495,7 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
       return JSON.stringify(result);
     }
     if (name === 'hubspot_push_truewind_prospect') {
-      return await runTruewindHubSpotProspectWorkflow(input);
+      return await runTruewindHubSpotProspectWorkflow(toolInput);
     }
 
     // --- HubSpot write ---

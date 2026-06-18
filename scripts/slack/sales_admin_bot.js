@@ -38,7 +38,10 @@ const { createSalesAdminWorkflow, scheduleSalesAdminWorkflow } = require('./sale
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
 const DEFAULT_HTTP_TIMEOUT_MS = Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 30000);
-const HUBSPOT_MAX_ATTEMPTS = Number(process.env.HUBSPOT_MAX_ATTEMPTS || 5);
+const HUBSPOT_MAX_ATTEMPTS = (() => {
+  const n = Number(process.env.HUBSPOT_MAX_ATTEMPTS);
+  return Number.isFinite(n) && n >= 1 ? n : 5; // guard against NaN (would make the retry loop infinite)
+})();
 
 function hubspotRequestOnce(endpoint, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
@@ -90,8 +93,12 @@ async function hubspotRequest(endpoint, method = 'GET', body = null) {
 // Minimal HTTP server so Railway's health check has a port to hit.
 function startHealthServer() {
   const port = Number(process.env.PORT || 8080);
-  http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('ok'); })
-    .listen(port, () => console.log(`  Health check on port ${port}`));
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('ok'); });
+  server.on('error', (err) => {
+    console.error(`Health server failed to bind port ${port}: ${err.message}`);
+    process.exit(1); // surface the failure clearly so Railway restarts instead of a silent boot hang
+  });
+  server.listen(port, () => console.log(`  Health check on port ${port}`));
 }
 
 // Detect a wedged/flapping Socket Mode connection and exit so Railway restarts it.

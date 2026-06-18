@@ -5631,7 +5631,9 @@ async function startSlackBot() {
     // Socket Mode. Keeping them in the worker (or single 'all') process means they
     // never block the dedicated 'bot' process's Socket Mode heartbeat.
     console.log(`Scheduling background jobs (role='${role}')`);
-    scheduleMqlDiscoveryReport();
+    // Daily MQL Discovery Report disabled per request (not useful / distracting).
+    // Re-enable by uncommenting; the report code, route, and CLI flag remain.
+    // scheduleMqlDiscoveryReport();
     scheduleDailyProgress();
     scheduleLeadStatusSync();
   } else {

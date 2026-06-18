@@ -17,6 +17,7 @@ const {
   TRUEWIND_HUBSPOT,
   sanitizeToken,
   resolveBotRoles,
+  shouldCheckDuplicates,
   __setHubSpotRequestOverrideForTests,
   buildDealNoteBody,
   buildRecruitingCalendarInvite,
@@ -367,6 +368,58 @@ async function testCreateDealToolDefaultsOwnerToRequester() {
     }, { slack_user_id: 'U04BPMPR29G', channel_id: 'C_TEST' });
     const dealPost2 = calls.find((c) => c.endpoint === '/crm/v3/objects/deals' && c.method === 'POST');
     assert.strictEqual(dealPost2.body.properties.hubspot_owner_id, '84547076'); // explicit wins
+  } finally {
+    __setHubSpotRequestOverrideForTests(null);
+  }
+}
+
+function testDuplicateOverrideKeyword() {
+  assert.strictEqual(shouldCheckDuplicates({}), true);
+  assert.strictEqual(shouldCheckDuplicates({ check_duplicates: false }), false);
+  assert.strictEqual(shouldCheckDuplicates({ context: 'create a deal please' }), true);
+  // "override" anywhere in the user text bypasses the guard (case-insensitive).
+  assert.strictEqual(shouldCheckDuplicates({ context: 'yes OVERRIDE and create it' }), false);
+  assert.strictEqual(shouldCheckDuplicates({ notes: 'override' }), false);
+  // substring shouldn't trigger it (word boundary)
+  assert.strictEqual(shouldCheckDuplicates({ context: 'overridden config' }), true);
+}
+
+async function testCreateDealToolBlocksOpenDuplicate() {
+  const calls = [];
+  const openDeal = {
+    id: '555',
+    properties: {
+      dealname: 'Acme - MQL', pipeline: TRUEWIND_HUBSPOT.pipeline,
+      dealstage: TRUEWIND_HUBSPOT.mqlDealStage, hs_is_closed: 'false', hubspot_owner_id: '559564379',
+    },
+  };
+  __setHubSpotRequestOverrideForTests(async (endpoint, method = 'GET', body = null) => {
+    calls.push({ endpoint, method, body });
+    if (endpoint.includes('/properties/')) return { name: endpoint.split('/').pop(), type: 'string', fieldType: 'text', modificationMetadata: { readOnlyValue: false, readOnlyDefinition: false } };
+    if (endpoint === '/crm/v3/objects/deals/search') return { results: [openDeal] };
+    if (endpoint === '/crm/v3/objects/companies/search') return { results: [] };
+    if (endpoint.includes('/associations/')) return { results: [] };
+    if (endpoint === '/crm/v3/objects/deals' && method === 'POST') return { id: '999', properties: body.properties };
+    throw new Error(`Unexpected HubSpot mock call: ${method} ${endpoint}`);
+  });
+  try {
+    // Open duplicate exists → blocked, no deal created.
+    const blocked = await executeTool('hubspot_create_deal', {
+      dealname: 'Acme New Deal', dealstage: TRUEWIND_HUBSPOT.mqlDealStage, deal_source: 'Referral', company_name: 'Acme',
+    }, { slack_user_id: 'U04BPMPR29G', channel_id: 'C_TEST' });
+    const parsed = JSON.parse(blocked);
+    assert.strictEqual(parsed.error, 'duplicate_deal_exists');
+    assert.match(parsed.message, /override/i);
+    assert.strictEqual(calls.some((c) => c.endpoint === '/crm/v3/objects/deals' && c.method === 'POST'), false);
+
+    // "override" in the context bypasses the guard → deal is created.
+    calls.length = 0;
+    const created = await executeTool('hubspot_create_deal', {
+      dealname: 'Acme New Deal', dealstage: TRUEWIND_HUBSPOT.mqlDealStage, deal_source: 'Referral',
+      company_name: 'Acme', context: 'create it anyway, override',
+    }, { slack_user_id: 'U04BPMPR29G', channel_id: 'C_TEST' });
+    assert.ok(JSON.parse(created).id, 'deal created when override is present');
+    assert.strictEqual(calls.some((c) => c.endpoint === '/crm/v3/objects/deals' && c.method === 'POST'), true);
   } finally {
     __setHubSpotRequestOverrideForTests(null);
   }
@@ -1440,6 +1493,8 @@ async function run() {
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
   await testCreateDealToolDefaultsOwnerToRequester();
+  testDuplicateOverrideKeyword();
+  await testCreateDealToolBlocksOpenDuplicate();
   testDealNotesPromptAndTools();
   testRecruitingAtsToolRegistrationAndPrompt();
   testRecruitingNotionPropertyHelpers();

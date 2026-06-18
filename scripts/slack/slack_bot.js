@@ -3509,6 +3509,18 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
       if (input.amount) props.amount = String(input.amount);
       if (input.properties) Object.assign(props, input.properties);
       props.deal_source = dealSource;
+      // Default the deal owner to the requesting teammate unless an owner was
+      // explicitly provided. Mirrors the structured deal flows so every creation
+      // path assigns the deal to whoever asked for it (explicit > requester > split).
+      if (!String(props.hubspot_owner_id || '').trim()) {
+        const requesterOwner = await resolveHubSpotOwnerForProspect({
+          ...input,
+          slack_user_id: runtimeContext.slack_user_id,
+          channel_id: runtimeContext.channel_id,
+        });
+        const dealOwner = resolveDealHubSpotOwner({ ...input }, requesterOwner);
+        if (dealOwner?.id) props.hubspot_owner_id = dealOwner.id;
+      }
       const validatedProps = await validateHubSpotProperties('deals', props);
       const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedProps });
       return JSON.stringify(formatHubSpotObjectResponse(res, 'deals'));

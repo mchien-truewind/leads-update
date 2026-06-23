@@ -7,6 +7,7 @@ const path = require('path');
 const {
   CONFIG,
   CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY,
+  buildBookedDemoSlackMessage,
   buildCalendlyContactProperties,
   buildDealName,
   findAllowedHostUserUri,
@@ -21,6 +22,7 @@ const {
   isCalendlyApiUri,
   isRescheduled,
   isUsableCompanyDomain,
+  postBookedDemoSlackAlert,
   shouldProcessScheduledEvent,
   validateCalendlySignature,
 } = require('../calendly_hubspot');
@@ -208,12 +210,14 @@ function testCalendlyContactPropertiesMarkMeetingBooked() {
       name: 'Ada Lovelace',
       email: 'ada@acme-finance.com',
       markMeetingBooked: true,
+      ownerId: '92555980',
     }),
     {
       email: 'ada@acme-finance.com',
       firstname: 'Ada',
       lastname: 'Lovelace',
       calendly_meeting_booked: 'true',
+      hubspot_owner_id: '92555980',
     },
   );
   assert.deepStrictEqual(
@@ -227,6 +231,80 @@ function testCalendlyContactPropertiesMarkMeetingBooked() {
       lastname: 'Lovelace',
     },
   );
+}
+
+function testBookedDemoSlackMessageTagsMeetingHost() {
+  const text = buildBookedDemoSlackMessage({
+    payload: {
+      name: 'Sean Wilson',
+      email: 'sean@practicefinancialgroup.com',
+      phone: '5419303372',
+      questions_and_answers: [
+        { question: 'ERP', answer: 'Other' },
+        { question: 'Job Title', answer: 'Systems and Technology Manager' },
+        { question: 'How did you hear about us?', answer: 'Industry event or conference' },
+        { question: 'Finance team size', answer: '2-5' },
+      ],
+    },
+    scheduledEvent: {
+      resource: {
+        name: 'Book Demo',
+        start_time: '2026-05-19T18:00:00.000Z',
+      },
+    },
+    contactId: '222587193659',
+    companyName: 'Practice Financial Group',
+    ownerName: 'Amy Vetter',
+    ownerSlackUserId: 'U0B4MRN83FE',
+  });
+
+  assert.ok(text.startsWith('<@U0B4MRN83FE>\nNew DEMO Meeting Booked'));
+  assert.ok(text.includes('<https://app.hubspot.com/contacts/43974586/record/0-1/222587193659|Sean Wilson>'));
+  assert.ok(text.includes('- Owner: <@U0B4MRN83FE>'));
+  assert.ok(text.includes('- Meeting Host: Amy Vetter'));
+  assert.ok(text.includes('- ERP: Other'));
+  assert.ok(text.includes('- Job Title: Systems and Technology Manager'));
+  assert.ok(text.includes('- How did you hear about us? Industry event or conference'));
+  assert.ok(text.includes('- Finance team size: 2-5'));
+  assert.ok(text.includes('- Phone: 5419303372'));
+}
+
+async function testBookedDemoSlackAlertRetriesTransientFailures() {
+  const previousAttempts = process.env.CALENDLY_DEMO_SLACK_ALERT_ATTEMPTS;
+  process.env.CALENDLY_DEMO_SLACK_ALERT_ATTEMPTS = '2';
+  let attempts = 0;
+  const posts = [];
+  try {
+    const result = await postBookedDemoSlackAlert({
+      slackClient: {
+        chat: {
+          postMessage: async (payload) => {
+            attempts += 1;
+            posts.push(payload);
+            if (attempts === 1) throw new Error('rate_limited');
+            return { ts: '123.456' };
+          },
+        },
+      },
+      slackToken: 'xoxb-test',
+      slackChannel: 'C_TEST',
+      ownerSlackUserByHubSpotOwnerId: { 92555980: 'U0B4MRN83FE' },
+      payload: { name: 'Sean Wilson', email: 'sean@practicefinancialgroup.com' },
+      scheduledEvent: { resource: { start_time: '2026-05-19T18:00:00.000Z' } },
+      contactId: '222587193659',
+      companyName: 'Practice Financial Group',
+      ownerId: '92555980',
+      ownerName: 'Amy Vetter',
+    });
+
+    assert.strictEqual(result.ts, '123.456');
+    assert.strictEqual(attempts, 2);
+    assert.strictEqual(posts[0].channel, 'C_TEST');
+    assert.ok(posts[1].text.includes('<@U0B4MRN83FE>'));
+  } finally {
+    if (previousAttempts === undefined) delete process.env.CALENDLY_DEMO_SLACK_ALERT_ATTEMPTS;
+    else process.env.CALENDLY_DEMO_SLACK_ALERT_ATTEMPTS = previousAttempts;
+  }
 }
 
 function testOrganizerName() {
@@ -268,6 +346,8 @@ async function run() {
   testCompanyNameExtraction();
   testCompanyIdentityExtraction();
   testCalendlyContactPropertiesMarkMeetingBooked();
+  testBookedDemoSlackMessageTagsMeetingHost();
+  await testBookedDemoSlackAlertRetriesTransientFailures();
   testOrganizerName();
   testConfigHasExpectedCloseLostStage();
 }

@@ -199,6 +199,17 @@ const SLACK_TO_HUBSPOT_OWNER = {
   ...DEFAULT_SLACK_TO_HUBSPOT_OWNER,
   ...parseSlackOwnerMap(),
 };
+
+function invertSlackToHubSpotOwnerMap(map) {
+  const ownerToSlack = {};
+  for (const [slackUserId, owner] of Object.entries(map || {})) {
+    const ownerId = owner?.id ? String(owner.id) : '';
+    if (ownerId && slackUserId && !ownerToSlack[ownerId]) ownerToSlack[ownerId] = slackUserId;
+  }
+  return ownerToSlack;
+}
+
+const HUBSPOT_OWNER_TO_SLACK_USER = invertSlackToHubSpotOwnerMap(SLACK_TO_HUBSPOT_OWNER);
 const hubspotContactPropertyCache = new Map();
 const hubspotPropertyCache = new Map();
 let hubspotRequestOverride = null;
@@ -5461,7 +5472,13 @@ function startHttpServer() {
     }
     if (req.method === 'POST' && req.url.split('?')[0] === '/webhooks/calendly') {
       try {
-        await handleCalendlyHubSpotWebhook(req, res, { logger: console });
+        await handleCalendlyHubSpotWebhook(req, res, {
+          logger: console,
+          slackClient: app.client,
+          slackToken: process.env.SLACK_BOT_TOKEN,
+          slackChannel: process.env.CALENDLY_DEMO_SLACK_CHANNEL_ID || process.env.CALENDLY_DEMO_SLACK_CHANNEL,
+          ownerSlackUserByHubSpotOwnerId: HUBSPOT_OWNER_TO_SLACK_USER,
+        });
       } catch (err) {
         console.error('Calendly HubSpot webhook failed:', err.message);
         res.writeHead(500);

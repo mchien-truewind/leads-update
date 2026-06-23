@@ -45,6 +45,7 @@ const CONFIG = {
   ]),
 };
 const CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY = 'calendly_meeting_booked';
+const DEFAULT_DEMO_SLACK_CHANNEL_ID = 'C05MF0R662J';
 
 function readRequestBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
@@ -375,6 +376,21 @@ function getCompanyIdentityFromPayload(payload) {
   return { name, domain };
 }
 
+function getQuestionAnswer(payload, matchers) {
+  const questions = [
+    ...(payload?.questions_and_answers || []),
+    ...(payload?.invitee?.questions_and_answers || []),
+  ];
+  for (const item of questions) {
+    const question = lower(item?.question || item?.name || item?.label);
+    if (!question) continue;
+    if (!matchers.some(matcher => question.includes(matcher))) continue;
+    const answer = clean(item?.answer || item?.value);
+    if (answer) return answer;
+  }
+  return '';
+}
+
 function getOrganizerName(hostUserUri, scheduledEvent, config = CONFIG) {
   const mapped = clean(config.organizerNameByCalendlyUserUri?.get(hostUserUri));
   if (mapped) return mapped;
@@ -413,6 +429,111 @@ function buildDealName({ companyName, organizerName, startTime }) {
 function hubspotDateMs(date = new Date()) {
   const day = date.toISOString().slice(0, 10);
   return String(new Date(`${day}T00:00:00.000Z`).getTime());
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function formatDateTimeForSlack(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return clean(value);
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    month: 'numeric',
+    day: 'numeric',
+    year: '2-digit',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  }).format(date);
+}
+
+function buildBookedDemoSlackMessage({
+  payload,
+  scheduledEvent,
+  contactId,
+  companyName = '',
+  ownerName = '',
+  ownerSlackUserId = '',
+  portalId = CONFIG.hubSpotPortalId,
+}) {
+  const name = clean(payload?.name || payload?.invitee?.name || `${payload?.first_name || ''} ${payload?.last_name || ''}`);
+  const email = clean(payload?.email || payload?.invitee?.email);
+  const contactUrl = contactId
+    ? `https://app.hubspot.com/contacts/${portalId}/record/0-1/${contactId}`
+    : '';
+  const title = contactUrl && name ? `<${contactUrl}|${name}>` : (name || contactUrl || '(unknown contact)');
+  const ownerLabel = ownerSlackUserId ? `<@${ownerSlackUserId}>` : clean(ownerName);
+  const event = scheduledEvent?.resource || scheduledEvent || {};
+  const start = formatDateTimeForSlack(getEventStart(scheduledEvent));
+  const erp = getQuestionAnswer(payload, ['erp']);
+  const jobTitle = clean(payload?.job_title || payload?.jobtitle) || getQuestionAnswer(payload, ['job title', 'title']);
+  const heard = getQuestionAnswer(payload, ['how did you hear']);
+  const financeTeamSize = getQuestionAnswer(payload, ['finance team size', 'finance team']);
+  const phone = clean(payload?.phone || payload?.invitee?.phone || payload?.text_reminder_number);
+  const webinar = getQuestionAnswer(payload, ['webinar']);
+
+  return [
+    ownerLabel || null,
+    'New DEMO Meeting Booked',
+    title,
+    email,
+    clean(companyName) ? `- Company: ${clean(companyName)}` : null,
+    ownerLabel || ownerName ? `- Owner: ${ownerLabel || ownerName}` : null,
+    clean(ownerName) ? `- Meeting Host: ${clean(ownerName)}` : null,
+    start ? `- Meeting Time: ${start}` : null,
+    clean(event.name) ? `- Event: ${clean(event.name)}` : null,
+    erp ? `- ERP: ${erp}` : null,
+    jobTitle ? `- Job Title: ${jobTitle}` : null,
+    heard ? `- How did you hear about us? ${heard}` : null,
+    financeTeamSize ? `- Finance team size: ${financeTeamSize}` : null,
+    phone ? `- Phone: ${phone}` : null,
+    webinar ? `- Webinar: ${webinar}` : null,
+  ].filter(Boolean).join('\n');
+}
+
+async function postBookedDemoSlackAlert({
+  slackClient,
+  slackToken,
+  slackChannel = '',
+  ownerSlackUserByHubSpotOwnerId = {},
+  payload,
+  scheduledEvent,
+  contactId,
+  companyName = '',
+  ownerId = '',
+  ownerName = '',
+}) {
+  const channel = clean(slackChannel) || clean(process.env.CALENDLY_DEMO_SLACK_CHANNEL_ID)
+    || clean(process.env.CALENDLY_DEMO_SLACK_CHANNEL)
+    || DEFAULT_DEMO_SLACK_CHANNEL_ID;
+  const token = clean(slackToken) || clean(process.env.SLACK_BOT_TOKEN);
+  if (!slackClient?.chat?.postMessage || !token || !channel) return null;
+  if (String(process.env.CALENDLY_DEMO_SLACK_ALERTS || '').toLowerCase() === 'false') return null;
+
+  const ownerSlackUserId = ownerSlackUserByHubSpotOwnerId[String(ownerId)] || '';
+  const text = buildBookedDemoSlackMessage({
+    payload,
+    scheduledEvent,
+    contactId,
+    companyName,
+    ownerName,
+    ownerSlackUserId,
+  });
+  if (!text) return null;
+  const attempts = Math.max(1, Number(process.env.CALENDLY_DEMO_SLACK_ALERT_ATTEMPTS || 3) || 1);
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await slackClient.chat.postMessage({ token, channel, text });
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) await delay(250 * attempt);
+    }
+  }
+  throw lastError;
 }
 
 function isCalendlyApiUri(uri) {
@@ -563,13 +684,14 @@ async function ensureCompany({ payload }) {
   return createCompany(identity);
 }
 
-function buildCalendlyContactProperties({ name, email, markMeetingBooked = false }) {
+function buildCalendlyContactProperties({ name, email, markMeetingBooked = false, ownerId = '' }) {
   const nameParts = splitName(name);
   const properties = {
     email: clean(email),
     ...nameParts,
   };
   if (markMeetingBooked) properties[CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY] = 'true';
+  if (clean(ownerId)) properties.hubspot_owner_id = clean(ownerId);
   return properties;
 }
 
@@ -581,17 +703,19 @@ async function updateContactProperties(contactId, properties) {
   });
 }
 
-async function markContactCalendlyMeetingBooked(contactId) {
-  return updateContactProperties(contactId, {
+async function markContactCalendlyMeetingBooked(contactId, ownerId = '') {
+  const properties = {
     [CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY]: 'true',
-  });
+  };
+  if (clean(ownerId)) properties.hubspot_owner_id = clean(ownerId);
+  return updateContactProperties(contactId, properties);
 }
 
-async function createContact({ name, email, markMeetingBooked = false }) {
+async function createContact({ name, email, markMeetingBooked = false, ownerId = '' }) {
   return hubspotRequest('/crm/v3/objects/contacts', {
     method: 'POST',
     body: {
-      properties: buildCalendlyContactProperties({ name, email, markMeetingBooked }),
+      properties: buildCalendlyContactProperties({ name, email, markMeetingBooked, ownerId }),
     },
   });
 }
@@ -728,19 +852,19 @@ async function createMeeting({ payload, scheduledEvent, contactId, companyId, de
   return meeting;
 }
 
-async function ensureContact({ payload }) {
+async function ensureContact({ payload, ownerId = '' }) {
   const email = clean(payload.email);
   if (!email) throw new Error('Calendly invitee payload missing email');
   const existing = await findContactByEmail(email);
   if (existing) {
-    await markContactCalendlyMeetingBooked(existing.id);
+    await markContactCalendlyMeetingBooked(existing.id, ownerId);
     return existing;
   }
-  return createContact({ name: payload.name, email, markMeetingBooked: true });
+  return createContact({ name: payload.name, email, markMeetingBooked: true, ownerId });
 }
 
-async function handleInviteeCreated(payload, scheduledEvent, filter) {
-  const contact = await ensureContact({ payload });
+async function handleInviteeCreated(payload, scheduledEvent, filter, options = {}) {
+  const contact = await ensureContact({ payload, ownerId: filter.ownerId });
   const company = await ensureCompany({ payload });
   const companyName = company?.properties?.name || getCompanyIdentityFromPayload(payload).name;
   if (company) await associate('companies', company.id, 'contacts', contact.id);
@@ -832,7 +956,33 @@ async function handleInviteeCreated(payload, scheduledEvent, filter) {
     ].filter(Boolean));
   }
 
-  return { action: 'created_or_updated', contactId: contact.id, companyId: company?.id, dealId: deal.id, meetingId: meeting.id };
+  const ownerName = getOrganizerName(filter.hostUserUri, scheduledEvent);
+  let slackAlert = null;
+  const shouldPostBookedDemoAlert = !isRescheduled(payload);
+  if (shouldPostBookedDemoAlert) {
+    slackAlert = await postBookedDemoSlackAlert({
+      slackClient: options.slackClient,
+      slackToken: options.slackToken,
+      slackChannel: options.slackChannel,
+      ownerSlackUserByHubSpotOwnerId: options.ownerSlackUserByHubSpotOwnerId,
+      payload,
+      scheduledEvent,
+      contactId: contact.id,
+      companyName,
+      ownerId: filter.ownerId,
+      ownerName,
+    });
+  }
+
+  return {
+    action: 'created_or_updated',
+    contactId: contact.id,
+    companyId: company?.id,
+    dealId: deal.id,
+    meetingId: meeting.id,
+    slackAlertTs: slackAlert?.ts,
+    slackAlertSkipped: shouldPostBookedDemoAlert ? undefined : 'reschedule',
+  };
 }
 
 async function handleInviteeCanceled(payload, scheduledEvent, filter) {
@@ -867,7 +1017,7 @@ async function handleInviteeCanceled(payload, scheduledEvent, filter) {
   return { action: 'closed_lost_no_show', dealId: deal.id, meetingId: meeting?.id };
 }
 
-async function processCalendlyWebhook(body) {
+async function processCalendlyWebhook(body, options = {}) {
   const processingKey = webhookProcessingKey(body);
   if (processingKey && inFlightWebhookKeys.has(processingKey)) return { action: 'ignored_in_flight_duplicate' };
   if (processingKey) inFlightWebhookKeys.add(processingKey);
@@ -893,7 +1043,7 @@ async function processCalendlyWebhook(body) {
     }
 
     let result;
-    if (eventName === 'invitee.created') result = await handleInviteeCreated(payload, scheduledEvent, filter);
+    if (eventName === 'invitee.created') result = await handleInviteeCreated(payload, scheduledEvent, filter, options);
     else if (eventName === 'invitee.canceled') result = await handleInviteeCanceled(payload, scheduledEvent, filter);
     else result = { action: 'ignored_event_type' };
     markDurableProcessingSucceeded(durableRecord, result);
@@ -906,7 +1056,7 @@ async function processCalendlyWebhook(body) {
   }
 }
 
-async function handleCalendlyHubSpotWebhook(req, res, { logger = console } = {}) {
+async function handleCalendlyHubSpotWebhook(req, res, { logger = console, ...options } = {}) {
   let rawBody;
   try {
     rawBody = await readRequestBody(req);
@@ -933,7 +1083,7 @@ async function handleCalendlyHubSpotWebhook(req, res, { logger = console } = {})
   }
 
   try {
-    const result = await processCalendlyWebhook(parsed);
+    const result = await processCalendlyWebhook(parsed, { ...options, logger });
     logger.log('Calendly webhook processed:', JSON.stringify({
       event: parsed.event,
       action: result.action,
@@ -954,6 +1104,7 @@ module.exports = {
   refreshCalendlyOwnerMap,
   buildDealName,
   buildCalendlyContactProperties,
+  buildBookedDemoSlackMessage,
   findAllowedHostUserUri,
   getCompanyNameFromPayload,
   getCompanyIdentityFromPayload,
@@ -970,6 +1121,7 @@ module.exports = {
   isRescheduled,
   parseSignatureHeader,
   processCalendlyWebhook,
+  postBookedDemoSlackAlert,
   shouldProcessScheduledEvent,
   validateCalendlySignature,
   webhookProcessingKey,

@@ -18,7 +18,7 @@ const { createSalesAdminState } = require('./state');
 
 const DEFAULT_AE_ROSTER = [
   { name: 'Xavier Marco', hubspotOwnerId: '89305622', email: 'xavier@trytruewind.com', slackUserId: 'U0AKMHVCJMA', salesAdminChannel: 'gtm-salesadmin-xavier' },
-  { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+  { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah', timezone: 'America/New_York' },
   { name: 'Jenilee Chen', hubspotOwnerId: '91143842', email: 'jenilee@trytruewind.com', slackUserId: 'U0ATZSNCE5T', salesAdminChannel: 'gtm-salesadmin-jenilee' },
   { name: 'Mercedes Chien', hubspotOwnerId: '87811681', email: 'mercedes@trytruewind.com', slackUserId: 'U0ABULY5TEK', salesAdminChannel: 'gtm-salesadmin-mercedes' },
   { name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' },
@@ -56,6 +56,7 @@ function parseRoster(rawValue = '') {
       email: String(item.email || '').trim().toLowerCase(),
       slackUserId: String(item.slackUserId || item.slack_user_id || '').trim(),
       salesAdminChannel: String(item.salesAdminChannel || item.sales_admin_channel || item.channel || '').trim().replace(/^#/, ''),
+      timezone: String(item.timezone || item.timeZone || item.time_zone || '').trim(),
     };
     const missing = ['name', 'hubspotOwnerId', 'email', 'slackUserId', 'salesAdminChannel'].filter(key => !ae[key]);
     if (missing.length) throw new Error(`AE roster item ${index + 1} missing: ${missing.join(', ')}`);
@@ -236,6 +237,10 @@ function formatLocalDateTime(iso, timeZone = 'America/Los_Angeles') {
     minute: '2-digit',
     hour12: true,
   }).format(date);
+}
+
+function rosterTimeZoneForAe(ae = {}, fallback = 'America/Los_Angeles') {
+  return String(ae.timezone || ae.timeZone || fallback || 'America/Los_Angeles').trim() || 'America/Los_Angeles';
 }
 
 function classifyMeetingStatus(meeting) {
@@ -1035,6 +1040,23 @@ async function resolveChannelId(client, token, channelName, { includePrivate = f
   }
 }
 
+async function resolveSlackUserTimeZone(client, token, slackUserId, { logger = console } = {}) {
+  const user = String(slackUserId || '').trim();
+  if (!client?.users?.info || !token || !user) return '';
+  try {
+    const res = await client.users.info({ token, user });
+    const tz = String(res?.user?.tz || '').trim();
+    return tz;
+  } catch (err) {
+    if (err?.data?.error === 'missing_scope') {
+      logger.warn(`Sales admin Slack timezone lookup skipped for ${user}: missing Slack scope users:read`);
+      return '';
+    }
+    logger.warn(`Sales admin Slack timezone lookup failed for ${user}: ${err.message}`);
+    return '';
+  }
+}
+
 class SalesAdminWorkflow {
   constructor({ app, hubspotRequest, anthropic, env = process.env, logger = console } = {}) {
     this.app = app;
@@ -1046,6 +1068,7 @@ class SalesAdminWorkflow {
     this.hubspot = new HubSpotSalesAdminClient({ hubspotRequest, portalId: this.config.portalId, logger });
     this.grain = new GrainClient({ token: this.config.grainToken, baseUrl: this.config.grainBaseUrl, logger });
     this.channelIdsByOwnerId = new Map();
+    this.slackTimeZonesByOwnerId = new Map();
     this.missingChannelsByOwnerId = new Set();
     this.inFlight = new Set();
   }
@@ -1069,10 +1092,21 @@ class SalesAdminWorkflow {
         }
         this.missingChannelsByOwnerId.delete(ae.hubspotOwnerId);
         this.channelIdsByOwnerId.set(ae.hubspotOwnerId, channelId);
+        const slackTimeZone = await resolveSlackUserTimeZone(this.app.client, this.env.SLACK_BOT_TOKEN, ae.slackUserId, { logger: this.logger });
+        if (slackTimeZone) this.slackTimeZonesByOwnerId.set(ae.hubspotOwnerId, slackTimeZone);
+        const resolvedTimeZone = this.timeZoneForAe(ae);
+        const timeZoneSource = slackTimeZone ? 'slack_profile' : (ae.timezone ? 'roster' : 'default');
+        const logPayload = { event: 'salesadmin_timezone_resolved', ae: ae.name, hubspotOwnerId: ae.hubspotOwnerId, timeZone: resolvedTimeZone, source: timeZoneSource };
+        if (timeZoneSource === 'default') this.logger.warn(JSON.stringify(logPayload));
+        else this.logger.log(JSON.stringify(logPayload));
       } catch (err) {
         this.logger.error(`Sales admin channel resolution failed for ${ae.name}: ${err.message}`);
       }
     }
+  }
+
+  timeZoneForAe(ae) {
+    return this.slackTimeZonesByOwnerId.get(ae.hubspotOwnerId) || rosterTimeZoneForAe(ae, this.config.timezone);
   }
 
   isAeChannelReady(ae) {
@@ -1115,7 +1149,7 @@ class SalesAdminWorkflow {
   }
 
   async meetingsForDayOffset(ae, now = new Date(), dayOffset = 0) {
-    const { start, end } = getLocalDayRange(now, this.config.timezone, dayOffset);
+    const { start, end } = getLocalDayRange(now, this.timeZoneForAe(ae), dayOffset);
     const meetings = await this.hubspot.searchMeetingsForOwnerBetween(ae.hubspotOwnerId, start, end);
     const enriched = await Promise.all(meetings.map(meeting => this.hubspot.attachAssociations(meeting)));
     const deduped = dedupeDigestMeetings(enriched);
@@ -1186,15 +1220,15 @@ class SalesAdminWorkflow {
     return this.meetingsForDayOffset(ae, now, 1);
   }
 
-  async runMorningSummaries(now = new Date()) {
+  async runMorningSummaries(now = new Date(), options = {}) {
     if (!this.isEnabled()) return { skipped: true, reason: 'disabled' };
-    if (isWeekendLocalDate(now, this.config.timezone)) {
-      return { posted: 0, skipped: this.config.roster.length, errors: 0, reason: 'weekend' };
-    }
-    return this.withLock('morning', async () => {
-      const { dateKey } = getLocalDayRange(now, this.config.timezone);
+    const roster = options.roster || this.config.roster;
+    return this.withLock(options.lockName || 'morning', async () => {
       const stats = { posted: 0, skipped: 0, errors: 0 };
-      for (const ae of this.config.roster) {
+      for (const ae of roster) {
+        const aeTimeZone = this.timeZoneForAe(ae);
+        if (isWeekendLocalDate(now, aeTimeZone)) { stats.skipped += 1; continue; }
+        const { dateKey } = getLocalDayRange(now, aeTimeZone);
         if (!this.isAeChannelReady(ae)) { stats.skipped += 1; continue; }
         const key = `morning:${dateKey}:${ae.hubspotOwnerId}`;
         if (this.state.has(key)) { stats.skipped += 1; continue; }
@@ -1207,13 +1241,13 @@ class SalesAdminWorkflow {
           for (const meeting of scheduled) {
             const prior = await this.hubspot.findPriorMeeting(meeting);
             const tips = await extractPriorTips({ anthropic: this.anthropic, priorMeeting: prior, logger: this.logger });
-            lines.push(`\n*${formatLocalTime(meeting.properties?.hs_meeting_start_time, this.config.timezone)} - ${meetingTitle(meeting)}*`);
+            lines.push(`\n*${formatLocalTime(meeting.properties?.hs_meeting_start_time, aeTimeZone)} - ${meetingTitle(meeting)}*`);
             lines.push(meetingLinks(this.hubspot, meeting));
             lines.push(`Tips: ${tips.map(tip => `• ${tip}`).join(' ')}`);
           }
           if (cancelled.length > 0) {
             lines.push('\n*Cancelled today, not yet separately alerted:*');
-            for (const meeting of cancelled) lines.push(`- ${formatLocalTime(meeting.properties?.hs_meeting_start_time, this.config.timezone)} - ${meetingTitle(meeting)}`);
+            for (const meeting of cancelled) lines.push(`- ${formatLocalTime(meeting.properties?.hs_meeting_start_time, aeTimeZone)} - ${meetingTitle(meeting)}`);
           }
           const posted = await this.safePostMessage(ae, { text: lines.join('\n') });
           this.state.set(key, { type: 'morning', ae, dateKey, slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), status: 'posted' });
@@ -1227,17 +1261,17 @@ class SalesAdminWorkflow {
     });
   }
 
-  async runTomorrowSummaries(now = new Date()) {
+  async runTomorrowSummaries(now = new Date(), options = {}) {
     if (!this.isEnabled()) return { skipped: true, reason: 'disabled' };
-    const targetDay = getLocalDayRange(now, this.config.timezone, 1);
-    if (isWeekendLocalDate(targetDay.start, this.config.timezone)) {
-      return { posted: 0, skipped: this.config.roster.length, errors: 0, reason: 'weekend_tomorrow', dateKey: targetDay.dateKey };
-    }
-    return this.withLock('tomorrow', async () => {
-      const { start, dateKey } = targetDay;
-      const dateLabel = formatLocalDate(start, this.config.timezone);
+    const roster = options.roster || this.config.roster;
+    return this.withLock(options.lockName || 'tomorrow', async () => {
       const stats = { posted: 0, skipped: 0, errors: 0 };
-      for (const ae of this.config.roster) {
+      for (const ae of roster) {
+        const aeTimeZone = this.timeZoneForAe(ae);
+        const targetDay = getLocalDayRange(now, aeTimeZone, 1);
+        if (isWeekendLocalDate(targetDay.start, aeTimeZone)) { stats.skipped += 1; continue; }
+        const { start, dateKey } = targetDay;
+        const dateLabel = formatLocalDate(start, aeTimeZone);
         if (!this.isAeChannelReady(ae)) { stats.skipped += 1; continue; }
         const key = `tomorrow:${dateKey}:${ae.hubspotOwnerId}`;
         if (this.state.has(key)) { stats.skipped += 1; continue; }
@@ -1254,12 +1288,12 @@ class SalesAdminWorkflow {
           } else {
             for (const meeting of scheduled) {
               const stageDecision = await this.buildStageDecisionForMeeting(meeting);
-              lines.push(`\n${tomorrowMeetingText({ hubspot: this.hubspot, meeting, timeZone: this.config.timezone, stageDecision })}`);
+              lines.push(`\n${tomorrowMeetingText({ hubspot: this.hubspot, meeting, timeZone: aeTimeZone, stageDecision })}`);
             }
           }
           if (cancelled.length > 0) {
             lines.push('\n*Cancelled tomorrow:*');
-            for (const meeting of cancelled) lines.push(`- ${formatLocalTime(meeting.properties?.hs_meeting_start_time, this.config.timezone)} — ${slackMrkdwn(meetingTitle(meeting))}`);
+            for (const meeting of cancelled) lines.push(`- ${formatLocalTime(meeting.properties?.hs_meeting_start_time, aeTimeZone)} — ${slackMrkdwn(meetingTitle(meeting))}`);
           }
           const posted = await this.safePostMessage(ae, { text: truncateText(lines.join('\n'), 39000) });
           this.state.set(key, { type: 'tomorrow', ae, dateKey, slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), status: 'posted' });
@@ -1282,6 +1316,7 @@ class SalesAdminWorkflow {
       for (const ae of this.config.roster) {
         if (!this.isAeChannelReady(ae)) { stats.skipped += 1; continue; }
         try {
+          const aeTimeZone = this.timeZoneForAe(ae);
           const meetings = await this.hubspot.searchRecentlyUpdatedMeetingsForOwner(ae.hubspotOwnerId, updatedSince, startAfter);
           for (const rawMeeting of meetings) {
             if (classifyMeetingStatus(rawMeeting) !== 'cancelled') continue;
@@ -1291,7 +1326,7 @@ class SalesAdminWorkflow {
             const source = cancellationSourceLabel(meeting);
             const text = [
               `:warning: <@${ae.slackUserId}> meeting cancelled: *${meetingTitle(meeting)}*`,
-              `Original time: ${formatLocalDateTime(meeting.properties?.hs_meeting_start_time, this.config.timezone)}`,
+              `Original time: ${formatLocalDateTime(meeting.properties?.hs_meeting_start_time, aeTimeZone)}`,
               `Source: ${source}`,
               hubspotDealLine(this.hubspot, meeting),
               meetingLinks(this.hubspot, meeting),
@@ -1708,6 +1743,16 @@ function msUntilNextLocalTime({ now = new Date(), timeZone, hour, minute }) {
   return target.getTime() - now.getTime();
 }
 
+function rosterByScheduledTimeZone(workflow) {
+  const groups = new Map();
+  for (const ae of workflow.config.roster) {
+    const timeZone = workflow.timeZoneForAe(ae);
+    if (!groups.has(timeZone)) groups.set(timeZone, []);
+    groups.get(timeZone).push(ae);
+  }
+  return groups;
+}
+
 function scheduleSalesAdminWorkflow(workflow) {
   if (!workflow.isEnabled()) {
     workflow.logger.log('  Sales admin: disabled');
@@ -1719,24 +1764,28 @@ function scheduleSalesAdminWorkflow(workflow) {
   const timers = [];
   // unref so these timers never keep the process alive on their own.
   const track = (timer) => { if (timer && typeof timer.unref === 'function') timer.unref(); timers.push(timer); return timer; };
-  const scheduleMorning = () => {
-    const delay = msUntilNextLocalTime({ timeZone: workflow.config.timezone, hour: workflow.config.morningHour, minute: workflow.config.morningMinute });
+  // Timezone groups are fixed at startup. Slack profile timezone changes require
+  // a process restart before the daily timers move to the new timezone.
+  const scheduleMorning = (timeZone, roster) => {
+    const delay = msUntilNextLocalTime({ timeZone, hour: workflow.config.morningHour, minute: workflow.config.morningMinute });
     track(setTimeout(async () => {
-      await workflow.runMorningSummaries().catch(err => workflow.logger.error(`Sales admin morning scheduled run failed: ${err.message}`));
-      scheduleMorning();
+      await workflow.runMorningSummaries(new Date(), { roster, lockName: `morning:${timeZone}` }).catch(err => workflow.logger.error(`Sales admin morning scheduled run failed for ${timeZone}: ${err.message}`));
+      scheduleMorning(timeZone, roster);
     }, delay));
-    workflow.logger.log(`  Sales admin morning scheduled in ${Math.round(delay / 60000)} min`);
+    workflow.logger.log(`  Sales admin morning scheduled for ${timeZone} in ${Math.round(delay / 60000)} min`);
   };
-  scheduleMorning();
-  const scheduleTomorrow = () => {
-    const delay = msUntilNextLocalTime({ timeZone: workflow.config.timezone, hour: workflow.config.tomorrowHour, minute: workflow.config.tomorrowMinute });
+  const scheduleTomorrow = (timeZone, roster) => {
+    const delay = msUntilNextLocalTime({ timeZone, hour: workflow.config.tomorrowHour, minute: workflow.config.tomorrowMinute });
     track(setTimeout(async () => {
-      await workflow.runTomorrowSummaries().catch(err => workflow.logger.error(`Sales admin tomorrow scheduled run failed: ${err.message}`));
-      scheduleTomorrow();
+      await workflow.runTomorrowSummaries(new Date(), { roster, lockName: `tomorrow:${timeZone}` }).catch(err => workflow.logger.error(`Sales admin tomorrow scheduled run failed for ${timeZone}: ${err.message}`));
+      scheduleTomorrow(timeZone, roster);
     }, delay));
-    workflow.logger.log(`  Sales admin tomorrow summary scheduled in ${Math.round(delay / 60000)} min`);
+    workflow.logger.log(`  Sales admin tomorrow summary scheduled for ${timeZone} in ${Math.round(delay / 60000)} min`);
   };
-  scheduleTomorrow();
+  for (const [timeZone, roster] of rosterByScheduledTimeZone(workflow)) {
+    scheduleMorning(timeZone, roster);
+    scheduleTomorrow(timeZone, roster);
+  }
   // Self-rescheduling scans: the next run is only queued AFTER the current one settles,
   // so a slow scan can never overlap/stack (which would starve this process).
   const scheduleScan = (run, intervalMs, label) => {
@@ -1774,6 +1823,9 @@ module.exports = {
   parseRoster,
   recordingDirectlyMatchesMeeting,
   resolveChannelId,
+  resolveSlackUserTimeZone,
+  rosterByScheduledTimeZone,
   selectedStageFromInteraction,
   scheduleSalesAdminWorkflow,
+  rosterTimeZoneForAe,
 };

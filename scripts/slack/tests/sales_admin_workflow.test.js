@@ -19,6 +19,9 @@ const {
   parseRoster,
   recordingDirectlyMatchesMeeting,
   resolveChannelId,
+  resolveSlackUserTimeZone,
+  rosterByScheduledTimeZone,
+  rosterTimeZoneForAe,
   selectedStageFromInteraction,
 } = require('../sales_admin/workflow');
 const { createSalesAdminState } = require('../sales_admin/state');
@@ -314,8 +317,15 @@ test('sales admin createNote associates to contacts/companies/deals, never the m
 
 test('sales admin roster requires channel, Slack user, and HubSpot owner', () => {
   const roster = parseRoster(JSON.stringify([{ name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: '#gtm-salesadmin-alex' }]));
-  assert.deepEqual(roster, [{ name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' }]);
+  assert.deepEqual(roster, [{ name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex', timezone: '' }]);
   assert.throws(() => parseRoster(JSON.stringify([{ name: 'Missing Channel', hubspotOwnerId: '1', email: 'a@example.com', slackUserId: 'U1' }])), /salesAdminChannel/);
+});
+
+test('sales admin roster supports per-AE timezone fallback and defaults Sarah to Eastern', () => {
+  const roster = parseRoster(JSON.stringify([{ name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: '#gtm-salesadmin-alex', time_zone: 'America/Denver' }]));
+  assert.equal(roster[0].timezone, 'America/Denver');
+  const sarah = DEFAULT_AE_ROSTER.find(ae => ae.email === 'sarah@trytruewind.com');
+  assert.equal(rosterTimeZoneForAe(sarah, 'America/Los_Angeles'), 'America/New_York');
 });
 
 test('sales admin default roster includes confirmed Alex and Amy IDs', () => {
@@ -324,6 +334,24 @@ test('sales admin default roster includes confirmed Alex and Amy IDs', () => {
   assert.equal(byName['Alex Lee'].slackUserId, 'U04BPMPR29G');
   assert.equal(byName['Amy Vetter'].hubspotOwnerId, '92555980');
   assert.equal(byName['Amy Vetter'].slackUserId, 'U0B4MRN83FE');
+});
+
+test('sales admin resolves Slack profile timezone when users.info is available', async () => {
+  const client = { users: { info: async ({ user }) => ({ user: { id: user, tz: 'America/New_York' } }) } };
+  const tz = await resolveSlackUserTimeZone(client, 'xoxb-test', 'U09QC3B292R', { logger: { warn() {} } });
+  assert.equal(tz, 'America/New_York');
+});
+
+test('sales admin timezone lookup degrades cleanly without Slack scope', async () => {
+  const client = { users: { info: async () => {
+    const err = new Error('missing_scope');
+    err.data = { error: 'missing_scope' };
+    throw err;
+  } } };
+  const warnings = [];
+  const tz = await resolveSlackUserTimeZone(client, 'xoxb-test', 'U09QC3B292R', { logger: { warn: msg => warnings.push(msg) } });
+  assert.equal(tz, '');
+  assert.match(warnings[0], /users:read/);
 });
 
 
@@ -411,6 +439,58 @@ test('sales admin next local time schedules tomorrow after target', () => {
   assert.equal(delay, 23 * 60 * 60 * 1000);
 });
 
+test('sales admin next local time uses target IANA timezone, not host timezone', () => {
+  const delay = msUntilNextLocalTime({ now: new Date('2026-06-03T11:30:00.000Z'), timeZone: 'America/New_York', hour: 8, minute: 0 });
+  assert.equal(delay, 30 * 60 * 1000);
+});
+
+test('sales admin scheduler groups AEs by resolved Slack timezone', () => {
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => ({ ts: '1', channel: payload.channel }) } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+        { name: 'Xavier Marco', hubspotOwnerId: '89305622', email: 'xavier@trytruewind.com', slackUserId: 'U0AKMHVCJMA', salesAdminChannel: 'gtm-salesadmin-xavier' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-tz-group-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.slackTimeZonesByOwnerId.set('84547076', 'America/New_York');
+
+  const groups = rosterByScheduledTimeZone(workflow);
+
+  assert.deepEqual(groups.get('America/New_York').map(ae => ae.name), ['Sarah Elix']);
+  assert.deepEqual(groups.get('America/Los_Angeles').map(ae => ae.name), ['Xavier Marco']);
+});
+
+test('sales admin scheduler prefers cached Slack timezone over roster fallback', () => {
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => ({ ts: '1', channel: payload.channel }) } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah', timezone: 'America/Los_Angeles' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-tz-cache-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.slackTimeZonesByOwnerId.set('84547076', 'America/New_York');
+
+  const groups = rosterByScheduledTimeZone(workflow);
+
+  assert.equal(workflow.timeZoneForAe(workflow.config.roster[0]), 'America/New_York');
+  assert.deepEqual([...groups.keys()], ['America/New_York']);
+});
+
 test('sales admin morning summaries skip Saturday and Sunday', async () => {
   const posts = [];
   const workflow = new SalesAdminWorkflow({
@@ -435,10 +515,10 @@ test('sales admin morning summaries skip Saturday and Sunday', async () => {
   const saturday = await workflow.runMorningSummaries(new Date('2026-06-06T16:00:00.000Z'));
   const sunday = await workflow.runMorningSummaries(new Date('2026-06-07T16:00:00.000Z'));
 
-  assert.equal(saturday.reason, 'weekend');
-  assert.equal(sunday.reason, 'weekend');
   assert.equal(saturday.posted, 0);
+  assert.equal(saturday.skipped, 1);
   assert.equal(sunday.posted, 0);
+  assert.equal(sunday.skipped, 1);
   assert.equal(posts.length, 0);
 });
 
@@ -476,10 +556,10 @@ test('sales admin tomorrow summaries skip weekend targets but send Sunday for Mo
   const saturday = await workflow.runTomorrowSummaries(new Date('2026-06-07T00:30:00.000Z'));
   const sunday = await workflow.runTomorrowSummaries(new Date('2026-06-08T00:30:00.000Z'));
 
-  assert.equal(friday.reason, 'weekend_tomorrow');
-  assert.equal(friday.dateKey, '2026-06-06');
-  assert.equal(saturday.reason, 'weekend_tomorrow');
-  assert.equal(saturday.dateKey, '2026-06-07');
+  assert.equal(friday.posted, 0);
+  assert.equal(friday.skipped, 1);
+  assert.equal(saturday.posted, 0);
+  assert.equal(saturday.skipped, 1);
   assert.equal(sunday.posted, 1);
   assert.equal(fetches, 1);
   assert.equal(posts.length, 1);

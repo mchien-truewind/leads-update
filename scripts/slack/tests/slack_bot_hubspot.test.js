@@ -53,6 +53,10 @@ const {
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
   redactedToolInputForLog,
+  mergeSlackThreadMessages,
+  sanitizeLogValue,
+  slackTextMentionsUser,
+  markEditedMentionSeen,
   resolveDealHubSpotOwner,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
@@ -589,6 +593,100 @@ function testRecruitingCalendarInviteBuilderAndAuthorization() {
   assert.doesNotMatch(logged, /candidate@example\.com|Casey Candidate|interviewer@example\.com/);
   assert.match(logged, /2026-05-28T14:00:00-07:00/);
   assert.match(logged, /redacted/);
+}
+
+function testMergeSlackThreadMessagesPreservesLeadingBotContext() {
+  const merged = mergeSlackThreadMessages([
+    {
+      role: 'assistant',
+      content: 'New DEMO Meeting Booked\nPamela Szajnuk\n- Company: County Commissioners\n- Event: Intro to Truewind',
+    },
+    {
+      role: 'assistant',
+      content: 'Calendly call booked\n- Company: CCAP\n- Scheduled: Oct 14 at 10:30 AM',
+    },
+    {
+      role: 'user',
+      content: "what's the source for this?",
+    },
+  ]);
+
+  assert.strictEqual(merged.length, 1);
+  assert.strictEqual(merged[0].role, 'user');
+  assert.match(merged[0].content, /Prior Slack thread context/);
+  assert.match(merged[0].content, /New DEMO Meeting Booked/);
+  assert.match(merged[0].content, /Calendly call booked/);
+  assert.match(merged[0].content, /Current user message/);
+  assert.match(merged[0].content, /what's the source for this\?/);
+}
+
+function testMergeSlackThreadMessagesKeepsNormalConversationShape() {
+  const merged = mergeSlackThreadMessages([
+    { role: 'user', content: 'find the SF deal' },
+    { role: 'assistant', content: 'Which SF deal?' },
+    { role: 'user', content: 'SF Superior Court' },
+  ]);
+
+  assert.deepStrictEqual(merged, [
+    { role: 'user', content: 'find the SF deal' },
+    { role: 'assistant', content: 'Which SF deal?' },
+    { role: 'user', content: 'SF Superior Court' },
+  ]);
+}
+
+function testMergeSlackThreadMessagesSynthesizesUserForBotOnlyContext() {
+  const merged = mergeSlackThreadMessages([
+    { role: 'assistant', content: 'New DEMO Meeting Booked' },
+    { role: 'assistant', content: 'Calendly call booked' },
+  ]);
+
+  assert.strictEqual(merged.length, 1);
+  assert.strictEqual(merged[0].role, 'user');
+  assert.match(merged[0].content, /New DEMO Meeting Booked/);
+  assert.match(merged[0].content, /Calendly call booked/);
+}
+
+function testMergeSlackThreadMessagesMaintainsAlternationAfterFolding() {
+  const merged = mergeSlackThreadMessages([
+    { role: 'assistant', content: 'New DEMO Meeting Booked' },
+    { role: 'user', content: 'what source?' },
+    { role: 'assistant', content: 'I think Calendly' },
+    { role: 'assistant', content: 'Also the event says Intro to Truewind' },
+    { role: 'user', content: 'which company?' },
+  ]);
+
+  assert.deepStrictEqual(
+    merged.map(message => message.role),
+    ['user', 'assistant', 'user'],
+  );
+  assert.match(merged[0].content, /Prior Slack thread context/);
+  assert.match(merged[0].content, /what source\?/);
+  assert.match(merged[1].content, /I think Calendly/);
+  assert.match(merged[1].content, /Also the event says Intro to Truewind/);
+}
+
+function testSanitizeLogValueRedactsTokenLikeValues() {
+  const sanitized = sanitizeLogValue('failed with xoxb-123-secret and xapp-abc-secret and sk-ant-api03-secret Bearer abc.def');
+  assert.doesNotMatch(sanitized, /xoxb-123-secret|xapp-abc-secret|sk-ant-api03-secret|Bearer abc\.def/);
+  assert.match(sanitized, /redacted-slack-token/);
+  assert.match(sanitized, /redacted-slack-app-token/);
+  assert.match(sanitized, /redacted-anthropic-key/);
+  assert.match(sanitized, /Bearer \[redacted-token\]/);
+}
+
+function testEditedMentionHelpersDetectOnlyTargetBotMention() {
+  assert.strictEqual(slackTextMentionsUser('cc <@U_BOT>', 'U_BOT'), true);
+  assert.strictEqual(slackTextMentionsUser('cc <@U_OTHER>', 'U_BOT'), false);
+  assert.strictEqual(slackTextMentionsUser('cc @mercedes-claude', 'U_BOT'), false);
+  assert.strictEqual(slackTextMentionsUser('', 'U_BOT'), false);
+  assert.strictEqual(slackTextMentionsUser('cc <@U_BOT>', ''), false);
+}
+
+function testEditedMentionDedupeAllowsOnlyNewEditEvents() {
+  assert.strictEqual(markEditedMentionSeen('C_TEST', '1770000000.000100', '1770000001.000100', 1000), true);
+  assert.strictEqual(markEditedMentionSeen('C_TEST', '1770000000.000100', '1770000001.000100', 2000), false);
+  assert.strictEqual(markEditedMentionSeen('C_TEST', '1770000000.000100', '1770000002.000100', 3000), true);
+  assert.strictEqual(markEditedMentionSeen('C_TEST', '1770000000.000100', '1770000001.000100', 10 * 60 * 1000 + 5000), true);
 }
 
 async function testRecruitingCalendarInviteExecuteToolAuthAndIdempotency() {
@@ -1500,6 +1598,13 @@ async function run() {
   testDuplicateOverrideKeyword();
   await testCreateDealToolBlocksOpenDuplicate();
   testDealNotesPromptAndTools();
+  testMergeSlackThreadMessagesPreservesLeadingBotContext();
+  testMergeSlackThreadMessagesKeepsNormalConversationShape();
+  testMergeSlackThreadMessagesSynthesizesUserForBotOnlyContext();
+  testMergeSlackThreadMessagesMaintainsAlternationAfterFolding();
+  testSanitizeLogValueRedactsTokenLikeValues();
+  testEditedMentionHelpersDetectOnlyTargetBotMention();
+  testEditedMentionDedupeAllowsOnlyNewEditEvents();
   testRecruitingAtsToolRegistrationAndPrompt();
   testRecruitingNotionPropertyHelpers();
   testRecruitingCalendarInviteBuilderAndAuthorization();

@@ -17,7 +17,9 @@ const PROJECTS = [
     name: 'Truewind Slack bot',
     services: [
       { id: '295937c7-9787-4918-b0ee-a10ecb444bc4', name: 'gmail-triage-worker' },
+      { id: '8208df57-5e7e-43d2-b839-44d3a7652427', name: 'gtm-ops' },
       { id: '600dc5b7-e5f2-4399-8eac-4b596c84f56e', name: 'leads-update' },
+      { id: 'de1aa05e-b712-4d71-ac50-93b94af210e1', name: 'leads-update-bot' },
     ],
   },
 ];

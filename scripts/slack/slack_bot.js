@@ -244,6 +244,8 @@ const DEFAULT_RECRUITING_CALENDAR_SLACK_USER_ID = (
   || process.env.SLACK_USER_ID
   || 'U0ABULY5TEK'
 ).trim();
+const editedMentionEventsSeen = new Map();
+let slackBotUserIdPromise = null;
 
 function createSlackApp() {
   if (require.main !== module) {
@@ -260,6 +262,38 @@ function createSlackApp() {
     socketMode: true,
     appToken: process.env.SLACK_APP_TOKEN,
   });
+}
+
+async function getSlackBotUserId() {
+  if (process.env.SLACK_BOT_USER_ID) return process.env.SLACK_BOT_USER_ID.trim();
+  if (!slackBotUserIdPromise) {
+    slackBotUserIdPromise = app.client.auth.test({ token: process.env.SLACK_BOT_TOKEN })
+      .then((result) => String(result.user_id || '').trim())
+      .catch((err) => {
+        console.error(`Could not resolve Slack bot user ID: ${sanitizeLogValue(err.message)}`);
+        return '';
+      });
+  }
+  return slackBotUserIdPromise;
+}
+
+function slackTextMentionsUser(text, slackUserId) {
+  return Boolean(slackUserId) && String(text || '').includes(`<@${slackUserId}>`);
+}
+
+function pruneEditedMentionDedupe(now = Date.now()) {
+  const ttlMs = 10 * 60 * 1000;
+  for (const [key, seenAt] of editedMentionEventsSeen.entries()) {
+    if (now - seenAt > ttlMs) editedMentionEventsSeen.delete(key);
+  }
+}
+
+function markEditedMentionSeen(channel, messageTs, editedTs = '', now = Date.now()) {
+  pruneEditedMentionDedupe(now);
+  const key = `${channel}:${messageTs}:${editedTs}`;
+  if (editedMentionEventsSeen.has(key)) return false;
+  editedMentionEventsSeen.set(key, now);
+  return true;
 }
 
 async function hubspotRequest(endpoint, method = 'GET', body = null) {
@@ -3942,6 +3976,22 @@ function stripMention(text) {
   return text.replace(/<@[A-Z0-9]+>/g, '').trim();
 }
 
+function sanitizeLogValue(value) {
+  return String(value || '')
+    .replace(/xox[abprs]-[A-Za-z0-9-]+/g, '[redacted-slack-token]')
+    .replace(/xapp-[A-Za-z0-9-]+/g, '[redacted-slack-app-token]')
+    .replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted-anthropic-key]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [redacted-token]');
+}
+
+function logSlackMessageLifecycle(stage, fields = {}) {
+  console.log(JSON.stringify({
+    event: 'slack_message_lifecycle',
+    stage,
+    ...fields,
+  }));
+}
+
 const slackUserProfileCache = new Map();
 
 // Resolve a Slack user ID to their profile (email + display name). Cached for the
@@ -3999,6 +4049,14 @@ async function fetchThreadHistory(channel, threadTs, isThread) {
             messages.push({ role: 'user', content });
           }
         }
+        logSlackMessageLifecycle('history_fetched', {
+          channel,
+          thread_ts: threadTs,
+          is_thread: true,
+          message_count: messages.length,
+          raw_message_count: result.messages.length,
+          parent_ts: parentTs,
+        });
         return { messages, parentTs };
       } else {
         const result = await app.client.conversations.history({ token, channel, limit: 20 });
@@ -4016,18 +4074,38 @@ async function fetchThreadHistory(channel, threadTs, isThread) {
             messages.push({ role: 'user', content });
           }
         }
+        logSlackMessageLifecycle('history_fetched', {
+          channel,
+          thread_ts: threadTs,
+          is_thread: false,
+          message_count: messages.length,
+          raw_message_count: result.messages.length,
+          parent_ts: null,
+        });
         return { messages, parentTs: null };
       }
     } catch (err) {
-      console.error(`Error fetching history (token=${token.slice(0,8)}...): ${err.message}`);
+      const errorMessage = sanitizeLogValue(err.message);
+      console.error(`Error fetching history (token=${token.slice(0,8)}...): ${errorMessage}`);
+      logSlackMessageLifecycle('history_fetch_error', {
+        channel,
+        thread_ts: threadTs,
+        is_thread: isThread,
+        error: errorMessage,
+      });
       continue;
     }
   }
   console.error('All tokens failed to fetch history');
+  logSlackMessageLifecycle('history_fetch_failed', {
+    channel,
+    thread_ts: threadTs,
+    is_thread: isThread,
+  });
   return { messages: [], parentTs: null };
 }
 
-function mergeMessages(messages) {
+function coalesceConsecutiveMessages(messages) {
   const merged = [];
   for (const msg of messages) {
     if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
@@ -4036,7 +4114,33 @@ function mergeMessages(messages) {
       merged.push({ ...msg });
     }
   }
+  return merged;
+}
+
+function mergeMessages(messages) {
+  const merged = coalesceConsecutiveMessages(messages);
   if (merged.length > 0 && merged[0].role !== 'user') merged.shift();
+  if (merged.length > 0 && merged[merged.length - 1].role !== 'user') merged.pop();
+  return merged;
+}
+
+function mergeSlackThreadMessages(messages) {
+  const merged = coalesceConsecutiveMessages(messages);
+  const leadingContext = [];
+
+  while (merged.length > 0 && merged[0].role !== 'user') {
+    leadingContext.push(merged.shift().content);
+  }
+
+  if (leadingContext.length > 0) {
+    const context = `Prior Slack thread context from earlier bot messages:\n${leadingContext.join('\n\n')}`;
+    if (merged.length > 0) {
+      merged[0].content = `${context}\n\nCurrent user message:\n${merged[0].content}`;
+    } else {
+      merged.push({ role: 'user', content: context });
+    }
+  }
+
   if (merged.length > 0 && merged[merged.length - 1].role !== 'user') merged.pop();
   return merged;
 }
@@ -4072,6 +4176,13 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
   if (!cleanText) return;
 
   console.log(`handleMessage: channel=${channel}, threadTs=${threadTs}, isThread=${isThread}, text_chars=${cleanText.length}`);
+  logSlackMessageLifecycle('received', {
+    channel,
+    thread_ts: threadTs,
+    is_thread: isThread,
+    text_chars: cleanText.length,
+    has_slack_user: Boolean(slackUserId),
+  });
 
   const structuredDeal = parseStructuredDealRequest(cleanText);
   if (structuredDeal) {
@@ -4087,10 +4198,20 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
         blocks: buildDealSourceSelectBlocks(requestId, dealSourceOptions),
         thread_ts: threadTs,
       });
+      logSlackMessageLifecycle('structured_deal_missing_source', {
+        channel,
+        thread_ts: threadTs,
+      });
       return;
     }
     const reply = await runStructuredDealCreateWorkflow(structuredDeal);
     await say({ text: reply, thread_ts: threadTs });
+    logSlackMessageLifecycle('reply_posted', {
+      channel,
+      thread_ts: threadTs,
+      path: 'structured_deal',
+      reply_chars: reply.length,
+    });
     return;
   }
 
@@ -4103,10 +4224,24 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
   if (messages.length === 0) {
     messages = [{ role: 'user', content: cleanText }];
   }
-  messages = mergeMessages(messages);
+  const roleCountsBeforeMerge = messages.reduce((counts, message) => {
+    counts[message.role] = (counts[message.role] || 0) + 1;
+    return counts;
+  }, {});
+  messages = mergeSlackThreadMessages(messages);
   if (messages.length === 0) {
     messages = [{ role: 'user', content: cleanText }];
   }
+  logSlackMessageLifecycle('context_prepared', {
+    channel,
+    thread_ts: threadTs,
+    parent_ts: parentTs,
+    is_thread: isThread,
+    messages: messages.length,
+    role_counts_before_merge: roleCountsBeforeMerge,
+    first_role: messages[0]?.role || '',
+    last_role: messages[messages.length - 1]?.role || '',
+  });
 
   // Use the actual parent message timestamp for the date, not the reply timestamp
   const threadDate = new Date(parseFloat(parentTs) * 1000).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
@@ -4116,6 +4251,14 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
 
   const selectedModel = selectClaudeModelForMessages(messages);
   console.log(`Claude model selected: ${selectedModel.model} tier=${selectedModel.tier} reason=${selectedModel.reason}`);
+  logSlackMessageLifecycle('model_selected', {
+    channel,
+    thread_ts: threadTs,
+    parent_ts: parentTs,
+    model: selectedModel.model,
+    tier: selectedModel.tier,
+    reason: selectedModel.reason,
+  });
 
   // Call Claude with transient-error retries (see withRetry).
   // The cache_control breakpoint on the system block caches the whole static
@@ -4140,6 +4283,12 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
 
       for (const block of toolUseBlocks) {
         console.log(`Tool call: ${block.name}(${redactedToolInputForLog(block.name, block.input)})`);
+        logSlackMessageLifecycle('tool_call', {
+          channel,
+          thread_ts: threadTs,
+          parent_ts: parentTs,
+          tool: block.name,
+        });
         const result = await executeTool(block.name, block.input, {
           channel_id: channel,
           slack_user_id: slackUserId,
@@ -4161,9 +4310,23 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
     const textBlock = response.content.find((b) => b.type === 'text');
     const reply = textBlock ? textBlock.text : '(No response)';
     await say({ text: reply, thread_ts: threadTs });
+    logSlackMessageLifecycle('reply_posted', {
+      channel,
+      thread_ts: threadTs,
+      parent_ts: parentTs,
+      path: 'claude',
+      reply_chars: reply.length,
+    });
   } catch (err) {
-    console.error('Claude API error:', err.message);
-    await say({ text: `Error: Claude request failed: ${err.message}. No action completed by this response.`, thread_ts: threadTs });
+    const errorMessage = sanitizeLogValue(err.message);
+    console.error('Claude API error:', errorMessage);
+    logSlackMessageLifecycle('handler_error', {
+      channel,
+      thread_ts: threadTs,
+      parent_ts: parentTs,
+      error: errorMessage,
+    });
+    await say({ text: `Error: Claude request failed: ${errorMessage}. No action completed by this response.`, thread_ts: threadTs });
   }
 }
 
@@ -4222,11 +4385,51 @@ app.event('app_mention', async ({ event, say }) => {
   const isThread = !!event.thread_ts;
   const threadTs = event.thread_ts || event.ts;
   console.log(`app_mention: thread_ts=${event.thread_ts}, ts=${event.ts}, isThread=${isThread}`);
+  logSlackMessageLifecycle('app_mention_received', {
+    channel: event.channel,
+    thread_ts: threadTs,
+    event_ts: event.ts,
+    is_thread: isThread,
+    has_user: Boolean(event.user),
+  });
   await handleMessage(event.text, threadTs, event.channel, isThread, say, event.user || '');
 });
 
+async function handleEditedMessageMention(event, say) {
+  const message = event.message || {};
+  const previous = event.previous_message || {};
+  const channel = event.channel || message.channel;
+  const messageTs = message.ts || event.message_ts || event.ts;
+  const editedTs = message.edited?.ts || event.event_ts || '';
+  const text = message.text || '';
+  if (!channel || !messageTs || !text || message.bot_id || message.subtype === 'bot_message') return;
+  if (typeof previous.text !== 'string') return;
+
+  const botUserId = await getSlackBotUserId();
+  if (!botUserId) return;
+  if (message.user === botUserId) return;
+  if (!slackTextMentionsUser(text, botUserId)) return;
+  if (slackTextMentionsUser(previous.text || '', botUserId)) return;
+  if (!markEditedMentionSeen(channel, messageTs, editedTs)) return;
+
+  const isThread = !!message.thread_ts;
+  const threadTs = message.thread_ts || message.ts;
+  logSlackMessageLifecycle('edited_app_mention_received', {
+    channel,
+    thread_ts: threadTs,
+    message_ts: messageTs,
+    is_thread: isThread,
+    has_user: Boolean(message.user),
+  });
+  await handleMessage(text, threadTs, channel, isThread, say, message.user || event.user || '');
+}
+
 // Respond to DMs
 app.event('message', async ({ event, say }) => {
+  if (event.subtype === 'message_changed') {
+    await handleEditedMessageMention(event, say);
+    return;
+  }
   if (event.channel_type !== 'im') return;
   if (event.bot_id || event.subtype) return;
   const isThread = !!event.thread_ts;
@@ -5562,13 +5765,21 @@ function startHttpServer() {
 function startConnectionWatchdog(app, {
   intervalMs = Number(process.env.SLACK_WATCHDOG_INTERVAL_MS || 30000),
   maxFailures = Number(process.env.SLACK_WATCHDOG_MAX_FAILURES || 5),
+  maxDisconnectedMs = Number(process.env.SLACK_WATCHDOG_MAX_DISCONNECTED_MS || 120000),
 } = {}) {
+  let socketState = 'connected';
+  let socketStateChangedAt = Date.now();
+  let lastSocketConnectedAt = Date.now();
+
   // Best-effort: surface raw socket lifecycle so we can confirm/diagnose flapping.
   try {
     const socketClient = app.receiver?.client;
     if (socketClient && typeof socketClient.on === 'function') {
       for (const evt of ['disconnected', 'connecting', 'reconnecting', 'connected', 'error']) {
         socketClient.on(evt, (info) => {
+          socketState = evt;
+          socketStateChangedAt = Date.now();
+          if (evt === 'connected') lastSocketConnectedAt = socketStateChangedAt;
           console.log(JSON.stringify({
             event: 'slack_socket_lifecycle',
             state: evt,
@@ -5583,6 +5794,19 @@ function startConnectionWatchdog(app, {
 
   let consecutiveFailures = 0;
   const timer = setInterval(async () => {
+    const now = Date.now();
+    const disconnectedForMs = socketState === 'connected' ? 0 : now - socketStateChangedAt;
+    if (disconnectedForMs >= maxDisconnectedMs) {
+      console.log(JSON.stringify({
+        event: 'slack_watchdog_exit',
+        reason: 'socket mode disconnected too long; exiting so Railway restarts a fresh process',
+        socket_state: socketState,
+        disconnected_for_ms: disconnectedForMs,
+        last_connected_at: new Date(lastSocketConnectedAt).toISOString(),
+      }));
+      process.exit(1);
+    }
+
     try {
       await app.client.auth.test();
       consecutiveFailures = 0;
@@ -5734,6 +5958,10 @@ module.exports = {
   parseProgressDealSourceProperty,
   postMqlDiscoveryReport,
   redactedToolInputForLog,
+  mergeSlackThreadMessages,
+  sanitizeLogValue,
+  slackTextMentionsUser,
+  markEditedMentionSeen,
   resolveDealHubSpotOwner,
   resolveProspectWorkflowOwner,
   runLeadStatusSyncForSlack,

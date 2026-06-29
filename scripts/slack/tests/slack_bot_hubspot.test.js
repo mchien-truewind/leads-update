@@ -1,4 +1,6 @@
 const assert = require('assert');
+const crypto = require('crypto');
+const http = require('http');
 
 process.env.SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || 'xoxb-test';
 process.env.SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET || 'test-secret';
@@ -57,12 +59,17 @@ const {
   sanitizeLogValue,
   slackTextMentionsUser,
   markEditedMentionSeen,
+  markSlackHttpEventSeen,
+  normalizeSlackHttpEvent,
+  verifySlackRequestSignature,
   resolveDealHubSpotOwner,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
+  resolveSlackEventTransport,
   resolveProspectWorkflowOwner,
   matchingActivityKeywords,
   runStructuredDealCreateWorkflow,
+  startHttpServer,
   summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
 } = require('../slack_bot');
@@ -285,14 +292,25 @@ function testDynamicOwnerMatchByEmailAndName() {
 
 function testResolveBotRoles() {
   // Default / unknown → legacy single-process behavior (socket + worker).
-  assert.deepStrictEqual(resolveBotRoles(undefined), { role: 'all', runsSocket: true, runsWorker: true });
-  assert.deepStrictEqual(resolveBotRoles('all'), { role: 'all', runsSocket: true, runsWorker: true });
-  assert.deepStrictEqual(resolveBotRoles('nonsense'), { role: 'all', runsSocket: true, runsWorker: true });
+  assert.deepStrictEqual(resolveBotRoles(undefined), { role: 'all', eventTransport: 'socket', runsSocket: true, runsWorker: true });
+  assert.deepStrictEqual(resolveBotRoles('all'), { role: 'all', eventTransport: 'socket', runsSocket: true, runsWorker: true });
+  assert.deepStrictEqual(resolveBotRoles('nonsense'), { role: 'all', eventTransport: 'socket', runsSocket: true, runsWorker: true });
   // Dedicated interactive bot: socket only, no scheduled jobs.
-  assert.deepStrictEqual(resolveBotRoles('bot'), { role: 'bot', runsSocket: true, runsWorker: false });
-  assert.deepStrictEqual(resolveBotRoles(' BOT '), { role: 'bot', runsSocket: true, runsWorker: false });
+  assert.deepStrictEqual(resolveBotRoles('bot'), { role: 'bot', eventTransport: 'socket', runsSocket: true, runsWorker: false });
+  assert.deepStrictEqual(resolveBotRoles(' BOT '), { role: 'bot', eventTransport: 'socket', runsSocket: true, runsWorker: false });
   // Dedicated worker: crons + webhooks, no socket.
-  assert.deepStrictEqual(resolveBotRoles('worker'), { role: 'worker', runsSocket: false, runsWorker: true });
+  assert.deepStrictEqual(resolveBotRoles('worker'), { role: 'worker', eventTransport: 'socket', runsSocket: false, runsWorker: true });
+  // HTTP cutover mode disables Socket Mode even in roles that would normally run it.
+  assert.deepStrictEqual(resolveBotRoles('bot', 'http'), { role: 'bot', eventTransport: 'http', runsSocket: false, runsWorker: false });
+  assert.deepStrictEqual(resolveBotRoles('worker', 'http'), { role: 'worker', eventTransport: 'http', runsSocket: false, runsWorker: true });
+  assert.deepStrictEqual(resolveBotRoles('all', 'dual'), { role: 'all', eventTransport: 'dual', runsSocket: true, runsWorker: true });
+}
+
+function testResolveSlackEventTransport() {
+  assert.strictEqual(resolveSlackEventTransport(undefined), 'socket');
+  assert.strictEqual(resolveSlackEventTransport(' HTTP '), 'http');
+  assert.strictEqual(resolveSlackEventTransport('dual'), 'dual');
+  assert.strictEqual(resolveSlackEventTransport('nonsense'), 'socket');
 }
 
 function testSanitizeTokenStripsWhitespace() {
@@ -687,6 +705,191 @@ function testEditedMentionDedupeAllowsOnlyNewEditEvents() {
   assert.strictEqual(markEditedMentionSeen('C_TEST', '1770000000.000100', '1770000001.000100', 2000), false);
   assert.strictEqual(markEditedMentionSeen('C_TEST', '1770000000.000100', '1770000002.000100', 3000), true);
   assert.strictEqual(markEditedMentionSeen('C_TEST', '1770000000.000100', '1770000001.000100', 10 * 60 * 1000 + 5000), true);
+}
+
+function testSlackHttpSignatureVerification() {
+  const signingSecret = 'test-signing-secret';
+  const rawBody = JSON.stringify({ type: 'event_callback', event: { type: 'app_mention' } });
+  const timestamp = '1770000000';
+  const signature = `v0=${crypto
+    .createHmac('sha256', signingSecret)
+    .update(`v0:${timestamp}:${rawBody}`)
+    .digest('hex')}`;
+
+  assert.strictEqual(verifySlackRequestSignature({
+    signingSecret,
+    timestamp,
+    rawBody,
+    signature,
+    nowSeconds: 1770000001,
+  }), true);
+  assert.strictEqual(verifySlackRequestSignature({
+    signingSecret,
+    timestamp,
+    rawBody,
+    signature: signature.replace(/.$/, '0'),
+    nowSeconds: 1770000001,
+  }), false);
+  assert.strictEqual(verifySlackRequestSignature({
+    signingSecret,
+    timestamp,
+    rawBody,
+    signature,
+    nowSeconds: 1770000601,
+  }), false);
+}
+
+function testNormalizeSlackHttpAppMention() {
+  const payload = {
+    type: 'event_callback',
+    team_id: 'T_TEST',
+    event: {
+      type: 'app_mention',
+      channel: 'C_TEST',
+      user: 'U_TEST',
+      text: '<@U_BOT> move Brunton to S3',
+      ts: '1770000000.000100',
+      thread_ts: '1769999999.000100',
+    },
+  };
+
+  const normalized = normalizeSlackHttpEvent(payload);
+  assert.strictEqual(normalized.handled, true);
+  assert.strictEqual(normalized.stage, 'http_app_mention_received');
+  assert.strictEqual(normalized.channel, 'C_TEST');
+  assert.strictEqual(normalized.threadTs, '1769999999.000100');
+  assert.strictEqual(normalized.isThread, true);
+  assert.strictEqual(normalized.user, 'U_TEST');
+  assert.strictEqual(normalized.dedupeKey, 'C_TEST:1770000000.000100');
+}
+
+function testNormalizeSlackHttpEditedMention() {
+  const payload = {
+    type: 'event_callback',
+    team_id: 'T_TEST',
+    event: {
+      type: 'message',
+      subtype: 'message_changed',
+      channel: 'C_TEST',
+      message: {
+        user: 'U_TEST',
+        text: 'cc <@U_BOT>',
+        ts: '1770000000.000200',
+        thread_ts: '1769999999.000100',
+        edited: { ts: '1770000001.000200' },
+      },
+      previous_message: {
+        user: 'U_TEST',
+        text: 'cc',
+        ts: '1770000000.000200',
+      },
+    },
+  };
+
+  const normalized = normalizeSlackHttpEvent(payload);
+  assert.strictEqual(normalized.handled, true);
+  assert.strictEqual(normalized.stage, 'http_message_changed_received');
+  assert.strictEqual(normalized.channel, 'C_TEST');
+  assert.strictEqual(normalized.threadTs, '1769999999.000100');
+  assert.strictEqual(normalized.dedupeKey, 'C_TEST:1770000000.000200:1770000001.000200');
+}
+
+function testSlackHttpEventDedupeAllowsRetriesOnlyOnce() {
+  assert.strictEqual(markSlackHttpEventSeen('C_TEST:1770000000.000100', 1000), true);
+  assert.strictEqual(markSlackHttpEventSeen('C_TEST:1770000000.000100', 2000), false);
+  assert.strictEqual(markSlackHttpEventSeen('C_TEST:1770000000.000200', 3000), true);
+  assert.strictEqual(markSlackHttpEventSeen('C_TEST:1770000000.000100', 24 * 60 * 60 * 1000 + 5000), true);
+}
+
+function slackSignatureForBody(rawBody, timestamp, signingSecret = process.env.SLACK_SIGNING_SECRET) {
+  return `v0=${crypto
+    .createHmac('sha256', signingSecret)
+    .update(`v0:${timestamp}:${rawBody}`)
+    .digest('hex')}`;
+}
+
+function postSlackEvent(port, rawBody, { signature, timestamp = String(Math.floor(Date.now() / 1000)) } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: '/slack/events',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(rawBody),
+        'X-Slack-Request-Timestamp': timestamp,
+        'X-Slack-Signature': signature || slackSignatureForBody(rawBody, timestamp),
+      },
+    }, (res) => {
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => resolve({ statusCode: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.write(rawBody);
+    req.end();
+  });
+}
+
+async function withEphemeralSlackHttpServer(fn) {
+  const oldPort = process.env.PORT;
+  process.env.PORT = '0';
+  const server = startHttpServer();
+  try {
+    await new Promise(resolve => server.once('listening', resolve));
+    await fn(server.address().port);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    if (oldPort == null) {
+      delete process.env.PORT;
+    } else {
+      process.env.PORT = oldPort;
+    }
+  }
+}
+
+async function testSlackHttpEventsRouteVerifiesUrlChallenge() {
+  await withEphemeralSlackHttpServer(async (port) => {
+    const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'challenge-token' });
+    const response = await postSlackEvent(port, rawBody);
+    assert.strictEqual(response.statusCode, 200);
+    assert.strictEqual(response.body, 'challenge-token');
+  });
+}
+
+async function testSlackHttpEventsRouteRejectsInvalidSignature() {
+  await withEphemeralSlackHttpServer(async (port) => {
+    const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'challenge-token' });
+    const response = await postSlackEvent(port, rawBody, { signature: 'v0=bad' });
+    assert.strictEqual(response.statusCode, 401);
+    assert.strictEqual(response.body, 'invalid_signature');
+  });
+}
+
+async function testSlackHttpEventsRouteRejectsMalformedJson() {
+  await withEphemeralSlackHttpServer(async (port) => {
+    const rawBody = '{"type":';
+    const response = await postSlackEvent(port, rawBody);
+    assert.strictEqual(response.statusCode, 400);
+    assert.strictEqual(response.body, 'invalid_json');
+  });
+}
+
+async function testSlackHttpEventsRouteAcksEventCallbacks() {
+  await withEphemeralSlackHttpServer(async (port) => {
+    const rawBody = JSON.stringify({
+      type: 'event_callback',
+      team_id: 'T_TEST',
+      event: {
+        type: 'reaction_added',
+        event_ts: '1770000000.000300',
+      },
+    });
+    const response = await postSlackEvent(port, rawBody);
+    assert.strictEqual(response.statusCode, 200);
+    assert.strictEqual(response.body, 'ok');
+  });
 }
 
 async function testRecruitingCalendarInviteExecuteToolAuthAndIdempotency() {
@@ -1592,6 +1795,7 @@ async function run() {
   testDynamicOwnerMatchByEmailAndName();
   testSanitizeTokenStripsWhitespace();
   testResolveBotRoles();
+  testResolveSlackEventTransport();
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
   await testCreateDealToolDefaultsOwnerToRequester();
@@ -1605,6 +1809,14 @@ async function run() {
   testSanitizeLogValueRedactsTokenLikeValues();
   testEditedMentionHelpersDetectOnlyTargetBotMention();
   testEditedMentionDedupeAllowsOnlyNewEditEvents();
+  testSlackHttpSignatureVerification();
+  testNormalizeSlackHttpAppMention();
+  testNormalizeSlackHttpEditedMention();
+  testSlackHttpEventDedupeAllowsRetriesOnlyOnce();
+  await testSlackHttpEventsRouteVerifiesUrlChallenge();
+  await testSlackHttpEventsRouteRejectsInvalidSignature();
+  await testSlackHttpEventsRouteRejectsMalformedJson();
+  await testSlackHttpEventsRouteAcksEventCallbacks();
   testRecruitingAtsToolRegistrationAndPrompt();
   testRecruitingNotionPropertyHelpers();
   testRecruitingCalendarInviteBuilderAndAuthorization();

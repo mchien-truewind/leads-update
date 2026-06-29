@@ -245,7 +245,23 @@ const DEFAULT_RECRUITING_CALENDAR_SLACK_USER_ID = (
   || 'U0ABULY5TEK'
 ).trim();
 const editedMentionEventsSeen = new Map();
+const slackHttpEventSeen = new Map();
 let slackBotUserIdPromise = null;
+
+function resolveSlackEventTransport(value = process.env.SLACK_EVENT_TRANSPORT) {
+  const normalized = String(value || 'socket').trim().toLowerCase();
+  return new Set(['socket', 'http', 'dual']).has(normalized) ? normalized : 'socket';
+}
+
+function slackSocketEventsEnabled() {
+  const transport = resolveSlackEventTransport();
+  return transport === 'socket' || transport === 'dual';
+}
+
+function slackHttpEventsEnabled() {
+  const transport = resolveSlackEventTransport();
+  return transport === 'http' || transport === 'dual';
+}
 
 function createSlackApp() {
   if (require.main !== module) {
@@ -293,6 +309,21 @@ function markEditedMentionSeen(channel, messageTs, editedTs = '', now = Date.now
   const key = `${channel}:${messageTs}:${editedTs}`;
   if (editedMentionEventsSeen.has(key)) return false;
   editedMentionEventsSeen.set(key, now);
+  return true;
+}
+
+function pruneSlackHttpEventDedupe(now = Date.now()) {
+  const ttlMs = Number(process.env.SLACK_HTTP_EVENT_DEDUPE_TTL_MS || 24 * 60 * 60 * 1000);
+  for (const [key, seenAt] of slackHttpEventSeen.entries()) {
+    if (now - seenAt > ttlMs) slackHttpEventSeen.delete(key);
+  }
+}
+
+function markSlackHttpEventSeen(key, now = Date.now()) {
+  pruneSlackHttpEventDedupe(now);
+  if (!key) return false;
+  if (slackHttpEventSeen.has(key)) return false;
+  slackHttpEventSeen.set(key, now);
   return true;
 }
 
@@ -3994,6 +4025,205 @@ function logSlackMessageLifecycle(stage, fields = {}) {
 
 const slackUserProfileCache = new Map();
 
+function readRawRequestBody(req, maxBytes = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalBytes = 0;
+    req.on('data', (chunk) => {
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) {
+        reject(new Error(`Request body too large (${totalBytes} bytes)`));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function verifySlackRequestSignature({
+  signingSecret = process.env.SLACK_SIGNING_SECRET,
+  timestamp,
+  rawBody,
+  signature,
+  nowSeconds = Math.floor(Date.now() / 1000),
+}) {
+  if (!signingSecret || !timestamp || !signature || rawBody == null) return false;
+
+  const requestTimestamp = Number(timestamp);
+  if (!Number.isFinite(requestTimestamp)) return false;
+  if (Math.abs(nowSeconds - requestTimestamp) > 60 * 5) return false;
+
+  const baseString = `v0:${timestamp}:${rawBody}`;
+  const expected = `v0=${crypto
+    .createHmac('sha256', signingSecret)
+    .update(baseString)
+    .digest('hex')}`;
+
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  const actualBuffer = Buffer.from(signature, 'utf8');
+  if (expectedBuffer.length !== actualBuffer.length) return false;
+  return crypto.timingSafeEqual(expectedBuffer, actualBuffer);
+}
+
+function getSlackEventDedupeKey({ channel = '', messageTs = '', editedTs = '' } = {}) {
+  if (!channel || !messageTs) return '';
+  return editedTs ? `${channel}:${messageTs}:${editedTs}` : `${channel}:${messageTs}`;
+}
+
+function getSlackHttpEventDedupeKey(payload, event) {
+  if (!event) return '';
+  if (event.type === 'app_mention') {
+    return getSlackEventDedupeKey({ channel: event.channel, messageTs: event.ts || event.event_ts });
+  }
+  if (event.type === 'message' && event.subtype === 'message_changed') {
+    const message = event.message || {};
+    const editedTs = message.edited?.ts || event.event_ts || '';
+    return getSlackEventDedupeKey({
+      channel: event.channel || message.channel,
+      messageTs: message.ts || event.message_ts || event.ts,
+      editedTs,
+    });
+  }
+  if (event.type === 'message' && event.channel_type === 'im') {
+    return getSlackEventDedupeKey({ channel: event.channel, messageTs: event.ts || event.event_ts });
+  }
+  return `${event.type || ''}:${event.event_ts || event.ts || ''}`;
+}
+
+function normalizeSlackHttpEvent(payload) {
+  const event = payload?.event || {};
+  if (event.type === 'app_mention') {
+    const threadTs = event.thread_ts || event.ts;
+    if (!event.channel || !threadTs || !event.text || event.bot_id) {
+      return { handled: false, reason: 'invalid_app_mention' };
+    }
+    return {
+      handled: true,
+      stage: 'http_app_mention_received',
+      text: event.text,
+      channel: event.channel,
+      threadTs,
+      isThread: Boolean(event.thread_ts),
+      user: event.user || '',
+      eventTs: event.ts || '',
+      dedupeKey: getSlackHttpEventDedupeKey(payload, event),
+    };
+  }
+
+  if (event.type === 'message' && event.subtype === 'message_changed') {
+    const message = event.message || {};
+    const channel = event.channel || message.channel;
+    const messageTs = message.ts || event.message_ts || event.ts;
+    const text = message.text || '';
+    if (!channel || !messageTs || !text || message.bot_id || message.subtype === 'bot_message') {
+      return { handled: false, reason: 'invalid_message_changed' };
+    }
+    return {
+      handled: true,
+      stage: 'http_message_changed_received',
+      text,
+      channel,
+      threadTs: message.thread_ts || message.ts,
+      isThread: Boolean(message.thread_ts),
+      user: message.user || event.user || '',
+      eventTs: messageTs,
+      dedupeKey: getSlackHttpEventDedupeKey(payload, event),
+      editedEvent: event,
+    };
+  }
+
+  if (event.type === 'message' && event.channel_type === 'im') {
+    if (!event.channel || !event.ts || !event.text || event.bot_id || event.subtype) {
+      return { handled: false, reason: 'invalid_im_message' };
+    }
+    return {
+      handled: true,
+      stage: 'http_im_message_received',
+      text: event.text,
+      channel: event.channel,
+      threadTs: event.thread_ts || event.ts,
+      isThread: Boolean(event.thread_ts),
+      user: event.user || '',
+      eventTs: event.ts || '',
+      dedupeKey: getSlackHttpEventDedupeKey(payload, event),
+    };
+  }
+
+  return { handled: false, reason: `ignored_${event.type || 'unknown'}` };
+}
+
+function createSlackWebApiSay(channel) {
+  return async (message) => {
+    const payload = typeof message === 'string' ? { text: message } : { ...message };
+    return app.client.chat.postMessage({
+      channel,
+      ...payload,
+    });
+  };
+}
+
+async function handleSlackHttpEventPayload(payload) {
+  if (payload?.type !== 'event_callback') {
+    logSlackMessageLifecycle('http_event_ignored', {
+      reason: `ignored_payload_${payload?.type || 'unknown'}`,
+    });
+    return;
+  }
+
+  if (!slackHttpEventsEnabled()) {
+    logSlackMessageLifecycle('http_event_ignored', {
+      reason: 'http_transport_disabled',
+      event_type: payload?.event?.type || '',
+      subtype: payload?.event?.subtype || '',
+    });
+    return;
+  }
+
+  const normalized = normalizeSlackHttpEvent(payload);
+  if (!normalized.handled) {
+    logSlackMessageLifecycle('http_event_ignored', {
+      reason: normalized.reason,
+      event_type: payload?.event?.type || '',
+      subtype: payload?.event?.subtype || '',
+    });
+    return;
+  }
+
+  if (!markSlackHttpEventSeen(normalized.dedupeKey)) {
+    logSlackMessageLifecycle('http_event_duplicate_skipped', {
+      channel: normalized.channel,
+      thread_ts: normalized.threadTs,
+      event_ts: normalized.eventTs,
+    });
+    return;
+  }
+
+  const say = createSlackWebApiSay(normalized.channel);
+  if (normalized.editedEvent) {
+    await handleEditedMessageMention(normalized.editedEvent, say);
+    return;
+  }
+
+  logSlackMessageLifecycle(normalized.stage, {
+    channel: normalized.channel,
+    thread_ts: normalized.threadTs,
+    event_ts: normalized.eventTs,
+    is_thread: normalized.isThread,
+    has_user: Boolean(normalized.user),
+  });
+  await handleMessage(
+    normalized.text,
+    normalized.threadTs,
+    normalized.channel,
+    normalized.isThread,
+    say,
+    normalized.user,
+  );
+}
+
 // Resolve a Slack user ID to their profile (email + display name). Cached for the
 // process lifetime so repeated HubSpot writes by the same teammate don't re-hit
 // the Slack API. Returns { email, realName } with empty strings when unavailable.
@@ -4384,6 +4614,23 @@ app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) =
 app.event('app_mention', async ({ event, say }) => {
   const isThread = !!event.thread_ts;
   const threadTs = event.thread_ts || event.ts;
+  if (!slackSocketEventsEnabled()) {
+    logSlackMessageLifecycle('socket_event_ignored', {
+      reason: 'socket_transport_disabled',
+      channel: event.channel,
+      thread_ts: threadTs,
+      event_ts: event.ts,
+    });
+    return;
+  }
+  if (!markSlackHttpEventSeen(getSlackEventDedupeKey({ channel: event.channel, messageTs: event.ts }))) {
+    logSlackMessageLifecycle('socket_event_duplicate_skipped', {
+      channel: event.channel,
+      thread_ts: threadTs,
+      event_ts: event.ts,
+    });
+    return;
+  }
   console.log(`app_mention: thread_ts=${event.thread_ts}, ts=${event.ts}, isThread=${isThread}`);
   logSlackMessageLifecycle('app_mention_received', {
     channel: event.channel,
@@ -4427,6 +4674,16 @@ async function handleEditedMessageMention(event, say) {
 // Respond to DMs
 app.event('message', async ({ event, say }) => {
   if (event.subtype === 'message_changed') {
+    if (!slackSocketEventsEnabled()) {
+      const message = event.message || {};
+      logSlackMessageLifecycle('socket_event_ignored', {
+        reason: 'socket_transport_disabled',
+        channel: event.channel || message.channel,
+        thread_ts: message.thread_ts || message.ts || event.ts,
+        event_ts: message.ts || event.ts,
+      });
+      return;
+    }
     await handleEditedMessageMention(event, say);
     return;
   }
@@ -4434,6 +4691,23 @@ app.event('message', async ({ event, say }) => {
   if (event.bot_id || event.subtype) return;
   const isThread = !!event.thread_ts;
   const threadTs = event.thread_ts || event.ts;
+  if (!slackSocketEventsEnabled()) {
+    logSlackMessageLifecycle('socket_event_ignored', {
+      reason: 'socket_transport_disabled',
+      channel: event.channel,
+      thread_ts: threadTs,
+      event_ts: event.ts,
+    });
+    return;
+  }
+  if (!markSlackHttpEventSeen(getSlackEventDedupeKey({ channel: event.channel, messageTs: event.ts }))) {
+    logSlackMessageLifecycle('socket_event_duplicate_skipped', {
+      channel: event.channel,
+      thread_ts: threadTs,
+      event_ts: event.ts,
+    });
+    return;
+  }
   await handleMessage(event.text, threadTs, event.channel, isThread, say, event.user || '');
 });
 
@@ -5654,8 +5928,65 @@ function scheduleLeadStatusSync() {
 
 function startHttpServer() {
   // Health check server for Railway (needs a port to know the service is alive)
-  const PORT = process.env.PORT || 3000;
+  const PORT = Number(process.env.PORT || 3000);
   const server = http.createServer(async (req, res) => {
+    if (req.method === 'POST' && req.url.split('?')[0] === '/slack/events') {
+      let rawBody = '';
+      try {
+        rawBody = await readRawRequestBody(req);
+      } catch (err) {
+        console.error(`Slack HTTP event body read failed: ${sanitizeLogValue(err.message)}`);
+        res.writeHead(413);
+        res.end('body_too_large');
+        return;
+      }
+
+      const signatureOk = verifySlackRequestSignature({
+        timestamp: req.headers['x-slack-request-timestamp'],
+        rawBody,
+        signature: req.headers['x-slack-signature'],
+      });
+      if (!signatureOk) {
+        logSlackMessageLifecycle('http_event_signature_rejected', {
+          has_timestamp: Boolean(req.headers['x-slack-request-timestamp']),
+          has_signature: Boolean(req.headers['x-slack-signature']),
+        });
+        res.writeHead(401);
+        res.end('invalid_signature');
+        return;
+      }
+
+      let payload;
+      try {
+        payload = rawBody ? JSON.parse(rawBody) : {};
+      } catch (err) {
+        console.error(`Slack HTTP event JSON parse failed: ${sanitizeLogValue(err.message)}`);
+        res.writeHead(400);
+        res.end('invalid_json');
+        return;
+      }
+
+      if (payload.type === 'url_verification') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end(payload.challenge || '');
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+
+      setImmediate(() => {
+        handleSlackHttpEventPayload(payload).catch((err) => {
+          console.error(`Slack HTTP event processing failed: ${sanitizeLogValue(err.message)}`);
+          logSlackMessageLifecycle('http_event_handler_error', {
+            error: sanitizeLogValue(err.message),
+            event_type: payload?.event?.type || '',
+            subtype: payload?.event?.subtype || '',
+          });
+        });
+      });
+      return;
+    }
     if (req.url.split('?')[0] === '/webhooks/instantly/positive-reply') {
       try {
         await handleInstantlyPositiveReplyWebhook(req, res, {
@@ -5839,12 +6170,19 @@ function startConnectionWatchdog(app, {
 //   BOT_ROLE=all    (default) socket + webhooks + crons in one process (legacy)
 //   BOT_ROLE=bot    Socket Mode interactive only (no crons)
 //   BOT_ROLE=worker crons + webhooks only (no Socket Mode)
-function resolveBotRoles(role) {
+// SLACK_EVENT_TRANSPORT gates which Slack event transport is active:
+//   socket (default) keeps current Socket Mode behavior
+//   http handles Events API callbacks on /slack/events and disables Socket Mode
+//   dual is only for deliberate local/canary testing
+function resolveBotRoles(role, eventTransport = process.env.SLACK_EVENT_TRANSPORT) {
   const normalized = String(role || 'all').trim().toLowerCase();
   const effective = new Set(['all', 'bot', 'worker']).has(normalized) ? normalized : 'all';
+  const transport = resolveSlackEventTransport(eventTransport);
+  const socketTransportEnabled = transport === 'socket' || transport === 'dual';
   return {
     role: effective,
-    runsSocket: effective === 'all' || effective === 'bot',
+    eventTransport: transport,
+    runsSocket: socketTransportEnabled && (effective === 'all' || effective === 'bot'),
     runsWorker: effective === 'all' || effective === 'worker',
   };
 }
@@ -5858,8 +6196,8 @@ async function startSlackBot() {
     return;
   }
 
-  const { role, runsSocket, runsWorker } = resolveBotRoles(process.env.BOT_ROLE);
-  console.log(`Starting (role='${role}', socket=${runsSocket}, worker=${runsWorker})`);
+  const { role, eventTransport, runsSocket, runsWorker } = resolveBotRoles(process.env.BOT_ROLE);
+  console.log(`Starting (role='${role}', event_transport='${eventTransport}', socket=${runsSocket}, worker=${runsWorker})`);
 
   // HTTP server (health check + webhook routes) runs in every role. Webhook routes
   // only receive traffic on the service the public domain points at (the worker).
@@ -5962,6 +6300,9 @@ module.exports = {
   sanitizeLogValue,
   slackTextMentionsUser,
   markEditedMentionSeen,
+  markSlackHttpEventSeen,
+  normalizeSlackHttpEvent,
+  verifySlackRequestSignature,
   resolveDealHubSpotOwner,
   resolveProspectWorkflowOwner,
   runLeadStatusSyncForSlack,
@@ -5971,7 +6312,9 @@ module.exports = {
   shouldSetLifecycleToOpportunity,
   shouldCheckDuplicates,
   startSlackBot,
+  startHttpServer,
   resolveBotRoles,
+  resolveSlackEventTransport,
   summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
   findDuplicateOpenDeal,

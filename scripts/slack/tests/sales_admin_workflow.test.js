@@ -110,6 +110,153 @@ test('sales admin Grain matching can use direct HubSpot and calendar metadata', 
   assert.equal(recordingDirectlyMatchesMeeting({ calendar_event: { id: 'other' } }, meeting({ hs_meeting_source_id: 'calendar-event-1' })), false);
 });
 
+function salesAdminWorkflowForGrainReview({ anthropic = null, recordings = [], getRecording = null, transcript = '' } = {}) {
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => ({ ts: '1', channel: payload.channel }) } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-grain-review-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+      GRAIN_API_TOKEN: 'grain-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.grain = {
+    isConfigured: () => true,
+    listRecordings: async () => recordings,
+    getRecording: getRecording || (async id => recordings.find(recording => recording.id === id) || {}),
+    getTranscript: async () => transcript,
+  };
+  return workflow;
+}
+
+function hubspotMeetingForGrainReview(extra = {}) {
+  return {
+    id: 'meeting-1',
+    properties: {
+      hs_meeting_title: 'ProspectCo / Truewind Intro',
+      hs_meeting_start_time: '2026-06-03T20:00:00.000Z',
+      hs_meeting_end_time: '2026-06-03T20:30:00.000Z',
+      ...extra.properties,
+    },
+    _contacts: [{ id: 'ct1', firstname: 'Pat', lastname: 'Buyer', email: 'pat@prospectco.com', company: 'ProspectCo' }],
+    _companies: [{ id: 'co1', name: 'ProspectCo' }],
+    _deals: [{ id: 'deal1', dealname: 'ProspectCo - Sarah' }],
+    ...extra,
+  };
+}
+
+test('sales admin Grain reviewer rejects sensitive non-prospect recordings before Slack can link them', async () => {
+  const anthropic = {
+    messages: {
+      create: async () => ({
+        content: [{ type: 'text', text: '{"decision":"reject","reason":"External participant is not the HubSpot prospect contact.","matched_emails":[]}' }],
+      }),
+    },
+  };
+  const workflow = salesAdminWorkflowForGrainReview({
+    anthropic,
+    recordings: [{
+      id: 'grain-sensitive',
+      title: 'CEO / external executive sensitive call',
+      start_time: '2026-06-03T20:00:00.000Z',
+      url: 'https://grain.com/share/recording/grain-sensitive',
+      participants: [
+        { email: 'sarah@trytruewind.com' },
+        { email: 'ceo@trytruewind.com' },
+        { email: 'exec@notprospect.com' },
+      ],
+    }],
+  });
+
+  const result = await workflow.fetchGrainForMeeting(
+    { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com' },
+    hubspotMeetingForGrainReview(),
+  );
+
+  assert.equal(result.recording, null);
+  assert.equal(result.grainUrl, '');
+  assert.equal(result.source, 'grain_review_rejected');
+  assert.equal(result.review.decision, 'reject');
+});
+
+test('sales admin Grain reviewer deterministically approves AE plus exact prospect contact overlap', async () => {
+  const workflow = salesAdminWorkflowForGrainReview({
+    recordings: [{
+      id: 'grain-valid',
+      title: 'ProspectCo / Truewind Intro',
+      start_time: '2026-06-03T20:00:00.000Z',
+      url: 'https://grain.com/share/recording/grain-valid',
+      participants: [
+        { email: 'sarah@trytruewind.com' },
+        { email: 'pat@prospectco.com' },
+      ],
+      ai_action_items: [{ text: 'Send follow-up pricing and confirm decision timeline' }],
+    }],
+  });
+
+  const result = await workflow.fetchGrainForMeeting(
+    { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com' },
+    hubspotMeetingForGrainReview(),
+  );
+
+  assert.equal(result.source, 'grain_matched');
+  assert.equal(result.grainUrl, 'https://grain.com/share/recording/grain-valid');
+  assert.equal(result.review.decision, 'approve');
+  assert.equal(result.review.reviewer, 'deterministic');
+  assert.deepEqual(result.review.matchedEmails, ['pat@prospectco.com']);
+});
+
+test('sales admin Grain reviewer deterministically approves direct HubSpot metadata matches', async () => {
+  const workflow = salesAdminWorkflowForGrainReview({
+    recordings: [{
+      id: 'grain-direct',
+      title: 'Ambiguous title',
+      start_time: '2026-06-03T20:00:00.000Z',
+      participants: [{ email: 'sarah@trytruewind.com' }],
+      hubspot: { meeting_id: 'meeting-1' },
+    }],
+  });
+
+  const result = await workflow.fetchGrainForMeeting(
+    { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com' },
+    hubspotMeetingForGrainReview(),
+  );
+
+  assert.equal(result.source, 'grain_matched');
+  assert.equal(result.review.decision, 'approve');
+  assert.equal(result.review.reason, 'Grain metadata directly references the HubSpot/calendar meeting.');
+});
+
+test('sales admin Grain reviewer fails closed on reviewer errors', async () => {
+  const workflow = salesAdminWorkflowForGrainReview({
+    anthropic: { messages: { create: async () => { throw new Error('reviewer unavailable'); } } },
+    recordings: [{
+      id: 'grain-ambiguous',
+      title: 'Ambiguous external call',
+      start_time: '2026-06-03T20:00:00.000Z',
+      participants: [
+        { email: 'sarah@trytruewind.com' },
+        { email: 'someone@external.com' },
+      ],
+    }],
+  });
+
+  const result = await workflow.fetchGrainForMeeting(
+    { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com' },
+    hubspotMeetingForGrainReview(),
+  );
+
+  assert.equal(result.recording, null);
+  assert.equal(result.grainUrl, '');
+  assert.equal(result.source, 'grain_review_error');
+});
+
 test('sales admin HubSpot enrichment falls back to company and contact deals', async () => {
   const client = new HubSpotSalesAdminClient({
     hubspotRequest: async () => {
@@ -1027,6 +1174,55 @@ test('sales admin post-meeting prompt defaults to no-show when no Grain recordin
   assert.equal(actions.elements[0].style, 'primary');
   assert.equal(actions.elements[0].action_id, POST_ACTIONS.noShow);
   assert.equal(workflow.state.get('post:no-grain-meeting:89305622').grainSource, 'no_grain_recording');
+});
+
+test('sales admin post-meeting prompt hides rejected Grain links and defaults to no-show', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-rejected-grain-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('84547076', 'C_SARAH');
+  workflow.meetingsForToday = async () => [{
+    id: 'rejected-grain-meeting',
+    properties: {
+      hs_meeting_title: 'ProspectCo / Truewind Intro',
+      hs_meeting_start_time: '2026-06-03T17:00:00.000Z',
+      hs_meeting_end_time: '2026-06-03T17:30:00.000Z',
+    },
+    _contacts: [{ id: 'ct1', firstname: 'Pat', lastname: 'Buyer', email: 'pat@prospectco.com', company: 'ProspectCo' }],
+    _companies: [{ id: 'c1', name: 'ProspectCo' }],
+    _deals: [],
+  }];
+  workflow.fetchGrainForMeeting = async () => ({
+    recording: null,
+    grainUrl: '',
+    source: 'grain_review_rejected',
+    review: { decision: 'reject', reason: 'Not the prospect call', reviewer: 'anthropic', matchedEmails: [] },
+  });
+  workflow.buildStageDecisionForMeeting = async () => null;
+
+  const stats = await workflow.runPostMeetingScan(new Date('2026-06-03T18:00:00.000Z'));
+
+  assert.equal(stats.prompted, 1);
+  const headerBlock = posts[0].blocks[0];
+  assert.match(headerBlock.text.text, /Doesn't look like they showed up/);
+  assert.ok(!JSON.stringify(posts[0].blocks).includes('https://grain.com'), 'rejected Grain link should not be shown');
+  const actions = posts[0].blocks.find(block => block.type === 'actions');
+  assert.deepEqual(actions.elements.map(element => element.type === 'button' ? element.text.text : element.options[0].text.text), ['No-Show', 'Confirm Completed', 'Edit Notes', 'Not this meeting']);
+  const state = workflow.state.get('post:rejected-grain-meeting:84547076');
+  assert.equal(state.grainSource, 'grain_review_rejected');
+  assert.equal(state.grainReview.decision, 'reject');
 });
 
 test('sales admin confirmation updates HubSpot deal next step summary', async () => {

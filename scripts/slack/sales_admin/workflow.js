@@ -388,6 +388,122 @@ function getMeetingEmails(meeting) {
     .filter(Boolean);
 }
 
+function uniqueValues(values = []) {
+  return [...new Set(values.map(value => normalizeDigestText(value)).filter(Boolean))];
+}
+
+function getMeetingContext(meeting) {
+  return {
+    id: String(meeting?.id || ''),
+    title: meetingTitle(meeting),
+    startTime: meeting?.properties?.hs_meeting_start_time || '',
+    endTime: meeting?.properties?.hs_meeting_end_time || '',
+    sourceId: meeting?.properties?.hs_meeting_source_id || '',
+    externalUrl: meeting?.properties?.hs_meeting_external_url || '',
+    contactEmails: uniqueValues(getMeetingEmails(meeting)),
+    contacts: (meeting?._contacts || []).map(contact => ({
+      email: normalizeDigestText(contact.email),
+      name: contactLabel(contact),
+      company: String(contact.company || '').trim(),
+    })),
+    companies: (meeting?._companies || []).map(company => ({ id: String(company.id || ''), name: String(company.name || '').trim() })),
+    deals: (meeting?._deals || []).map(deal => ({ id: String(deal.id || ''), name: String(deal.dealname || '').trim() })),
+  };
+}
+
+function getRecordingOwnerEmails(recording) {
+  const owners = [
+    recording?.owner,
+    recording?.creator,
+    recording?.user,
+    ...(Array.isArray(recording?.owners) ? recording.owners : []),
+  ];
+  return uniqueValues(owners.map(owner => {
+    if (typeof owner === 'string') return owner;
+    return owner?.email || owner?.email_address || '';
+  }));
+}
+
+function buildGrainMatchEvidence(ae, meeting, recording) {
+  const participantEmails = uniqueValues(getGrainParticipantEmails(recording));
+  const ownerEmails = getRecordingOwnerEmails(recording);
+  const recordingStartMs = getGrainRecordingStartMs(recording);
+  const meetingStartMs = Date.parse(meeting?.properties?.hs_meeting_start_time || '');
+  const meetingContext = getMeetingContext(meeting);
+  return {
+    ae: {
+      name: ae?.name || '',
+      email: normalizeDigestText(ae?.email),
+      hubspotOwnerId: String(ae?.hubspotOwnerId || ''),
+    },
+    meeting: meetingContext,
+    recording: {
+      id: getGrainRecordingId(recording),
+      title: getGrainRecordingTitle(recording),
+      url: getGrainRecordingUrl(recording),
+      startTime: recordingStartMs ? new Date(recordingStartMs).toISOString() : '',
+      participantEmails,
+      ownerEmails,
+      calendarEvent: recording?.calendar_event || recording?.calendarEvent || {},
+      hubspot: recording?.hubspot || recording?.hubspot_metadata || recording?.hubspot_event || {},
+    },
+    checks: {
+      directMetadataMatch: recordingDirectlyMatchesMeeting(recording, meeting),
+      aeEmailPresent: Boolean(normalizeDigestText(ae?.email) && [...participantEmails, ...ownerEmails].includes(normalizeDigestText(ae.email))),
+      exactContactEmailOverlap: participantEmails.filter(email => meetingContext.contactEmails.includes(email)),
+      startDiffMinutes: Number.isFinite(meetingStartMs) && recordingStartMs ? Math.round(Math.abs(recordingStartMs - meetingStartMs) / 60000) : null,
+    },
+  };
+}
+
+function deterministicGrainMatchReview(evidence) {
+  if (evidence.checks.directMetadataMatch) {
+    return { decision: 'approve', reason: 'Grain metadata directly references the HubSpot/calendar meeting.', matchedEmails: evidence.checks.exactContactEmailOverlap, reviewer: 'deterministic' };
+  }
+  if (evidence.checks.aeEmailPresent && evidence.checks.exactContactEmailOverlap.length > 0) {
+    return { decision: 'approve', reason: 'Recording includes the AE and an exact HubSpot meeting contact email.', matchedEmails: evidence.checks.exactContactEmailOverlap, reviewer: 'deterministic' };
+  }
+  return { decision: 'uncertain', reason: 'No direct metadata match or exact prospect contact email overlap.', matchedEmails: evidence.checks.exactContactEmailOverlap, reviewer: 'deterministic' };
+}
+
+function parseGrainReviewerResponse(responseText) {
+  const jsonText = String(responseText || '').match(/\{[\s\S]*\}/)?.[0] || '';
+  if (!jsonText) throw new Error('Reviewer returned no JSON object');
+  const parsed = JSON.parse(jsonText);
+  const decision = String(parsed.decision || '').trim().toLowerCase();
+  if (!['approve', 'reject', 'uncertain'].includes(decision)) throw new Error(`Reviewer returned invalid decision: ${parsed.decision}`);
+  const reason = String(parsed.reason || '').trim();
+  if (!reason) throw new Error('Reviewer returned no reason');
+  const matchedEmails = Array.isArray(parsed.matched_emails)
+    ? uniqueValues(parsed.matched_emails)
+    : Array.isArray(parsed.matchedEmails)
+      ? uniqueValues(parsed.matchedEmails)
+      : [];
+  return { decision, reason, matchedEmails, reviewer: 'anthropic' };
+}
+
+async function reviewGrainMatchWithAnthropic({ anthropic, evidence, logger = console } = {}) {
+  if (!anthropic) {
+    return { decision: 'uncertain', reason: 'No Anthropic reviewer configured for ambiguous Grain match.', matchedEmails: [], reviewer: 'anthropic_unavailable' };
+  }
+  try {
+    const res = await anthropic.messages.create({
+      model: process.env.SALES_ADMIN_CLAUDE_MODEL || 'claude-sonnet-4-6',
+      max_tokens: 300,
+      system: 'You are a strict privacy reviewer for sales call recordings. Return only valid JSON.',
+      messages: [{
+        role: 'user',
+        content: `Decide whether this Grain recording is the actual post-meeting call for the HubSpot sales meeting. Approve only if the evidence clearly shows the Truewind AE and the HubSpot prospect/customer were on the same call. Reject internal Truewind calls, CEO/executive calls, vendor/partner calls, and calls with external people who are not the HubSpot meeting contact/company/deal. If evidence is incomplete, choose uncertain.\n\nReturn exactly this JSON shape:\n{"decision":"approve|reject|uncertain","reason":"short reason","matched_emails":["email@example.com"]}\n\nEvidence:\n${JSON.stringify(evidence, null, 2).slice(0, 12000)}`,
+      }],
+    });
+    const responseText = res.content?.find(block => block.type === 'text')?.text || '';
+    return parseGrainReviewerResponse(responseText);
+  } catch (err) {
+    logger.warn(`Sales admin Grain reviewer failed: ${err.message}`);
+    return { decision: 'error', reason: err.message, matchedEmails: [], reviewer: 'anthropic' };
+  }
+}
+
 function recordingDirectlyMatchesMeeting(recording, meeting) {
   const meetingId = String(meeting?.id || '').trim();
   const sourceId = String(meeting?.properties?.hs_meeting_source_id || '').trim();
@@ -779,7 +895,7 @@ function selectedStageLabel(stageDecision, stageId) {
 
 function shouldDefaultNoShow({ grainSource = '', extraction = null } = {}) {
   const source = String(grainSource || extraction?.source || '').trim().toLowerCase();
-  return source === 'no_grain_recording';
+  return source === 'no_grain_recording' || source.startsWith('grain_review_');
 }
 
 function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', hubspotNextStep = '', nextStepDatePrefix = '', stageDecision = null, selectedStageId = '', stageUpdate = null, nextStepPropertyUpdate = null }) {
@@ -1236,6 +1352,16 @@ class SalesAdminWorkflow {
       }) || null;
     }
     if (!matched) return { recording: null, grainUrl: '', source: 'no_grain_recording' };
+    const review = await this.reviewGrainMatchForMeeting(ae, meeting, matched);
+    if (review.decision !== 'approve') {
+      const source = review.decision === 'reject'
+        ? 'grain_review_rejected'
+        : review.decision === 'error'
+          ? 'grain_review_error'
+          : 'grain_review_uncertain';
+      this.logger.warn(`Sales admin Grain match ${review.decision} for meeting ${meeting.id}: ${review.reason}`);
+      return { recording: null, grainUrl: '', source, review };
+    }
     const id = getGrainRecordingId(matched);
     let detail = matched;
     try {
@@ -1244,7 +1370,15 @@ class SalesAdminWorkflow {
     } catch (err) {
       this.logger.warn(`Sales admin Grain detail fetch failed for ${id || getGrainRecordingTitle(matched)}: ${err.message}`);
     }
-    return { recording: detail, grainUrl: getGrainRecordingUrl(detail) || getGrainRecordingUrl(matched), source: 'grain_matched' };
+    return { recording: detail, grainUrl: getGrainRecordingUrl(detail) || getGrainRecordingUrl(matched), source: 'grain_matched', review };
+  }
+
+  async reviewGrainMatchForMeeting(ae, meeting, recording) {
+    const evidence = buildGrainMatchEvidence(ae, meeting, recording);
+    const deterministic = deterministicGrainMatchReview(evidence);
+    if (deterministic.decision === 'approve') return { ...deterministic, evidence };
+    const reviewed = await reviewGrainMatchWithAnthropic({ anthropic: this.anthropic, evidence, logger: this.logger });
+    return { ...reviewed, evidence };
   }
 
   async runPostMeetingScan(now = new Date(), options = {}) {
@@ -1301,6 +1435,12 @@ class SalesAdminWorkflow {
               grainRecordingId: getGrainRecordingId(grain.recording),
               grainSource: grain.source,
               grainUrl: grain.grainUrl,
+              grainReview: grain.review ? {
+                decision: grain.review.decision,
+                reason: grain.review.reason,
+                reviewer: grain.review.reviewer,
+                matchedEmails: grain.review.matchedEmails || [],
+              } : null,
               extraction,
               promptMarker: marker,
               nextStepDatePrefix: formatPacificDatePrefix(new Date(), this.config.timezone),

@@ -4795,6 +4795,16 @@ def status_is_terminal(status: str) -> bool:
     return status_key(status) in TERMINAL_STATUSES
 
 
+def should_skip_terminal_status_before_decision_processing(
+    *, status: str, decision: str, reject_draft_id: str
+) -> bool:
+    if not status_is_terminal(status):
+        return False
+    if status_key(status) == "rejected" and clean_text(decision).lower() == "reject" and reject_draft_id.strip():
+        return False
+    return True
+
+
 def should_exclude_from_active_digest(status: str) -> bool:
     return status_key(status) in ATS_DIGEST_EXCLUDED_STATUSES
 
@@ -5808,7 +5818,11 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             fallback_thread_id=thread_id,
         )
 
-        if status_is_terminal(current_status_raw):
+        if should_skip_terminal_status_before_decision_processing(
+            status=current_status_raw,
+            decision=decision,
+            reject_draft_id=reject_draft_id_raw,
+        ):
             archive_labels = [label_id for label_id in (hiring_label_id, pipeline_label_id) if label_id]
             if archive_labels:
                 archived_count, archive_failures = remove_labels_from_threads(

@@ -41,6 +41,31 @@ class RecruitingCoordinatorRoleTest(unittest.TestCase):
             coordinator.uses_custom_gpt_first_round(role_page_props("Growth Generalist"), prop_map)
         )
 
+    def test_rejected_rows_with_reject_draft_are_not_skipped_before_send_gate(self):
+        self.assertFalse(
+            coordinator.should_skip_terminal_status_before_decision_processing(
+                status="Rejected",
+                decision="Reject",
+                reject_draft_id="draft-123",
+            )
+        )
+
+    def test_terminal_rows_without_pending_reject_draft_are_still_skipped(self):
+        self.assertTrue(
+            coordinator.should_skip_terminal_status_before_decision_processing(
+                status="Rejected",
+                decision="Reject",
+                reject_draft_id="",
+            )
+        )
+        self.assertTrue(
+            coordinator.should_skip_terminal_status_before_decision_processing(
+                status="Offered",
+                decision="Proceed",
+                reject_draft_id="draft-123",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

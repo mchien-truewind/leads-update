@@ -126,17 +126,16 @@ DEFAULT_CUSTOM_GPT_NO_RESPONSE_REJECTION_TEMPLATE = (
     "Mercedes"
 )
 DEFAULT_NO_RESPONSE_TEMPLATE = (
-    "We haven't heard back from you and we're closing this process.\n\n"
-    "We're growing quickly, though, and new roles open up often. Please keep checking our careers page "
-    "for future opportunities. We'd be glad to see your application again in the future.\n\n"
-    "Mercedes"
+    DEFAULT_CUSTOM_GPT_NO_RESPONSE_REJECTION_TEMPLATE
 )
 PROCEED_SENT_RE = re.compile(r"(?i)\bwhen are you free for a 20-minute intro call\b")
 SCHEDULING_SENT_RE = re.compile(
     r"(?i)\bthanks for the quick reply\b.*\b20-minute intro call on\b|\b20-minute intro call on\b"
 )
 NO_RESPONSE_SENT_RE = re.compile(
-    r"(?i)\bhaven't heard back from you\b.*\bclosing this process\b|\bclose the loop on this process\b"
+    r"(?i)\bhaven't heard back from you\b.*\bclosing this process\b|"
+    r"\bhaven't heard from you in a while\b.*\bclose the application\b|"
+    r"\bclose the loop on this process\b"
 )
 REJECT_HARD_PATTERNS = [
     re.compile(r"(?i)\bwon[’']?t\s+be\s+moving\s+forward\b"),
@@ -238,7 +237,7 @@ class Config:
     resume_extractor_model_anthropic: str
     anthropic_api_key: str
     openai_api_key: str
-    no_response_wait_days: int
+    no_response_wait_business_days: int
     assignment_keywords: set[str]
     sent_status_lookback_days: int
     pipeline_label_name: str
@@ -551,7 +550,10 @@ def load_config() -> Config:
         resume_extractor_model_anthropic=os.getenv("RECRUITING_RESUME_EXTRACTOR_MODEL_ANTHROPIC", "claude-haiku-4-5").strip(),
         anthropic_api_key=get_env_first("RECRUITING_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
         openai_api_key=get_env_first("RECRUITING_OPENAI_API_KEY", "OPENAI_API_KEY"),
-        no_response_wait_days=parse_env_int("RECRUITING_NO_RESPONSE_WAIT_DAYS", 14),
+        no_response_wait_business_days=parse_env_int(
+            "RECRUITING_NO_RESPONSE_WAIT_BUSINESS_DAYS",
+            parse_env_int("RECRUITING_NO_RESPONSE_WAIT_DAYS", 7),
+        ),
         assignment_keywords=parse_csv_set(
             os.getenv("RECRUITING_ASSIGNMENT_KEYWORDS", ""), default=DEFAULT_ASSIGNMENT_KEYWORDS
         ),
@@ -6103,7 +6105,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         custom_gpt_no_response_sent += 1
                         if prop.status in properties_schema:
                             update_payload[prop.status] = build_notion_value(
-                                properties_schema[prop.status], STATUS_REJECTED
+                                properties_schema[prop.status], STATUS_NO_RESPONSE
                             )
                         if prop.decision in properties_schema:
                             update_payload[prop.decision] = build_notion_value(
@@ -6156,7 +6158,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 closeout_labels.append(pipeline_label_id)
             if no_response_sent_at:
                 if prop.status in properties_schema:
-                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], STATUS_REJECTED)
+                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], STATUS_NO_RESPONSE)
                 if prop.decision in properties_schema:
                     update_payload[prop.decision] = build_notion_value(properties_schema[prop.decision], "Reject")
                 archived_count, archive_failures = remove_labels_from_threads(
@@ -6179,8 +6181,12 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     keywords=config.assignment_keywords,
                 )
                 if assignment_sent_at:
-                    wait_delta = now_local(config.timezone_name).astimezone(timezone.utc) - assignment_sent_at
-                    if wait_delta >= timedelta(days=config.no_response_wait_days):
+                    due_at = add_business_days(
+                        assignment_sent_at,
+                        config.no_response_wait_business_days,
+                        config.timezone_name,
+                    )
+                    if now_local(config.timezone_name).astimezone(timezone.utc) >= due_at:
                         if not candidate_replied_since_any_thread(
                             gmail_service,
                             thread_ids=related_thread_ids,
@@ -6820,7 +6826,7 @@ def close_stale_custom_gpt_cmd(args: argparse.Namespace) -> None:
             sent += 1
             update_payload: dict[str, Any] = {}
             if prop.status in properties_schema:
-                update_payload[prop.status] = build_notion_value(properties_schema[prop.status], STATUS_REJECTED)
+                update_payload[prop.status] = build_notion_value(properties_schema[prop.status], STATUS_NO_RESPONSE)
             if prop.decision in properties_schema:
                 update_payload[prop.decision] = build_notion_value(properties_schema[prop.decision], "Reject")
             if prop.decision_time in properties_schema:
@@ -7038,7 +7044,7 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "resume_extractor_configured": bool(
             config.openai_api_key if config.resume_extractor_provider == "openai" else False
         ),
-        "no_response_wait_days": config.no_response_wait_days,
+        "no_response_wait_business_days": config.no_response_wait_business_days,
         "custom_gpt_no_response_wait_hours": config.custom_gpt_no_response_wait_hours,
         "assignment_keywords": sorted(config.assignment_keywords),
         "sent_status_lookback_days": config.sent_status_lookback_days,
@@ -7100,13 +7106,13 @@ def build_parser() -> argparse.ArgumentParser:
     close_custom_gpt_parser.add_argument(
         "--business-days",
         type=int,
-        default=3,
-        help="Business days to wait after the CustomGPT assignment was sent. Default: 3.",
+        default=7,
+        help="Business days to wait after the CustomGPT assignment was sent. Default: 7.",
     )
     close_custom_gpt_parser.add_argument(
         "--send",
         action="store_true",
-        help="Actually send the closeout email and mark eligible candidates rejected. Omit for dry run.",
+        help="Actually send the closeout email and mark eligible candidates No response. Omit for dry run.",
     )
     close_custom_gpt_parser.add_argument(
         "--message",

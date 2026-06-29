@@ -5,6 +5,7 @@
 docs/tasks/
 docs/context/
 docs/logs/
+task-logs/drafts/
 
 # Worktrees directory (created by git worktree under the common dir)
 .worktrees/

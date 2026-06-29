@@ -199,7 +199,7 @@ def build_config(**overrides) -> cli.Config:
         "resume_extractor_model_anthropic": "",
         "anthropic_api_key": "",
         "openai_api_key": "",
-        "no_response_wait_days": 7,
+        "no_response_wait_business_days": 7,
         "assignment_keywords": set(),
         "sent_status_lookback_days": 7,
         "pipeline_label_name": "",
@@ -417,6 +417,34 @@ class CustomGptNoResponseDueTests(unittest.TestCase):
                 48,
             )
         )
+
+
+class NoResponseTemplateTests(unittest.TestCase):
+    def test_normal_no_response_uses_custom_gpt_closeout_language(self):
+        self.assertEqual(
+            cli.DEFAULT_NO_RESPONSE_TEMPLATE,
+            cli.DEFAULT_CUSTOM_GPT_NO_RESPONSE_REJECTION_TEMPLATE,
+        )
+
+        rendered = cli.render_no_response_template(cli.DEFAULT_NO_RESPONSE_TEMPLATE, "Sam")
+
+        self.assertIn("Hi Sam,", rendered)
+        self.assertIn("Haven't heard from you in a while", rendered)
+        self.assertIn("close the application", rendered)
+
+    def test_no_response_sent_detector_matches_custom_gpt_closeout_language(self):
+        body = cli.render_no_response_template(cli.DEFAULT_NO_RESPONSE_TEMPLATE, "Sam")
+
+        self.assertRegex(body, cli.NO_RESPONSE_SENT_RE)
+
+
+class NoResponseBusinessDayTests(unittest.TestCase):
+    def test_add_business_days_skips_weekends(self):
+        friday = datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc)
+
+        due_at = cli.add_business_days(friday, 7, "America/Los_Angeles")
+
+        self.assertEqual(due_at.date().isoformat(), "2026-07-07")
 
 
 class ActiveAtsDigestTests(unittest.TestCase):

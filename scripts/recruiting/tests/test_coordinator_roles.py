@@ -29,6 +29,104 @@ class RecruitingCoordinatorRoleTest(unittest.TestCase):
             ("AE", "Michael Goldstein"),
         )
 
+    def test_attention_prefix_subject_parses_embedded_role_and_candidate_name(self):
+        self.assertEqual(
+            coordinator.parse_required_subject(
+                "[hiring@] ATTN: Kyle - Account Executive - Michael Goldstein"
+            ),
+            ("AE", "Michael Goldstein"),
+        )
+
+    def test_subject_role_inference_handles_common_typos_and_variants(self):
+        self.assertEqual(
+            coordinator.infer_truewind_role_from_subject("[hiring@] ACOUNT EXECUTIVE - Nkechi Zita Ejikeme"),
+            "AE",
+        )
+        self.assertEqual(
+            coordinator.infer_truewind_role_from_subject("[hiring@] Growth Genaralist - Devika Sureshbabu"),
+            "Growth Generalist",
+        )
+        self.assertEqual(
+            coordinator.infer_truewind_role_from_subject("[hiring@] Growth Marketing Opening - Tanner Hoskin"),
+            "Growth Generalist",
+        )
+
+    def test_spam_report_subject_is_not_role_evidence(self):
+        self.assertEqual(
+            coordinator.infer_truewind_role_from_subject(
+                "[hiring@] Moderator's spam report for hiring@trytruewind.com"
+            ),
+            "Unknown",
+        )
+
+    def test_existing_other_role_backfills_from_stronger_parse(self):
+        class FakeNotion:
+            def __init__(self):
+                self.updated = []
+
+            def update_page(self, page_id, payload):
+                self.updated.append((page_id, payload))
+
+        prop_map = coordinator.NotionPropertyMap(role="Role at Truewind")
+        database_schema = {
+            "properties": {
+                "Candidate Name": {"type": "title"},
+                "Email": {"type": "email"},
+                "Source": {"type": "select"},
+                "Role at Truewind": {"type": "multi_select"},
+                "Resume URL": {"type": "url"},
+                "Career Stage": {"type": "select"},
+                "LinkedIn URL": {"type": "url"},
+                "Confidence Level - LI": {"type": "select"},
+                "Current Company": {"type": "rich_text"},
+                "Current Role": {"type": "rich_text"},
+                "Location": {"type": "select"},
+                "Date first entered": {"type": "date"},
+                "Gmail thread id": {"type": "rich_text"},
+                "Last sync at": {"type": "date"},
+            }
+        }
+        existing_page = {
+            "id": "page-1",
+            "properties": {
+                "Role at Truewind": {
+                    "type": "multi_select",
+                    "multi_select": [{"name": "Other"}],
+                },
+                "Source": {"type": "select", "select": {"name": "Inbound"}},
+            },
+        }
+        notion = FakeNotion()
+
+        page_id, was_created = coordinator.upsert_candidate_page(
+            notion,
+            database_schema,
+            prop_map,
+            candidate_name="Kris Thomas",
+            candidate_email="1kristhomas@gmail.com",
+            source="Inbound",
+            role="AE",
+            resume_url="",
+            career_stage="Unknown",
+            linkedin_url="",
+            linkedin_confidence="",
+            company="Unknown",
+            current_title="Unknown",
+            location="U.S.",
+            date_first_entered="2026-05-20T20:35:44+00:00",
+            gmail_thread_id="thread-1",
+            synced_at_iso="2026-06-30T00:00:00+00:00",
+            existing_page=existing_page,
+        )
+
+        self.assertEqual(page_id, "page-1")
+        self.assertFalse(was_created)
+        self.assertEqual(len(notion.updated), 1)
+        self.assertEqual(
+            notion.updated[0][1]["Role at Truewind"],
+            {"multi_select": [{"name": "AE"}]},
+        )
+
     def test_ae_uses_custom_gpt_proceed_template(self):
         prop_map = coordinator.NotionPropertyMap(role="Role at Truewind")
         self.assertTrue(

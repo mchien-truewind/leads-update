@@ -443,3 +443,70 @@ Mercedes asked why a specific recruiting rejection email draft for William was n
   - Gmail showed three messages, including the no-response closeout sent at `2026-06-30T00:53:33Z`.
 - New worker container emitted `[recruiting-worker] cycle_start 2026-06-30T00:59:16Z`.
 - Observed post-deploy logs showed attachment parsing warnings, but no Python traceback or crash. A `cycle_success` line had not appeared yet in the observed window.
+
+## 2026-06-29 Role Parsing And Backfill
+
+### What Was Asked
+
+- User asked why Kris Thomas had `Role=Other` when the role was clearly in the subject title.
+- User asked to make sure roles are parsed correctly.
+
+### What Was Found
+
+- Current parser already handled the simple subject `[hiring@] Account Executive - Kris Thomas` as `AE`, so Kris was likely stale/historical data.
+- Another real subject shape was broken:
+  - `[hiring@] ATTN: Kyle - Account Executive - Michael Goldstein`
+  - Old parse result: role `Other`, candidate `Account Executive - Michael Goldstein`
+  - Desired parse: role `AE`, candidate `Michael Goldstein`
+- Existing rows are intentionally protected from profile-field overwrite on ingest, so a stale `Other` role could remain forever unless explicitly backfilled.
+
+### Pre-Mutation QA
+
+- Built and ran a subject-only role backfill preview for rows with blank/`Unknown`/`Other` role.
+- First broader preview exposed false positives from body scanning:
+  - Google moderator spam digest
+  - Generic careers application
+  - Founding engineer inquiry
+- Tightened the preview and code to use conservative subject/title evidence for backfill and to reject invalid subject fragments before role matching.
+- Final preview proposed 11 clear subject-based updates:
+  - `Account Executive Candidate` -> `AE`
+  - `Application for BDR...` -> `BDR`
+  - `Account Executive - Michael Goldstein` -> `AE`
+  - `Kris Thomas` -> `AE`
+  - `Tanner Hoskin` -> `Growth Generalist`
+  - `Nkechi Zita Ejikeme` -> `AE`
+  - `Devika Sureshbabu` -> `Growth Generalist`
+  - `Jon Breault` -> `AE`
+  - `Forrest Lloyd` -> `AE`
+  - `Olivia Regina` -> `AE`
+  - `Arayla Caldwell` -> `Growth Generalist`
+
+### External Mutation
+
+- Applied the 11 Notion role updates from the final preview.
+- Readback preview returned zero remaining subject-based role updates.
+- Direct readback for Kris:
+  - Role `AE`
+  - Status `No response`
+  - Decision `Reject`
+
+### Code Fix
+
+- Updated `scripts/recruiting/coordinator_cli.py`:
+  - Added conservative `infer_truewind_role_from_subject(...)`.
+  - `parse_required_subject(...)` now scans hyphen-separated subject parts, so attention prefixes like `ATTN: Kyle - Account Executive - Michael Goldstein` do not block role/name parsing.
+  - `canonicalize_truewind_role(...)` now handles common typo/variant subjects:
+    - `acount executive`
+    - `genaralist`
+    - `growth marketing`
+  - Invalid fragments like `moderator's spam report` are rejected before role matching.
+  - Existing ATS rows backfill `Role at Truewind` only when the current role is weak: blank, `Unknown`, or `Other`.
+  - Existing specific/manual roles remain protected from overwrite.
+
+### Verification
+
+- `.venv/bin/python -m py_compile scripts/recruiting/coordinator_cli.py`
+- `.venv/bin/python -m unittest scripts/recruiting/tests/test_coordinator_roles.py scripts/recruiting/tests/test_coordinator_resume_extraction.py`
+  - Result: `Ran 51 tests ... OK`
+- Claude review approved the patch.
+- Explicit decision: `Other` is treated as a weak placeholder for this workflow and can be overwritten by specific subject/title evidence. This is intentional because it is how stale rows like Kris get repaired.

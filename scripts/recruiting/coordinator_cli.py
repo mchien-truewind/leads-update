@@ -2146,6 +2146,7 @@ INVALID_ROLE_FRAGMENTS = (
     "spam report",
     "contract idea",
 )
+SUBJECT_ROLE_PREFIX_RE = re.compile(r"(?i)^(?:attn|attention)\s*:\s*.+$")
 
 
 def classify_location(resume_text: str, snippet: str) -> str:
@@ -2163,27 +2164,37 @@ def canonicalize_truewind_role(raw_value: str) -> str:
     lowered = cleaned.lower()
     if not cleaned:
         return "Unknown"
+    if any(fragment in lowered for fragment in INVALID_ROLE_FRAGMENTS):
+        return "Unknown"
 
     if lowered in ROLE_CANONICAL:
         return ROLE_CANONICAL[lowered]
-    if "generalist" in lowered:
+    if "generalist" in lowered or "genaralist" in lowered:
+        return "Growth Generalist"
+    if "growth marketing" in lowered:
         return "Growth Generalist"
     if "growth associate" in lowered or "gtm associate" in lowered:
         return "Growth Generalist"
-    if "account executive" in lowered or re.search(r"\bae\b", lowered):
+    if "account executive" in lowered or "acount executive" in lowered or re.search(r"\bae\b", lowered):
         return "AE"
     if "bdr" in lowered or "business development representative" in lowered:
         return "BDR"
     if "sdr" in lowered:
         return "BDR"
-    if any(fragment in lowered for fragment in INVALID_ROLE_FRAGMENTS):
-        return "Unknown"
 
     stripped = ROLE_NOISE_TOKENS.sub(" ", cleaned)
     stripped = clean_text(stripped).strip("-:|,;")
     if not stripped:
         return "Unknown"
     return "Other"
+
+
+def infer_truewind_role_from_subject(subject: str, fallback_candidate_name: str = "") -> str:
+    parsed_subject = parse_required_subject(subject, fallback_candidate_name)
+    if parsed_subject and parsed_subject[0] not in {"Unknown", "Other"}:
+        return parsed_subject[0]
+    role = canonicalize_truewind_role(subject)
+    return role if role not in {"Unknown", "Other"} else "Unknown"
 
 
 def clean_candidate_name(value: str) -> str:
@@ -2207,6 +2218,19 @@ def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> t
     fallback_name = clean_candidate_name(fallback_candidate_name)
     if not body and fallback_name:
         return "Unknown", fallback_name
+
+    subject_parts = [clean_text(part) for part in re.split(r"\s*-\s*", body) if clean_text(part)]
+    for idx, part in enumerate(subject_parts):
+        role = canonicalize_truewind_role(part)
+        if role in ROLE_OPTIONS and role != "Other":
+            candidate_tail = " - ".join(subject_parts[idx + 1 :])
+            candidate_name = clean_candidate_name(candidate_tail)
+            if not candidate_name or canonicalize_truewind_role(candidate_name) in {"AE", "BDR", "Growth Generalist"}:
+                candidate_name = fallback_name
+            if candidate_name:
+                return role, candidate_name
+        if idx == 0 and SUBJECT_ROLE_PREFIX_RE.match(part):
+            continue
 
     match = re.match(r"^\s*(?P<left>.+?)\s*-\s*(?P<right>.+?)\s*$", body)
     if match:
@@ -5157,13 +5181,31 @@ def upsert_candidate_page(
 
     if page:
         # Existing ATS rows are manually curated in Notion. Avoid overwriting
-        # profile fields during subsequent sync cycles.
+        # profile fields during subsequent sync cycles. The exception is a weak
+        # blank/Unknown/Other role when the current thread parse finds a stronger
+        # role signal from the subject/body.
         props = page.get("properties", {})
         existing_source = notion_prop_value(props.get(prop_map.source, {})).strip()
+        existing_role_values = notion_prop_values(props.get(prop_map.role, {}))
+        existing_role = (
+            existing_role_values[0]
+            if len(existing_role_values) == 1
+            else notion_prop_value(props.get(prop_map.role, {})).strip()
+        )
+        update_payload: dict[str, Any] = {}
         if not existing_source and prop_map.source in properties_schema:
             built_source = build_notion_value(properties_schema[prop_map.source], source)
             if built_source is not None:
-                notion.update_page(page["id"], {prop_map.source: built_source})
+                update_payload[prop_map.source] = built_source
+        if (
+            role in ROLE_OPTIONS
+            and role != "Other"
+            and clean_text(existing_role).lower() in {"", "unknown", "other"}
+            and prop_map.role in properties_schema
+        ):
+            update_payload[prop_map.role] = build_notion_value(properties_schema[prop_map.role], [role])
+        if update_payload:
+            notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
         return page["id"], False
 
     role_values: list[str] = [role] if role in ROLE_OPTIONS else []
@@ -5570,7 +5612,9 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             if role in {"Unknown", "Other"}:
                 # A stated position (e.g. "Account Executive") may appear anywhere in the
                 # subject or body even when the primary subject parse missed it.
-                rescanned = canonicalize_truewind_role(f"{subject}\n{thread_body_text}")
+                rescanned = infer_truewind_role_from_subject(subject, candidate_name)
+                if rescanned in {"Unknown", "Other"}:
+                    rescanned = canonicalize_truewind_role(f"{subject}\n{thread_body_text}")
                 if rescanned not in {"Unknown", "Other"}:
                     role = rescanned
 

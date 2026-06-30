@@ -4910,6 +4910,19 @@ def custom_gpt_no_response_due(assignment_sent_at: datetime, now: datetime, wait
     return now.astimezone(timezone.utc) >= assignment_sent_at.astimezone(timezone.utc) + wait_delta
 
 
+def business_day_no_response_due(
+    sent_at: datetime | None,
+    reply_at: datetime | None,
+    now: datetime,
+    wait_business_days: int,
+    timezone_name: str,
+) -> bool:
+    if not sent_at or reply_at:
+        return False
+    due_at = add_business_days(sent_at, wait_business_days, timezone_name)
+    return now.astimezone(timezone.utc) >= due_at.astimezone(timezone.utc)
+
+
 def ensure_role_property_schema(
     notion: NotionClient,
     database_schema: dict[str, Any],
@@ -5845,6 +5858,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     non_scheduling_archive_failures = 0
     in_process_marked = 0
     no_response_drafts = 0
+    no_response_closeouts_sent = 0
     custom_gpt_no_response_sent = 0
     custom_gpt_no_response_send_failures = 0
     custom_gpt_no_response_skipped_young = 0
@@ -6053,6 +6067,77 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         update_payload[prop.status] = build_notion_value(
                             properties_schema[prop.status], STATUS_NEEDS_ATTENTION
                         )
+
+            assignment_sent_at = thread_latest_assignment_sent_at_any_thread(
+                gmail_service,
+                thread_ids=related_thread_ids,
+                sender_email=config.from_email,
+                keywords=config.assignment_keywords,
+            )
+            if assignment_sent_at and not update_payload:
+                reply_dt, _reply_text = latest_candidate_message_since_any_thread(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    candidate_email=candidate_email,
+                    since=assignment_sent_at,
+                )
+                if business_day_no_response_due(
+                    assignment_sent_at,
+                    reply_dt,
+                    now_local(config.timezone_name),
+                    config.no_response_wait_business_days,
+                    config.timezone_name,
+                ):
+                    no_response_sent_at = thread_latest_sent_matching_patterns_any_thread(
+                        gmail_service,
+                        thread_ids=related_thread_ids,
+                        sender_email=config.from_email,
+                        candidate_email=candidate_email,
+                        patterns=[NO_RESPONSE_SENT_RE],
+                    )
+                    sent_message_id = ""
+                    if not no_response_sent_at:
+                        first_name = extract_first_name(candidate_name, candidate_email)
+                        body = render_no_response_template(config.no_response_template, first_name)
+                        sent_message_id = send_reply_email(
+                            gmail_service,
+                            sender_email=config.from_email,
+                            to_email=candidate_email,
+                            thread_id=reply_thread_id,
+                            body_text=body,
+                        )
+                    if sent_message_id or no_response_sent_at:
+                        if sent_message_id:
+                            no_response_closeouts_sent += 1
+                        if prop.status in properties_schema:
+                            update_payload[prop.status] = build_notion_value(
+                                properties_schema[prop.status], STATUS_NO_RESPONSE
+                            )
+                        if prop.decision in properties_schema:
+                            update_payload[prop.decision] = build_notion_value(
+                                properties_schema[prop.decision], "Reject"
+                            )
+                        if prop.decision_time in properties_schema:
+                            update_payload[prop.decision_time] = build_notion_value(
+                                properties_schema[prop.decision_time], iso(now_local(config.timezone_name))
+                            )
+                        if prop.reject_draft_id in properties_schema:
+                            update_payload[prop.reject_draft_id] = build_notion_value(
+                                properties_schema[prop.reject_draft_id], ""
+                            )
+                        if prop.reject_send_at in properties_schema:
+                            update_payload[prop.reject_send_at] = build_notion_value(
+                                properties_schema[prop.reject_send_at], ""
+                            )
+                        closeout_labels = [label_id for label_id in (hiring_label_id, pipeline_label_id) if label_id]
+                        if closeout_labels:
+                            archived_count, archive_failures = remove_labels_from_threads(
+                                gmail_service,
+                                thread_ids=related_thread_ids,
+                                label_ids=closeout_labels,
+                            )
+                            reject_threads_archived += archived_count
+                            reject_archive_failures += archive_failures
 
             if update_payload:
                 notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
@@ -6766,6 +6851,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         prop,
     )
     print(f"No response drafts created: {no_response_drafts}")
+    print(f"No response closeouts sent: {no_response_closeouts_sent}")
     print(f"CustomGPT no-response closeouts sent: {custom_gpt_no_response_sent}")
     print(f"CustomGPT no-response closeouts skipped (younger than threshold): {custom_gpt_no_response_skipped_young}")
     print(f"CustomGPT no-response closeout send failures: {custom_gpt_no_response_send_failures}")

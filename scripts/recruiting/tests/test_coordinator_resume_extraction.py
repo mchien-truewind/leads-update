@@ -446,6 +446,23 @@ class NoResponseBusinessDayTests(unittest.TestCase):
 
         self.assertEqual(due_at.date().isoformat(), "2026-07-07")
 
+    def test_business_day_no_response_due_requires_no_reply(self):
+        sent_at = datetime(2026, 6, 12, 18, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 6, 24, 18, 0, tzinfo=timezone.utc)
+
+        self.assertTrue(
+            cli.business_day_no_response_due(sent_at, None, now, 7, "America/Los_Angeles")
+        )
+        self.assertFalse(
+            cli.business_day_no_response_due(
+                sent_at,
+                datetime(2026, 6, 13, 18, 0, tzinfo=timezone.utc),
+                now,
+                7,
+                "America/Los_Angeles",
+            )
+        )
+
 
 class EmailBodyFirstNameEvidenceTests(unittest.TestCase):
     def test_extracts_first_name_from_candidate_signoff(self):

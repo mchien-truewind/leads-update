@@ -317,3 +317,129 @@ Mercedes asked why a specific recruiting rejection email draft for William was n
 - Manual sends are detected by `thread_latest_manual_rejection_sent_at_any_thread(...)`; the worker then clears the draft state, keeps/sets `Status=Rejected`, and archives ATS labels.
 - Before this patch, correcting a Gmail draft after a first-name failure was not enough because the row had been moved to `Needs Attention` and the send gate only retried `Status=Rejected`.
 - After this patch, future corrected drafts with `Decision=Reject` and `Reject draft id` can retry from `Needs Attention`.
+
+### Deployment
+
+- The retry/name-evidence commit initially landed on branch `codex/slack-http-events-api` as `cb40223`; it was cherry-picked onto `main` as:
+  - Commit `2bd7ac80665b237cb54a89715c838501626a1b1b`
+  - Message `Retry reviewed rejection drafts`
+- Pushed `main` to GitHub.
+- Verified Railway identity before deploy checks:
+  - Email `mercedes@trytruewind.com`
+  - Workspace `Truewind`
+- Railway deployment:
+  - Deployment `d9edebd5-2fd7-4e0c-831e-264adf7c955f`
+  - Service `recruiting-sync-worker`
+  - Commit `2bd7ac80665b237cb54a89715c838501626a1b1b`
+  - Status `SUCCESS`
+- Post-deploy log readback:
+  - Container started.
+  - Worker emitted `[recruiting-worker] cycle_start 2026-06-30T00:35:54Z`.
+  - The observed log window showed document parsing/conversion warnings from attachment extraction, but no crash or Python traceback.
+  - A `cycle_success` line had not appeared yet within the observed post-deploy window.
+- Claude review note: `claude-review` was invoked with a compact review packet, but it did not return an approval/blocker. It attempted file inspection and ended with an interrupted request. Local compile/tests passed and the deploy was verified directly.
+
+## 2026-06-29 Kris Thomas No-Response Correction
+
+### What Was Asked
+
+- User asked why `1kristhomas@gmail.com` was still open rather than terminal.
+- User clarified the expected behavior: send the passed/no-response email, then mark ATS status `No response` as the terminal step.
+
+### What Was Found
+
+- Direct ATS readback for `1kristhomas@gmail.com`:
+  - Candidate `Kris Thomas`
+  - Status `Round 1 Scheduling`
+  - Decision `Proceed`
+  - Role `Other`
+  - Gmail thread `19e471a2c9861377`
+- Gmail evidence:
+  - Candidate applied on `2026-05-20`.
+  - Mercedes sent an assignment-style proceed email on `2026-05-22`.
+  - No candidate reply was found after that email.
+- Root cause:
+  - The row was `Role=Other`, so it was not classified into the CustomGPT no-response path.
+  - It was also `Round 1 Scheduling`, and that branch exited before the generic no-response logic.
+  - The no-response closeout rule therefore never ran for assignment-style proceed emails on non-CustomGPT `Round 1 Scheduling` rows.
+
+### External Mutation
+
+- Ran a guarded Kris-only helper under Railway production env.
+- Dry-run checked:
+  - Exactly one ATS row matched.
+  - Status was `Round 1 Scheduling`.
+  - Decision was `Proceed`.
+  - Assignment email existed.
+  - No candidate reply existed after assignment.
+  - Seven-business-day threshold had passed.
+  - No prior no-response closeout was already sent.
+  - Planned greeting was `Hi Kris,`.
+- Sent the no-response closeout email to `1kristhomas@gmail.com`.
+- Updated the ATS row:
+  - Status `No response`
+  - Decision `Reject`
+  - Decision time set
+  - Reject draft/send fields cleared
+  - Hiring label archived
+
+### Readback
+
+- ATS readback after mutation:
+  - Status `No response`
+  - Decision `Reject`
+  - Reject draft id blank
+  - Reject send at blank
+- Gmail readback after mutation:
+  - New sent message on `2026-06-30T00:53:33Z`
+  - Body snippet begins `Hi Kris, Haven't heard from you in a while...`
+
+### Code Fix
+
+- Updated `scripts/recruiting/coordinator_cli.py` so `Round 1 Scheduling` rows with assignment-style proceed emails can close out after no reply:
+  - Detect assignment email with `thread_latest_assignment_sent_at_any_thread(...)`.
+  - Require no candidate reply since assignment.
+  - Require `RECRUITING_NO_RESPONSE_WAIT_BUSINESS_DAYS` threshold.
+  - Skip the closeout branch if the current pass already prepared a scheduling/status update.
+  - Check for an already-sent no-response closeout before sending, so a partial Notion failure does not duplicate-send next run.
+  - Send the no-response closeout and then update ATS to `No response` / `Reject`.
+- Added `business_day_no_response_due(...)` and test coverage that a reply suppresses closeout.
+
+### Verification
+
+- `.venv/bin/python -m py_compile scripts/recruiting/coordinator_cli.py`
+- `.venv/bin/python -m unittest scripts/recruiting/tests/test_coordinator_roles.py scripts/recruiting/tests/test_coordinator_resume_extraction.py`
+  - Result: `Ran 47 tests ... OK`
+- Read-only preview before targeted Kris correction found two due assignment/no-reply rows:
+  - Kris Thomas
+  - Michael Goldstein
+- Direct readback for Michael showed he was already terminal:
+  - Status `Rejected`
+  - Decision `Reject`
+  - Reject fields blank
+  - Gmail had no-response closeout sent on `2026-06-29`.
+- Read-only preview after Kris correction showed no due assignment/no-reply `Round 1 Scheduling` rows remaining.
+
+### Review Notes
+
+- `claude-review` returned a stale/incorrect blocker report first, claiming `render_no_response_template` was undefined even though local AST and tests confirmed it exists.
+- The useful review risks were handled anyway:
+  - Added `not update_payload` gate so no-response cannot overwrite an active scheduling/status update prepared in the same pass.
+  - Added prior no-response sent detection before sending.
+- Second `claude-review` attempt could not read files in its own environment and refused to approve. This is a review shortfall; local tests and live readbacks were used as the verification basis.
+
+### Deployment
+
+- Committed and pushed:
+  - Commit `448d5c2`
+  - Message `Close stale round-one assignment no-responses`
+- Railway deployment:
+  - Deployment `9781d84e-8804-458f-b20f-63621c36d625`
+  - Commit `448d5c2`
+  - Status `SUCCESS`
+- Post-deploy readback for Kris remained correct:
+  - Status `No response`
+  - Decision `Reject`
+  - Gmail showed three messages, including the no-response closeout sent at `2026-06-30T00:53:33Z`.
+- New worker container emitted `[recruiting-worker] cycle_start 2026-06-30T00:59:16Z`.
+- Observed post-deploy logs showed attachment parsing warnings, but no Python traceback or crash. A `cycle_success` line had not appeared yet in the observed window.

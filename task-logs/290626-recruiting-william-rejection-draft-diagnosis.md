@@ -258,3 +258,62 @@ Mercedes asked why a specific recruiting rejection email draft for William was n
 
 - This changes the threshold once a qualifying outbound email is detected.
 - It still does not broaden what counts as a qualifying outreach email for Superposition booking-link/reschedule nudges. That trigger expansion still needs a preview-first implementation before sending emails.
+
+### Deployment
+
+- Committed scoped recruiting no-response changes to `main`:
+  - Commit `12c4079525dea2d2652c1dab4dba5b61f988065a`
+  - Message `Update recruiting no-response closeouts`
+- Pushed `main` to GitHub.
+- Railway created deployment `d4028c28-8e90-4e4c-a73b-ecc0d80450d9` for that commit, then a later `main` merge deployment superseded it:
+  - Latest deployment `ae9784ad-c3cd-4ee1-b4b5-b36487c42607`
+  - Latest commit `d5c4ecd3597023085f89adf37a66a349f37337bb`
+  - Verified `12c4079525dea2d2652c1dab4dba5b61f988065a` is an ancestor of `origin/main`, so the latest deployment includes the recruiting changes.
+  - Railway status: `SUCCESS`
+- Log readback showed the new recruiting container started and emitted `[recruiting-worker] cycle_start 2026-06-29T23:39:16Z`.
+- The first cycle had not yet printed `cycle_success` in the observed log window; visible output showed document extraction warnings only, with no crash or Python traceback.
+- Claude review note: compact Claude review of the final 7-business-day diff timed out with no output. Earlier Claude completion review approved the template/status portion as coherent, and local compile/tests passed.
+
+## 2026-06-29 Rejection Retry And Email-Body Name Evidence
+
+### What Was Asked
+
+- User manually sent some blocked rejection drafts and wanted confirmation that rejection emails are being sent regularly.
+- User asked to fix the retry behavior so corrected first-name drafts can be sent after a first-name verifier failure.
+- User asked the first-name verifier to scan the candidate's original email body because candidates often sign off with the first name that should be used.
+
+### What Was Done
+
+- Updated `scripts/recruiting/coordinator_cli.py`:
+  - Added `should_process_reject_draft(...)`.
+  - Rejection draft send gate now allows `Status=Needs Attention` as well as `Status=Rejected` when `Decision=Reject` and `Reject draft id` is present.
+  - Added candidate email-body first-name evidence extraction:
+    - `first_names_from_email_body(...)`
+    - `candidate_email_body_first_names(...)`
+  - `build_rejection_first_name_evidence(...)` now includes an `email_body` evidence source from candidate-authored Gmail messages.
+  - Email-body evidence strips quoted replies and requires signature candidates to look like person names, preventing Mercedes/signature text or ordinary sentences from becoming false first-name evidence.
+- Updated tests:
+  - `scripts/recruiting/tests/test_coordinator_roles.py`
+    - Confirms `Needs Attention` + `Decision=Reject` + draft id can retry the send gate.
+  - `scripts/recruiting/tests/test_coordinator_resume_extraction.py`
+    - Confirms first names are extracted from sign-offs like `Best, Chun-Chi`.
+    - Confirms first names are extracted from final signature lines like `Aishwarya Babuji`.
+    - Confirms names present only in quoted prior emails are ignored.
+
+### Verification
+
+- `.venv/bin/python -m py_compile scripts/recruiting/coordinator_cli.py`
+- `.venv/bin/python -m unittest scripts/recruiting/tests/test_coordinator_roles.py scripts/recruiting/tests/test_coordinator_resume_extraction.py`
+  - Result: `Ran 46 tests ... OK`
+- Production log readback after user manually sent blocked rejection drafts:
+  - Earlier cycle: `Reject drafts auto-send skipped (first-name mismatch): 7`.
+  - Later cycle: `Manual rejection sends auto-marked: 7`.
+  - Later cycle: `Rejected threads archived from ATS labels: 7`.
+  - Later cycle printed `[recruiting-worker] cycle_success`.
+
+### What Was Learned
+
+- The worker already runs regularly and reconciles manually sent rejection emails.
+- Manual sends are detected by `thread_latest_manual_rejection_sent_at_any_thread(...)`; the worker then clears the draft state, keeps/sets `Status=Rejected`, and archives ATS labels.
+- Before this patch, correcting a Gmail draft after a first-name failure was not enough because the row had been moved to `Needs Attention` and the send gate only retried `Status=Rejected`.
+- After this patch, future corrected drafts with `Decision=Reject` and `Reject draft id` can retry from `Needs Attention`.

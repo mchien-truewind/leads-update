@@ -50,6 +50,22 @@ class RecruitingCoordinatorRoleTest(unittest.TestCase):
             )
         )
 
+    def test_needs_attention_rows_with_reject_draft_can_retry_send_gate(self):
+        self.assertTrue(
+            coordinator.should_process_reject_draft(
+                status="Needs Attention",
+                decision="Reject",
+                reject_draft_id="draft-123",
+            )
+        )
+        self.assertFalse(
+            coordinator.should_process_reject_draft(
+                status="Round 1 Scheduling",
+                decision="Reject",
+                reject_draft_id="draft-123",
+            )
+        )
+
     def test_terminal_rows_without_pending_reject_draft_are_still_skipped(self):
         self.assertTrue(
             coordinator.should_skip_terminal_status_before_decision_processing(

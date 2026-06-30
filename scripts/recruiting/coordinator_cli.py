@@ -2674,6 +2674,70 @@ def resume_first_names_from_threads(gmail_service, *, thread_ids: list[str]) -> 
     return list(dict.fromkeys(name for name in names if name))
 
 
+SIGNOFF_PREFIX_RE = re.compile(
+    r"(?i)^(?:best|thanks|thank you|thank you!|regards|sincerely|cheers|warmly|talk soon|appreciate it)[,!. ]*$"
+)
+EMAIL_QUOTE_START_RE = re.compile(
+    r"(?is)(?:\n|^|\s)(?:On\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?.{0,180}?wrote:|From:\s|-----Original Message-----)"
+)
+EMAIL_BODY_NON_SIGNATURE_RE = re.compile(r"(?i)^(?:hi|hello|hey)(?:\s+.+)?[,!. ]*$")
+
+
+def candidate_email_body_first_names(
+    gmail_service,
+    *,
+    thread_ids: list[str],
+    candidate_email: str,
+) -> list[str]:
+    names: list[str] = []
+    normalized_candidate_email = normalize_email(candidate_email)
+    if not normalized_candidate_email:
+        return names
+    for thread_id in thread_ids:
+        try:
+            thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+        except Exception:
+            continue
+        for message in sorted_thread_messages(thread):
+            headers = header_map(message)
+            from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+            if from_email != normalized_candidate_email:
+                continue
+            body = extract_message_body_text(message)
+            names.extend(first_names_from_email_body(body))
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def first_names_from_email_body(body_text: str) -> list[str]:
+    quote_match = EMAIL_QUOTE_START_RE.search(body_text or "")
+    if quote_match:
+        body_text = (body_text or "")[: quote_match.start()]
+    lines = [
+        clean_text(re.sub(r"<[^>]+>", " ", line)).strip(" -\t")
+        for line in (body_text or "").replace("\r", "\n").split("\n")
+    ]
+    lines = [line for line in lines if line]
+    names: list[str] = []
+    for idx, line in enumerate(lines):
+        if idx > 0 and SIGNOFF_PREFIX_RE.match(lines[idx - 1]):
+            first_name = first_name_from_display_name(line) if looks_like_person_name(line) else ""
+            if first_name:
+                names.append(first_name)
+        if SIGNOFF_PREFIX_RE.match(line) and idx + 1 < len(lines):
+            next_line = lines[idx + 1]
+            first_name = first_name_from_display_name(next_line) if looks_like_person_name(next_line) else ""
+            if first_name:
+                names.append(first_name)
+    for line in reversed(lines[-8:]):
+        if EMAIL_BODY_NON_SIGNATURE_RE.match(line):
+            continue
+        first_name = first_name_from_display_name(line) if looks_like_person_name(line) else ""
+        if first_name:
+            names.append(first_name)
+            break
+    return list(dict.fromkeys(names))
+
+
 def build_rejection_first_name_evidence(
     gmail_service,
     *,
@@ -2685,6 +2749,11 @@ def build_rejection_first_name_evidence(
 ) -> dict[str, list[str]]:
     evidence: dict[str, list[str]] = {
         "email": candidate_email_display_first_names(
+            gmail_service,
+            thread_ids=thread_ids,
+            candidate_email=candidate_email,
+        ),
+        "email_body": candidate_email_body_first_names(
             gmail_service,
             thread_ids=thread_ids,
             candidate_email=candidate_email,
@@ -4802,9 +4871,15 @@ def should_skip_terminal_status_before_decision_processing(
 ) -> bool:
     if not status_is_terminal(status):
         return False
-    if status_key(status) == "rejected" and clean_text(decision).lower() == "reject" and reject_draft_id.strip():
+    if should_process_reject_draft(status=status, decision=decision, reject_draft_id=reject_draft_id):
         return False
     return True
+
+
+def should_process_reject_draft(*, status: str, decision: str, reject_draft_id: str) -> bool:
+    if clean_text(decision).lower() != "reject" or not reject_draft_id.strip():
+        return False
+    return status_key(status) in {"rejected", "needs attention"}
 
 
 def should_exclude_from_active_digest(status: str) -> bool:
@@ -6332,7 +6407,11 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         properties_schema[prop.decision_time], iso(decision_time)
                     )
 
-            if reject_draft_id and current_status == "rejected":
+            if should_process_reject_draft(
+                status=current_status_raw,
+                decision=decision,
+                reject_draft_id=reject_draft_id,
+            ):
                 candidate_notion_url = notion_page_url(page.get("id", ""))
                 draft = get_gmail_draft(gmail_service, reject_draft_id)
                 draft_created_at = gmail_draft_created_at(draft or {})

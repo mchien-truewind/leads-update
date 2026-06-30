@@ -447,6 +447,40 @@ class NoResponseBusinessDayTests(unittest.TestCase):
         self.assertEqual(due_at.date().isoformat(), "2026-07-07")
 
 
+class EmailBodyFirstNameEvidenceTests(unittest.TestCase):
+    def test_extracts_first_name_from_candidate_signoff(self):
+        body = """Hi Mercedes,
+
+Thanks for taking a look. I attached my resume.
+
+Best,
+Chun-Chi
+"""
+
+        self.assertEqual(cli.first_names_from_email_body(body), ["Chun-Chi"])
+
+    def test_extracts_first_name_from_last_signature_line(self):
+        body = """Hello,
+
+I am interested in the AE role.
+
+Aishwarya Babuji
+"""
+
+        self.assertEqual(cli.first_names_from_email_body(body), ["Aishwarya"])
+
+    def test_ignores_names_only_present_in_quoted_email(self):
+        body = """Hello,
+
+I attached my resume.
+
+On Mon, Jun 15, 2026 at 4:23 PM Mercedes Chien <mercedes@trytruewind.com> wrote:
+Mercedes
+"""
+
+        self.assertEqual(cli.first_names_from_email_body(body), [])
+
+
 class ActiveAtsDigestTests(unittest.TestCase):
     def _candidate(
         self,

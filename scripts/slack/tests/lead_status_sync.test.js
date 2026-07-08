@@ -93,12 +93,17 @@ function testLeadClassification() {
     { targetStatus: STATUS.NURTURING, reason: 'reply_signal' },
   );
   assert.deepStrictEqual(
-    classifyLeadStatus(contact(4, { hs_lead_status: STATUS.WORKING, hs_email_optout: 'true' }), 1),
+    classifyLeadStatus(contact(4, { hs_lead_status: STATUS.WORKING, do_not_contact: 'true' }), 1),
     {
       targetStatus: STATUS.DISQUALIFIED,
       disqualifiedReason: DISQUALIFIED_REASONS.NOT_INTERESTED,
       reason: 'disqualified_signal',
     },
+  );
+  // Email opt-out alone is not a disqualification signal.
+  assert.deepStrictEqual(
+    classifyLeadStatus(contact(41, { hs_lead_status: STATUS.NEW, hs_email_optout: 'true' }), 1),
+    { targetStatus: STATUS.WORKING, reason: 'touchpoint_signal' },
   );
   assert.deepStrictEqual(
     classifyLeadStatus(contact(5, { hs_lead_status: STATUS.DISQUALIFIED }), 0),
@@ -169,7 +174,7 @@ function testWebinarClassification() {
   );
   assert.deepStrictEqual(
     classifyLeadStatus(
-      contact(14, { hs_lead_status: STATUS.WORKING, hs_email_optout: 'true' }),
+      contact(14, { hs_lead_status: STATUS.WORKING, do_not_contact: 'true' }),
       0,
       { webinarAttendance: true },
     ),
@@ -178,6 +183,16 @@ function testWebinarClassification() {
       disqualifiedReason: DISQUALIFIED_REASONS.NOT_INTERESTED,
       reason: 'disqualified_signal',
     },
+  );
+  // Opted out of email but attended a webinar: opt-out alone does not
+  // disqualify, so attendance still moves them to Nurturing.
+  assert.deepStrictEqual(
+    classifyLeadStatus(
+      contact(15, { hs_lead_status: STATUS.WORKING, hs_email_optout: 'true' }),
+      0,
+      { webinarAttendance: true },
+    ),
+    { targetStatus: STATUS.NURTURING, reason: 'webinar_attendance_signal' },
   );
 }
 

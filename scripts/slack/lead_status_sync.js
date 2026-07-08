@@ -898,7 +898,10 @@ function hasReplySignal(properties) {
 }
 
 function disqualifiedSignal(properties) {
-  if (truthy(properties.do_not_contact) || truthy(properties.hs_email_optout)) {
+  // Only an explicit "do not contact" disqualifies. Email opt-out alone does
+  // not — an unsubscribed contact can still show intent (e.g. webinar
+  // attendance) and is classified by their other signals.
+  if (truthy(properties.do_not_contact)) {
     return DISQUALIFIED_REASONS.NOT_INTERESTED;
   }
   if (

@@ -191,7 +191,7 @@ Status rules:
 - Working: `Has contacted but no response` when BDR touchpoints exist and no reply signal exists.
 - Nurturing: `has contacted & responded` when a reply or meeting-booked signal exists.
 - Nurturing (webinar attendance): contacts in the list with a HubSpot note whose body contains `Workshop`, `Webinar`, or `Fireside Chat` together with `Yes` also move to Nurturing — they attended a content event and want to hear more. Notes are found by a HubSpot note search (incremental runs scan notes created in the lookback window; full runs scan all notes), so this works in every touchpoint-source mode. Disqualification signals and protected statuses still win.
-- Disqualified: `Disqualified (all)` when deterministic disqualification signals exist; `disqualified_reasons` is preserved or backfilled.
+- Disqualified: `Disqualified (all)` when deterministic disqualification signals exist; `disqualified_reasons` is preserved or backfilled. Signals: explicit `do_not_contact = true` (`Not Interested`) or hard bounce/quarantine (`Bad Contact Info`). Email opt-out alone does NOT disqualify — an unsubscribed contact can still show intent (e.g. webinar attendance) and is classified by their other signals.
 - Protected statuses are not overwritten: `MQL`, existing disqualified contacts, and customer/opportunity/evangelist lifecycle contacts.
 
 Required env:

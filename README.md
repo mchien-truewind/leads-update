@@ -190,6 +190,7 @@ Status rules:
 - New: `No one has contacted them` when there is no counted outreach activity.
 - Working: `Has contacted but no response` when BDR touchpoints exist and no reply signal exists.
 - Nurturing: `has contacted & responded` when a reply or meeting-booked signal exists.
+- Nurturing (webinar attendance): contacts in the list with a HubSpot note whose body contains `Workshop`, `Webinar`, or `Fireside Chat` together with `Yes` also move to Nurturing — they attended a content event and want to hear more. Notes are found by a HubSpot note search (incremental runs scan notes created in the lookback window; full runs scan all notes), so this works in every touchpoint-source mode. Disqualification signals and protected statuses still win.
 - Disqualified: `Disqualified (all)` when deterministic disqualification signals exist; `disqualified_reasons` is preserved or backfilled.
 - Protected statuses are not overwritten: `MQL`, existing disqualified contacts, and customer/opportunity/evangelist lifecycle contacts.
 
@@ -215,6 +216,8 @@ LEAD_STATUS_SYNC_BDR_OWNER_IDS=84547076,89305622,91143842,91143844
 LEAD_STATUS_SYNC_BDR_EMAILS=sarah@trytruewind.com,xavier@trytruewind.com,jenilee@trytruewind.com,brendan@trytruewind.com
 LEAD_STATUS_SYNC_TARGET_HOUR=19
 LEAD_STATUS_SYNC_TARGET_MINUTE=30
+LEAD_STATUS_SYNC_ENABLE_WEBINAR_ATTENDANCE=true  # set false to disable the webinar-attendance Nurturing rule
+LEAD_STATUS_SYNC_WEBINAR_ATTENDANCE_KEYWORDS=Workshop,Webinar,Fireside Chat
 LEAD_STATUS_SYNC_WEEKLY_FULL_DAY=0  # optional; 0=Sunday, blank disables scheduled full runs
 ```
 

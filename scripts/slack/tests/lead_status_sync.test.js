@@ -13,6 +13,7 @@ const {
   makeRateLimitedHubSpot,
   summarizeNoteTouchpoints,
   runLeadStatusSync,
+  webinarAttendanceSignal,
 } = require('../lead_status_sync');
 
 const TEST_CONFIG = {
@@ -130,6 +131,56 @@ function testLeadClassification() {
   );
 }
 
+function testWebinarAttendanceSignal() {
+  assert.strictEqual(webinarAttendanceSignal('Webinar Attended: Yes'), true);
+  assert.strictEqual(webinarAttendanceSignal('AI workshop follow-up — attended: YES'), true);
+  assert.strictEqual(webinarAttendanceSignal('Fireside chat June — Attended: yes'), true);
+  assert.strictEqual(webinarAttendanceSignal('Workshop registration: No'), false);
+  assert.strictEqual(webinarAttendanceSignal('Attended: Yes'), false);
+  assert.strictEqual(webinarAttendanceSignal('Webinar invite sent'), false);
+  assert.strictEqual(webinarAttendanceSignal(''), false);
+  assert.strictEqual(webinarAttendanceSignal('Fireside — yes'), false);
+}
+
+function testWebinarClassification() {
+  assert.deepStrictEqual(
+    classifyLeadStatus(contact(10, { hs_lead_status: STATUS.WORKING }), 2, { webinarAttendance: true }),
+    { targetStatus: STATUS.NURTURING, reason: 'webinar_attendance_signal' },
+  );
+  assert.deepStrictEqual(
+    classifyLeadStatus(
+      contact(11, { hs_lead_status: STATUS.WORKING, hs_sales_email_last_replied: '2026-06-20T12:00:00Z' }),
+      2,
+      { webinarAttendance: true },
+    ),
+    { targetStatus: STATUS.NURTURING, reason: 'reply_signal' },
+  );
+  assert.deepStrictEqual(
+    classifyLeadStatus(contact(12, { hs_lead_status: STATUS.CONVERTED }), 0, { webinarAttendance: true }),
+    { reason: 'protected' },
+  );
+  assert.deepStrictEqual(
+    classifyLeadStatus(
+      contact(13, { hs_lead_status: STATUS.DISQUALIFIED, disqualified_reasons: 'Not ICP' }),
+      0,
+      { webinarAttendance: true },
+    ),
+    { reason: 'protected_disqualified' },
+  );
+  assert.deepStrictEqual(
+    classifyLeadStatus(
+      contact(14, { hs_lead_status: STATUS.WORKING, hs_email_optout: 'true' }),
+      0,
+      { webinarAttendance: true },
+    ),
+    {
+      targetStatus: STATUS.DISQUALIFIED,
+      disqualifiedReason: DISQUALIFIED_REASONS.NOT_INTERESTED,
+      reason: 'disqualified_signal',
+    },
+  );
+}
+
 function testNoteTouchpointClassification() {
   const sinceMs = Date.parse('2026-02-20T00:00:00.000Z');
 
@@ -229,6 +280,9 @@ async function testIncrementalSyncUsesRecentCandidatesAndAllowedEngagements() {
     if (path === '/crm/v3/objects/calls/search') {
       return { results: [] };
     }
+    if (path === '/crm/v3/objects/notes/search') {
+      return { results: [] };
+    }
     if (path === '/crm/v3/objects/contacts/batch/read') {
       return {
         results: [
@@ -319,6 +373,9 @@ async function testIncrementalSyncUsesRecentNooksNotInterestedCalls() {
     if (path === '/crm/v3/objects/contacts/search') {
       return { results: [] };
     }
+    if (path === '/crm/v3/objects/notes/search') {
+      return { results: [] };
+    }
     if (path === '/crm/v3/objects/contacts/batch/read') {
       return {
         results: [
@@ -371,6 +428,93 @@ async function testIncrementalSyncUsesRecentNooksNotInterestedCalls() {
   });
 }
 
+async function testIncrementalSyncMovesWebinarAttendeesToNurturing() {
+  const updates = [];
+  const noteSearchBodies = [];
+
+  async function hubspot(path, options = {}) {
+    if (path.startsWith('/crm/v3/lists/694/memberships/join-order')) {
+      return { results: [{ recordId: '1' }] };
+    }
+    if (path === '/crm/v3/objects/contacts/search') {
+      return { results: [] };
+    }
+    if (path === '/crm/v3/objects/calls/search') {
+      return { results: [] };
+    }
+    if (path === '/crm/v3/objects/notes/search') {
+      noteSearchBodies.push(JSON.parse(options.body));
+      return {
+        results: [
+          {
+            id: 'w1',
+            properties: {
+              hs_note_body: '<p>Fireside Chat: AI for Controllers</p><p>Attended: Yes</p>',
+              hs_createdate: String(Date.parse('2026-07-07T18:00:00.000Z')),
+            },
+          },
+        ],
+      };
+    }
+    if (path === '/crm/v4/associations/notes/contacts/batch/read') {
+      return {
+        results: [
+          { from: { id: 'w1' }, to: [{ toObjectId: '1' }, { toObjectId: '99' }] },
+        ],
+      };
+    }
+    if (path === '/crm/v3/objects/contacts/batch/read') {
+      return {
+        results: [
+          contact(1, {
+            hs_lead_status: STATUS.WORKING,
+            bdr_touchpoints_90d: '0',
+          }),
+        ],
+      };
+    }
+    if (path.startsWith('/engagements/v1/engagements/associated/CONTACT/1/paged')) {
+      return { hasMore: false, results: [] };
+    }
+    if (path === '/crm/v3/objects/contacts/batch/update') {
+      updates.push(...JSON.parse(options.body).inputs);
+      return {};
+    }
+    throw new Error(`Unexpected HubSpot call: ${path}`);
+  }
+
+  const stats = await runLeadStatusSync({
+    mode: 'incremental',
+    listId: '694',
+    now: new Date('2026-07-08T02:30:00.000Z'),
+    lookbackHours: 28,
+    touchpointDays: 90,
+    bdrOwnerIds: ['100'],
+    bdrEmails: ['bdr@example.com'],
+    searchDelayMs: 0,
+    generalDelayMs: 0,
+    engagementConcurrency: 1,
+    hubspot,
+    skipSlack: true,
+    logger: { log() {} },
+  });
+
+  assert.strictEqual(stats.webinarAttendanceNotes, 1);
+  assert.strictEqual(stats.webinarAttendanceContacts, 1);
+  assert.strictEqual(stats.candidateCount, 1);
+  assert.strictEqual(stats.statusUpdates, 1);
+  assert.deepStrictEqual(updates, [
+    { id: '1', properties: { hs_lead_status: STATUS.NURTURING } },
+  ]);
+  assert.match(stats.slackText || formatLeadStatusSyncSummary(stats), /Webinar attendance contacts: 1/);
+  assert.ok(noteSearchBodies.length >= 1);
+  for (const body of noteSearchBodies) {
+    const filters = body.filterGroups[0].filters;
+    assert.ok(filters.some(f => f.propertyName === 'hs_note_body' && f.operator === 'CONTAINS_TOKEN'));
+    assert.ok(filters.some(f => f.propertyName === 'hs_createdate' && f.operator === 'GTE'));
+  }
+}
+
 async function testNotesModeUsesAssociatedNotesForTouchpoints() {
   const updates = [];
   const calls = [];
@@ -386,6 +530,9 @@ async function testNotesModeUsesAssociatedNotesForTouchpoints() {
       return field === 'notes_last_updated' ? { results: [{ id: '1' }] } : { results: [] };
     }
     if (path === '/crm/v3/objects/calls/search') {
+      return { results: [] };
+    }
+    if (path === '/crm/v3/objects/notes/search') {
       return { results: [] };
     }
     if (path === '/crm/v3/objects/contacts/batch/read') {
@@ -597,12 +744,15 @@ async function testRateLimitedHubSpotReleasesAfterError() {
 
 async function run() {
   testTouchpointFiltering();
+  testWebinarAttendanceSignal();
+  testWebinarClassification();
   testNoteTouchpointClassification();
   testNoteTouchpointSummaryDedupesAndTracksExclusions();
   testLeadClassification();
   testUpdateBuilderOnlyMovesForwardAndMaintainsTouchpoints();
   await testIncrementalSyncUsesRecentCandidatesAndAllowedEngagements();
   await testIncrementalSyncUsesRecentNooksNotInterestedCalls();
+  await testIncrementalSyncMovesWebinarAttendeesToNurturing();
   await testNotesModeUsesAssociatedNotesForTouchpoints();
   testSummaryIncludesKeyCounts();
   testNotesModeDefaultsToLowerConcurrency();

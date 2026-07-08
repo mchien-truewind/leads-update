@@ -7,6 +7,7 @@ const DEFAULT_TOUCHPOINT_DAYS = 90;
 const DEFAULT_TOUCHPOINT_SOURCE = 'engagements';
 const DEFAULT_BDR_OWNER_IDS = ['84547076', '89305622', '91143842', '91143844'];
 const DEFAULT_NOOKS_NOT_INTERESTED_DISPOSITION_IDS = ['739e9efc-95d4-448d-9440-7a14287a02fa'];
+const DEFAULT_WEBINAR_ATTENDANCE_KEYWORDS = ['Workshop', 'Webinar', 'Fireside Chat'];
 const DEFAULT_BDR_EMAILS = [
   'sarah@trytruewind.com',
   'xavier@trytruewind.com',
@@ -165,6 +166,11 @@ function makeDefaultConfig(env = process.env) {
       env.LEAD_STATUS_SYNC_NOOKS_NOT_INTERESTED_DISPOSITION_IDS,
       DEFAULT_NOOKS_NOT_INTERESTED_DISPOSITION_IDS,
     ).map(String),
+    enableWebinarAttendanceSync: String(env.LEAD_STATUS_SYNC_ENABLE_WEBINAR_ATTENDANCE || 'true').toLowerCase() !== 'false',
+    webinarAttendanceKeywords: parseDelimitedList(
+      env.LEAD_STATUS_SYNC_WEBINAR_ATTENDANCE_KEYWORDS,
+      DEFAULT_WEBINAR_ATTENDANCE_KEYWORDS,
+    ),
     searchDelayMs: Number(env.LEAD_STATUS_SYNC_SEARCH_DELAY_MS || 250),
     generalDelayMs: Number(env.LEAD_STATUS_SYNC_GENERAL_DELAY_MS || 80),
     engagementConcurrency: Number(env.LEAD_STATUS_SYNC_ENGAGEMENT_CONCURRENCY || (touchpointSource === 'engagements' ? 6 : 2)),
@@ -446,6 +452,85 @@ async function findNooksNotInterestedContactIds(hubspot, sinceMs, config) {
   if (!calls.length) return { callCount: 0, contactIds: [] };
   const contactIds = await readCallContactAssociations(hubspot, calls.map(call => String(call.id)), config);
   return { callCount: calls.length, contactIds };
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function webinarAttendanceSignal(text, keywords = DEFAULT_WEBINAR_ATTENDANCE_KEYWORDS) {
+  if (!text) return false;
+  const trimmed = (keywords || []).map(keyword => String(keyword).trim()).filter(Boolean);
+  if (!trimmed.length) return false;
+  const keywordPattern = new RegExp(
+    `\\b(?:${trimmed.map(keyword => escapeRegExp(keyword).replace(/\s+/g, '\\s+')).join('|')})\\b`,
+    'i',
+  );
+  return keywordPattern.test(text) && /\byes\b/i.test(text);
+}
+
+async function searchWebinarAttendanceNotes(hubspot, sinceMs, config) {
+  const notesById = new Map();
+  for (const keyword of config.webinarAttendanceKeywords || []) {
+    // Server-side search narrows by the keyword's first token + "Yes"; the
+    // authoritative match (full phrase AND "Yes") happens locally below.
+    const filters = [
+      { propertyName: 'hs_note_body', operator: 'CONTAINS_TOKEN', value: String(keyword).trim().split(/\s+/)[0] },
+      { propertyName: 'hs_note_body', operator: 'CONTAINS_TOKEN', value: 'Yes' },
+    ];
+    if (sinceMs) {
+      filters.push({ propertyName: 'hs_createdate', operator: 'GTE', value: String(sinceMs) });
+    }
+    let after;
+    do {
+      const body = {
+        filterGroups: [{ filters }],
+        properties: ['hs_note_body', 'hs_timestamp', 'hs_createdate'],
+        limit: 100,
+        sorts: [{ propertyName: 'hs_createdate', direction: 'DESCENDING' }],
+      };
+      if (after) body.after = after;
+      const data = await hubspot('/crm/v3/objects/notes/search', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      for (const note of data.results || []) {
+        if (webinarAttendanceSignal(noteBody(note), config.webinarAttendanceKeywords)) {
+          notesById.set(String(note.id), note);
+        }
+      }
+      after = data.paging?.next?.after;
+      if (config.searchDelayMs) await sleep(config.searchDelayMs);
+    } while (after);
+  }
+  return [...notesById.values()];
+}
+
+async function readNoteContactAssociations(hubspot, noteIds, config) {
+  const contactIds = new Set();
+  for (let i = 0; i < noteIds.length; i += 100) {
+    const data = await hubspot('/crm/v4/associations/notes/contacts/batch/read', {
+      method: 'POST',
+      body: JSON.stringify({
+        inputs: noteIds.slice(i, i + 100).map(id => ({ id })),
+      }),
+    });
+    for (const row of data.results || []) {
+      for (const target of row.to || []) {
+        const id = target.toObjectId || target.id;
+        if (id) contactIds.add(String(id));
+      }
+    }
+    if (config.generalDelayMs) await sleep(config.generalDelayMs);
+  }
+  return [...contactIds];
+}
+
+async function findWebinarAttendanceContactIds(hubspot, sinceMs, config) {
+  const notes = await searchWebinarAttendanceNotes(hubspot, sinceMs, config);
+  if (!notes.length) return { noteCount: 0, contactIds: [] };
+  const contactIds = await readNoteContactAssociations(hubspot, notes.map(note => String(note.id)), config);
+  return { noteCount: notes.length, contactIds };
 }
 
 function metadataEmail(metadata) {
@@ -813,7 +898,10 @@ function hasReplySignal(properties) {
 }
 
 function disqualifiedSignal(properties) {
-  if (truthy(properties.do_not_contact) || truthy(properties.hs_email_optout)) {
+  // Only an explicit "do not contact" disqualifies. Email opt-out alone does
+  // not — an unsubscribed contact can still show intent (e.g. webinar
+  // attendance) and is classified by their other signals.
+  if (truthy(properties.do_not_contact)) {
     return DISQUALIFIED_REASONS.NOT_INTERESTED;
   }
   if (
@@ -875,6 +963,9 @@ function classifyLeadStatus(contact, touchpointCount, signals = {}) {
   }
   if (hasReplySignal(properties)) {
     return { targetStatus: STATUS.NURTURING, reason: 'reply_signal' };
+  }
+  if (signals.webinarAttendance) {
+    return { targetStatus: STATUS.NURTURING, reason: 'webinar_attendance_signal' };
   }
   if (touchpointCount > 0) {
     return { targetStatus: STATUS.WORKING, reason: 'touchpoint_signal' };
@@ -978,6 +1069,8 @@ function formatLeadStatusSyncSummary(stats) {
     `Duplicate notes excluded: ${stats.duplicateNotes || 0}`,
     `Nooks not interested calls: ${stats.nooksNotInterestedCalls || 0}`,
     `Nooks not interested contacts: ${stats.nooksNotInterestedContacts || 0}`,
+    `Webinar attendance notes: ${stats.webinarAttendanceNotes || 0}`,
+    `Webinar attendance contacts: ${stats.webinarAttendanceContacts || 0}`,
     `Errors: ${stats.errors}`,
     '',
     'Stage moves:',
@@ -1035,6 +1128,23 @@ async function runLeadStatusSync(options = {}) {
     );
   }
 
+  const webinarAttendanceContactIds = new Set();
+  let webinarAttendanceNotes = 0;
+
+  if (config.enableWebinarAttendanceSync) {
+    const sinceMs = mode === 'full' ? 0 : now.getTime() - lookbackMs;
+    const webinarResult = await findWebinarAttendanceContactIds(hubspot, sinceMs, config);
+    webinarAttendanceNotes = webinarResult.noteCount;
+    // Nurturing from webinar attendance stays scoped to the open-leads list.
+    for (const id of webinarResult.contactIds) {
+      if (listSet.has(id)) webinarAttendanceContactIds.add(id);
+    }
+    logger.log?.(
+      `Lead status sync: webinar attendance notes=${webinarAttendanceNotes} `
+      + `contacts=${webinarAttendanceContactIds.size}`,
+    );
+  }
+
   if (mode !== 'full') {
     const found = new Set();
     const sinceMs = now.getTime() - lookbackMs;
@@ -1048,6 +1158,7 @@ async function runLeadStatusSync(options = {}) {
     candidateIds = [...found];
   }
   for (const id of nooksNotInterestedContactIds) candidateIds.push(id);
+  for (const id of webinarAttendanceContactIds) candidateIds.push(id);
   candidateIds = [...new Set(candidateIds)];
 
   const contacts = await batchReadContacts(hubspot, candidateIds, config);
@@ -1064,6 +1175,8 @@ async function runLeadStatusSync(options = {}) {
     errors: 0,
     nooksNotInterestedCalls,
     nooksNotInterestedContacts: nooksNotInterestedContactIds.size,
+    webinarAttendanceNotes,
+    webinarAttendanceContacts: webinarAttendanceContactIds.size,
     touchpointSource: config.touchpointSource,
     notesScanned: 0,
     notesCounted: 0,
@@ -1095,6 +1208,7 @@ async function runLeadStatusSync(options = {}) {
       }
       const classification = classifyLeadStatus(contact, touchpointCount, {
         nooksNotInterested: nooksNotInterestedContactIds.has(String(contact.id)),
+        webinarAttendance: webinarAttendanceContactIds.has(String(contact.id)),
       });
       const update = buildContactUpdate(
         contact,
@@ -1227,4 +1341,6 @@ module.exports = {
   parseCliArgs,
   summarizeNoteTouchpoints,
   runLeadStatusSync,
+  webinarAttendanceSignal,
+  findWebinarAttendanceContactIds,
 };

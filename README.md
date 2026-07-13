@@ -71,7 +71,7 @@ The workflow first tries to match the Slack tagger's Slack email to a HubSpot ow
 
 ## Daily Lead Progress Slack Post (Railway)
 
-The Railway Slack bot posts the report to `#gtm-general` at 6:07 PM Pacific on Sunday and Monday-Friday. Counts come from HubSpot deals created from Monday 00:00 Pacific through the report run time in the active pipeline. Obvious test/internal deals are skipped, and duplicate normalized deal names are counted once before grouping by the configured deal source property. When duplicate normalized deal names exist, the report keeps the most complete deal for reporting fields, preferring records with populated `deal_source`, owner, amount, close date, and stage; created date is only the tie-breaker.
+The Railway Slack bot can post the report to `#gtm-general` at 6:07 PM Pacific on Sunday and Monday-Friday. The report is disabled by default and only runs when `LEAD_REPORT_ENABLED=true` (or `1`). Counts come from HubSpot deals created from Monday 00:00 Pacific through the report run time in the active pipeline. Obvious test/internal deals are skipped, and duplicate normalized deal names are counted once before grouping by the configured deal source property. When duplicate normalized deal names exist, the report keeps the most complete deal for reporting fields, preferring records with populated `deal_source`, owner, amount, close date, and stage; created date is only the tie-breaker.
 
 - `deal_source` starting with `Inbound` counts as Inbound.
 - `deal_source` starting with `Outbound` counts as Outbound, including values like `Outbound - Event`.
@@ -80,6 +80,7 @@ The Railway Slack bot posts the report to `#gtm-general` at 6:07 PM Pacific on S
 Required env:
 
 ```sh
+LEAD_REPORT_ENABLED=false
 SLACK_BOT_TOKEN=xoxb-...
 HUBSPOT_PRIVATE_TOKEN=...
 LEAD_REPORT_TARGET_CHANNEL=gtm-general
@@ -96,6 +97,8 @@ LEAD_REPORT_WEEKLY_GOAL=30
 
 Manual test post from Railway:
 
+Manual triggers also remain disabled unless `LEAD_REPORT_ENABLED=true`.
+
 ```sh
 curl -H "x-lead-report-token: $LEAD_REPORT_TRIGGER_SECRET" \
   https://leads-update-production.up.railway.app/run-daily-progress
@@ -105,9 +108,12 @@ To intentionally post a second copy for same-day testing, append `?allowDuplicat
 
 Legacy local fallback:
 
+The legacy Python fallback uses the same fail-closed `LEAD_REPORT_ENABLED` switch. Leave it unset or set it to `false` to prevent local/launchd posts.
+
 1. Put your token in `.env.local`:
    ```sh
    SLACK_USER_TOKEN=xoxp-...
+   LEAD_REPORT_ENABLED=true
    ```
 2. Optional overrides in `.env.local`:
    ```sh

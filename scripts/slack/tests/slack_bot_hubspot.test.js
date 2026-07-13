@@ -10,6 +10,8 @@ process.env.GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'test-client';
 process.env.GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'test-secret';
 process.env.GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || 'test-refresh';
 process.env.RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS = process.env.RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS || 'U_TEST';
+process.env.LEAD_REPORT_TRIGGER_SECRET = process.env.LEAD_REPORT_TRIGGER_SECRET || 'test-lead-report-secret';
+process.env.LEAD_REPORT_ENABLED = 'false';
 process.env.SLACK_TO_HUBSPOT_OWNER_JSON = JSON.stringify({
   U_TEST: { id: '89305622', name: 'Xavier Marco' },
 });
@@ -53,6 +55,7 @@ const {
   parseHubSpotDateBoundary,
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
+  parseLeadReportEnabled,
   parseProgressDealSourceProperty,
   redactedToolInputForLog,
   mergeSlackThreadMessages,
@@ -69,6 +72,8 @@ const {
   resolveProspectWorkflowOwner,
   matchingActivityKeywords,
   runStructuredDealCreateWorkflow,
+  runDailyProgress,
+  scheduleDailyProgress,
   startHttpServer,
   summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
@@ -311,6 +316,20 @@ function testResolveSlackEventTransport() {
   assert.strictEqual(resolveSlackEventTransport(' HTTP '), 'http');
   assert.strictEqual(resolveSlackEventTransport('dual'), 'dual');
   assert.strictEqual(resolveSlackEventTransport('nonsense'), 'socket');
+}
+
+function testLeadReportDefaultsDisabledAndRequiresExplicitEnable() {
+  assert.strictEqual(parseLeadReportEnabled(undefined), false);
+  assert.strictEqual(parseLeadReportEnabled(''), false);
+  assert.strictEqual(parseLeadReportEnabled('false'), false);
+  assert.strictEqual(parseLeadReportEnabled('yes'), false);
+  assert.strictEqual(parseLeadReportEnabled(' true '), true);
+  assert.strictEqual(parseLeadReportEnabled('1'), true);
+}
+
+async function testDailyProgressIsFailClosed() {
+  assert.deepStrictEqual(await runDailyProgress(undefined, { force: true }), { status: 'disabled' });
+  assert.strictEqual(scheduleDailyProgress(), false);
 }
 
 function testSanitizeTokenStripsWhitespace() {
@@ -832,6 +851,24 @@ function postSlackEvent(port, rawBody, { signature, timestamp = String(Math.floo
   });
 }
 
+function getHttpRoute(port, path, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path,
+      method: 'GET',
+      headers,
+    }, (res) => {
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => resolve({ statusCode: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 async function withEphemeralSlackHttpServer(fn) {
   const oldPort = process.env.PORT;
   process.env.PORT = '0';
@@ -889,6 +926,19 @@ async function testSlackHttpEventsRouteAcksEventCallbacks() {
     const response = await postSlackEvent(port, rawBody);
     assert.strictEqual(response.statusCode, 200);
     assert.strictEqual(response.body, 'ok');
+  });
+}
+
+async function testDailyProgressHttpRouteIsDisabledWithoutAFlag() {
+  await withEphemeralSlackHttpServer(async (port) => {
+    const response = await getHttpRoute(port, '/run-daily-progress', {
+      'x-lead-report-token': process.env.LEAD_REPORT_TRIGGER_SECRET,
+    });
+    assert.strictEqual(response.statusCode, 410);
+    assert.deepStrictEqual(JSON.parse(response.body), {
+      status: 'disabled',
+      reason: 'LEAD_REPORT_ENABLED is not true',
+    });
   });
 }
 
@@ -1796,6 +1846,8 @@ async function run() {
   testSanitizeTokenStripsWhitespace();
   testResolveBotRoles();
   testResolveSlackEventTransport();
+  testLeadReportDefaultsDisabledAndRequiresExplicitEnable();
+  await testDailyProgressIsFailClosed();
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
   await testCreateDealToolDefaultsOwnerToRequester();
@@ -1817,6 +1869,7 @@ async function run() {
   await testSlackHttpEventsRouteRejectsInvalidSignature();
   await testSlackHttpEventsRouteRejectsMalformedJson();
   await testSlackHttpEventsRouteAcksEventCallbacks();
+  await testDailyProgressHttpRouteIsDisabledWithoutAFlag();
   testRecruitingAtsToolRegistrationAndPrompt();
   testRecruitingNotionPropertyHelpers();
   testRecruitingCalendarInviteBuilderAndAuthorization();

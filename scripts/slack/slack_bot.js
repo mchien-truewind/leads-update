@@ -5180,6 +5180,11 @@ const LEGACY_PROGRESS_WEEKLY_GOAL = 10;
 const DEFAULT_PROGRESS_DEAL_SOURCE_PROPERTY = 'deal_source';
 const LEGACY_PROGRESS_LEAD_SOURCE_PROPERTY = 'lead_source';
 
+function parseLeadReportEnabled(rawValue) {
+  const normalized = String(rawValue || '').trim().toLowerCase();
+  return normalized === 'true' || normalized === '1';
+}
+
 function parseProgressWeeklyGoal(rawValue) {
   if (rawValue == null || String(rawValue).trim() === '') {
     return DEFAULT_PROGRESS_WEEKLY_GOAL;
@@ -5207,6 +5212,7 @@ function parseProgressDealSourceProperty(rawValue) {
 }
 
 const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'gtm-general';
+const PROGRESS_ENABLED = parseLeadReportEnabled(process.env.LEAD_REPORT_ENABLED);
 const PROGRESS_DEAL_SOURCE_PROPERTY = parseProgressDealSourceProperty(process.env.LEAD_REPORT_DEAL_SOURCE_PROPERTY);
 const PROGRESS_PIPELINE_ID = process.env.LEAD_REPORT_PIPELINE_ID || '105321581';
 const PROGRESS_TRIGGER_SECRET = process.env.LEAD_REPORT_TRIGGER_SECRET || '';
@@ -5601,6 +5607,11 @@ function isAuthorizedMqlDiscoveryReportTrigger(reqUrl, headers = {}) {
 }
 
 async function runDailyProgress(channelOverride, options = {}) {
+  if (!PROGRESS_ENABLED) {
+    console.log('Daily progress: disabled by LEAD_REPORT_ENABLED');
+    return { status: 'disabled' };
+  }
+
   const force = Boolean(options.force);
   const allowDuplicate = Boolean(options.allowDuplicate);
   const targetName = channelOverride || PROGRESS_TARGET_CHANNEL;
@@ -5702,6 +5713,11 @@ async function runDailyProgress(channelOverride, options = {}) {
 }
 
 function scheduleDailyProgress() {
+  if (!PROGRESS_ENABLED) {
+    console.log('  Daily progress scheduling disabled by LEAD_REPORT_ENABLED');
+    return false;
+  }
+
   const scheduleNext = () => {
     const { nextDate, nextRunUtc } = getNextDailyProgressRun();
     const delayMs = Math.max(nextRunUtc.getTime() - Date.now(), 1000);
@@ -5720,6 +5736,7 @@ function scheduleDailyProgress() {
     console.error('Daily progress startup check error:', err.message);
   });
   scheduleNext();
+  return true;
 }
 
 function parseHubSpotFetchBody(options = {}) {
@@ -6048,6 +6065,11 @@ function startHttpServer() {
         res.end('unauthorized');
         return;
       }
+      if (!PROGRESS_ENABLED) {
+        res.writeHead(410, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'disabled', reason: 'LEAD_REPORT_ENABLED is not true' }));
+        return;
+      }
       runDailyProgress(undefined, {
         force: true,
         allowDuplicate: qs.get('allowDuplicate') === '1',
@@ -6230,7 +6252,11 @@ async function startSlackBot() {
     // Daily MQL Discovery Report disabled per request (not useful / distracting).
     // Re-enable by uncommenting; the report code, route, and CLI flag remain.
     // scheduleMqlDiscoveryReport();
-    scheduleDailyProgress();
+    if (PROGRESS_ENABLED) {
+      scheduleDailyProgress();
+    } else {
+      console.log('  Daily progress disabled by LEAD_REPORT_ENABLED; scheduler not started');
+    }
     scheduleLeadStatusSync();
   } else {
     console.log("Scheduled jobs disabled for this role; they run in the 'worker' service.");
@@ -6293,6 +6319,7 @@ module.exports = {
   parseHubSpotDateBoundary,
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
+  parseLeadReportEnabled,
   parseProgressDealSourceProperty,
   postMqlDiscoveryReport,
   redactedToolInputForLog,
@@ -6306,6 +6333,7 @@ module.exports = {
   resolveDealHubSpotOwner,
   resolveProspectWorkflowOwner,
   runLeadStatusSyncForSlack,
+  runDailyProgress,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
   runStructuredDealCreateWorkflow,
@@ -6313,6 +6341,7 @@ module.exports = {
   shouldCheckDuplicates,
   startSlackBot,
   startHttpServer,
+  scheduleDailyProgress,
   resolveBotRoles,
   resolveSlackEventTransport,
   summarizeHubSpotStageCohortOutcomes,

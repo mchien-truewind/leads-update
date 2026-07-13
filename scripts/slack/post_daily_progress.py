@@ -28,6 +28,10 @@ DEFAULT_WEEKLY_GOAL = 30.0
 LEGACY_WEEKLY_GOAL = 10.0
 
 
+def parse_report_enabled(raw_value: object) -> bool:
+    return str(raw_value or "").strip().lower() in {"true", "1"}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-channel", default=None, help="Slack channel name override")
@@ -73,6 +77,15 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
         "report_tz": pick("LEAD_REPORT_TIMEZONE", "America/Los_Angeles"),
         "weekly_goal": pick("LEAD_REPORT_WEEKLY_GOAL", str(int(DEFAULT_WEEKLY_GOAL))),
     }
+
+
+def report_enabled(repo_root: Path) -> bool:
+    env_local = load_env_file(repo_root / ".env.local")
+    env_file = load_env_file(repo_root / ".env")
+    for source in (os.environ, env_local, env_file):
+        if "LEAD_REPORT_ENABLED" in source:
+            return parse_report_enabled(source["LEAD_REPORT_ENABLED"])
+    return False
 
 
 def parse_weekly_goal(raw_value: str) -> float:
@@ -294,6 +307,10 @@ def compute_counts(config: Dict[str, str]) -> Tuple[datetime, int, int, int, int
 def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[2]
+    if not report_enabled(repo_root):
+        print("skipped mode=daily reason=LEAD_REPORT_ENABLED is not true")
+        return 0
+
     config = get_config(repo_root, args)
     weekly_goal = parse_weekly_goal(config["weekly_goal"])
 

@@ -33,6 +33,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
     "@slack/bolt": "^4.6.0",
-    "googleapis": "^171.4.0"
+    "googleapis": "^171.4.0",
+    "pg": "^8.22.0"
   }
 }

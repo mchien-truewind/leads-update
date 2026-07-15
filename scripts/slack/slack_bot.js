@@ -45,6 +45,9 @@ const {
   runLeadStatusSync,
 } = require('./lead_status_sync');
 const {
+  createPostgresSlackStateStore,
+} = require('./slack_state_store');
+const {
   buildMqlDiscoveryReport,
   formatMqlDiscoveryReport,
 } = require('./mql_discovery_report');
@@ -247,6 +250,9 @@ const DEFAULT_RECRUITING_CALENDAR_SLACK_USER_ID = (
 const editedMentionEventsSeen = new Map();
 const slackHttpEventSeen = new Map();
 const slackHttpInteractionSeen = new Map();
+let slackStateStore = createPostgresSlackStateStore({
+  connectionString: process.env.SLACK_STATE_DATABASE_URL,
+});
 let slackBotUserIdPromise = null;
 
 function resolveSlackEventTransport(value = process.env.SLACK_EVENT_TRANSPORT) {
@@ -2589,14 +2595,32 @@ function prunePendingDealSourceRequests() {
   }
 }
 
-function storePendingDealSourceRequest(input) {
+async function storePendingDealSourceRequest(input) {
   prunePendingDealSourceRequests();
   const requestId = crypto.randomUUID();
   pendingDealSourceRequests.set(requestId, {
     input: { ...input },
     createdAt: Date.now(),
   });
+  if (slackStateStore) {
+    await slackStateStore.savePendingDealSourceRequest(requestId, input);
+  }
   return requestId;
+}
+
+async function loadPendingDealSourceRequest(requestId) {
+  const local = requestId ? pendingDealSourceRequests.get(requestId) : null;
+  if (local) return local;
+  if (!requestId || !slackStateStore) return null;
+  const input = await slackStateStore.getPendingDealSourceRequest(requestId);
+  return input ? { input, createdAt: Date.now() } : null;
+}
+
+async function completePendingDealSourceRequest(requestId, jobId = null) {
+  pendingDealSourceRequests.delete(requestId);
+  if (requestId && slackStateStore) {
+    await slackStateStore.completePendingDealSourceRequest(requestId, jobId);
+  }
 }
 
 function parseDealSourceRequestId(blockId = '') {
@@ -4468,7 +4492,7 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
     structuredDeal.slack_user_id = slackUserId;
     if (!normalizeExplicitDealSource(structuredDeal)) {
       const dealSourceOptions = await getDealSourceOptions();
-      const requestId = storePendingDealSourceRequest(structuredDeal);
+      const requestId = await storePendingDealSourceRequest(structuredDeal);
       await say({
         text: missingDealSourceMessage(dealSourceOptions),
         blocks: buildDealSourceSelectBlocks(requestId, dealSourceOptions),
@@ -4606,10 +4630,16 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
   }
 }
 
-async function handleDealSourceSelectAction({ body, action, client = app.client }) {
+async function handleDealSourceSelectAction({ body, action, client = app.client, durableJobId = '' }) {
   const blockId = action?.block_id || body?.actions?.[0]?.block_id || '';
   const requestId = parseDealSourceRequestId(blockId);
-  const pending = requestId ? pendingDealSourceRequests.get(requestId) : null;
+  let pending = null;
+  if (requestId && durableJobId && slackStateStore) {
+    const input = await slackStateStore.claimPendingDealSourceRequest(requestId, durableJobId);
+    pending = input ? { input, createdAt: Date.now() } : null;
+  } else {
+    pending = requestId ? await loadPendingDealSourceRequest(requestId) : null;
+  }
   const channel = body?.channel?.id || body?.container?.channel_id;
   const threadTs = body?.message?.thread_ts || body?.message?.ts;
 
@@ -4627,7 +4657,6 @@ async function handleDealSourceSelectAction({ body, action, client = app.client 
     return;
   }
 
-  pendingDealSourceRequests.delete(requestId);
   const selectedOption = action?.selected_option || body?.actions?.[0]?.selected_option || {};
   const dealSource = String(selectedOption.value || '').trim();
   const dealSourceLabel = selectedOption.text?.text || dealSource;
@@ -4652,6 +4681,7 @@ async function handleDealSourceSelectAction({ body, action, client = app.client 
     deal_source: dealSource,
   });
   await client.chat.postMessage({ channel, thread_ts: threadTs, text: reply });
+  await completePendingDealSourceRequest(requestId, durableJobId || null);
 }
 
 app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) => {
@@ -4659,7 +4689,11 @@ app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) =
   await handleDealSourceSelectAction({ body, action, client });
 });
 
-async function handleSlackHttpInteractionPayload(payload, { client = app.client } = {}) {
+async function handleSlackHttpInteractionPayload(payload, {
+  client = app.client,
+  skipProcessDedupe = false,
+  durableJobId = '',
+} = {}) {
   if (!slackHttpEventsEnabled()) {
     logSlackMessageLifecycle('http_interaction_ignored', {
       reason: 'http_transport_disabled',
@@ -4685,7 +4719,7 @@ async function handleSlackHttpInteractionPayload(payload, { client = app.client 
   }
 
   const dedupeKey = getSlackHttpInteractionDedupeKey(payload);
-  if (!markSlackHttpInteractionSeen(dedupeKey)) {
+  if (!skipProcessDedupe && !markSlackHttpInteractionSeen(dedupeKey)) {
     logSlackMessageLifecycle('http_interaction_duplicate_skipped', {
       action_id: action.action_id,
       channel: payload.channel?.id || payload.container?.channel_id || '',
@@ -4700,7 +4734,68 @@ async function handleSlackHttpInteractionPayload(payload, { client = app.client 
     message_ts: payload.message?.ts || payload.container?.message_ts || '',
     has_user: Boolean(payload.user?.id),
   });
-  await handleDealSourceSelectAction({ body: payload, action, client });
+  await handleDealSourceSelectAction({ body: payload, action, client, durableJobId });
+}
+
+async function processDurableSlackInteraction(jobId, { client = app.client } = {}) {
+  if (!slackStateStore) throw new Error('Slack durable state store is not configured');
+  const claim = await slackStateStore.claimInteraction(jobId);
+  if (!claim) return false;
+  try {
+    await handleSlackHttpInteractionPayload(claim.payload, {
+      client,
+      skipProcessDedupe: true,
+      durableJobId: jobId,
+    });
+    await slackStateStore.completeInteraction(jobId);
+    return true;
+  } catch (err) {
+    const action = claim.payload?.actions?.[0] || {};
+    const requestId = parseDealSourceRequestId(action.block_id || '');
+    if (requestId && typeof slackStateStore.markPendingDealSourceNeedsReview === 'function') {
+      await slackStateStore.markPendingDealSourceNeedsReview(requestId, jobId, sanitizeLogValue(err.message));
+    }
+    await slackStateStore.failInteraction(jobId, sanitizeLogValue(err.message));
+    throw err;
+  }
+}
+
+function startSlackInteractionRecoveryLoop({ intervalMs = 30000 } = {}) {
+  if (!slackStateStore) return null;
+  let running = false;
+  const recover = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const staleJobIds = await slackStateStore.markStaleInteractionsForReview();
+      if (staleJobIds.length > 0) {
+        console.error(JSON.stringify({
+          event: 'slack_interactions_need_review',
+          count: staleJobIds.length,
+          reason: 'stale_processing_lock',
+        }));
+      }
+      await slackStateStore.pruneCompleted();
+      const pruned = await slackStateStore.pruneExpired();
+      if ((pruned.pending_deleted || pruned.review_requests_deleted || pruned.review_jobs_deleted) > 0) {
+        console.log(JSON.stringify({ event: 'slack_state_retention_pruned', ...pruned }));
+      }
+      const jobIds = await slackStateStore.recoverableInteractionIds();
+      for (const jobId of jobIds) {
+        await processDurableSlackInteraction(jobId).catch((err) => {
+          console.error(`Slack interaction recovery failed: ${sanitizeLogValue(err.message)}`);
+        });
+      }
+    } finally {
+      running = false;
+    }
+  };
+  recover().catch((err) => console.error(`Slack interaction recovery scan failed: ${sanitizeLogValue(err.message)}`));
+  const timer = setInterval(() => {
+    recover().catch((err) => console.error(`Slack interaction recovery scan failed: ${sanitizeLogValue(err.message)}`));
+  }, intervalMs);
+  timer.unref();
+  return timer;
 }
 
 // Respond to @mentions in channels
@@ -6078,6 +6173,24 @@ function startHttpServer() {
         return;
       }
 
+      let durableJob = null;
+      if (resolveSlackEventTransport() === 'http') {
+        if (!slackStateStore) {
+          logSlackMessageLifecycle('http_interaction_state_unavailable', {});
+          res.writeHead(503);
+          res.end('state_unavailable');
+          return;
+        }
+        try {
+          durableJob = await slackStateStore.enqueueInteraction(payload);
+        } catch (err) {
+          console.error(`Slack HTTP interaction enqueue failed: ${sanitizeLogValue(err.message)}`);
+          res.writeHead(503);
+          res.end('state_unavailable');
+          return;
+        }
+      }
+
       // Slack requires interactive requests to be acknowledged within three seconds.
       // Business logic continues asynchronously after the deterministic signature and
       // payload checks so HubSpot/Claude latency cannot cause Slack retries.
@@ -6085,7 +6198,10 @@ function startHttpServer() {
       res.end('');
 
       setImmediate(() => {
-        handleSlackHttpInteractionPayload(payload).catch((err) => {
+        const processing = durableJob
+          ? processDurableSlackInteraction(durableJob.jobId)
+          : handleSlackHttpInteractionPayload(payload);
+        processing.catch((err) => {
           console.error(`Slack HTTP interaction processing failed: ${sanitizeLogValue(err.message)}`);
           logSlackMessageLifecycle('http_interaction_handler_error', {
             error: sanitizeLogValue(err.message),
@@ -6371,6 +6487,15 @@ async function startSlackBot() {
   const { role, eventTransport, runsSocket, runsWorker } = resolveBotRoles(process.env.BOT_ROLE);
   console.log(`Starting (role='${role}', event_transport='${eventTransport}', socket=${runsSocket}, worker=${runsWorker})`);
 
+  if (eventTransport === 'http' && !slackStateStore) {
+    throw new Error('SLACK_STATE_DATABASE_URL is required when SLACK_EVENT_TRANSPORT=http');
+  }
+  if (slackStateStore) {
+    await slackStateStore.initialize();
+    startSlackInteractionRecoveryLoop();
+    console.log('Slack durable interaction state: ready');
+  }
+
   // HTTP server (health check + webhook routes) runs in every role. Webhook routes
   // only receive traffic on the service the public domain points at (the worker).
   startHttpServer();
@@ -6484,6 +6609,8 @@ module.exports = {
   getSlackHttpInteractionDedupeKey,
   handleSlackHttpInteractionPayload,
   handleDealSourceSelectAction,
+  processDurableSlackInteraction,
+  startSlackInteractionRecoveryLoop,
   verifySlackRequestSignature,
   resolveDealHubSpotOwner,
   resolveProspectWorkflowOwner,
@@ -6505,5 +6632,8 @@ module.exports = {
   formatDuplicateDealError,
   __setHubSpotRequestOverrideForTests(fn) {
     hubspotRequestOverride = typeof fn === 'function' ? fn : null;
+  },
+  __setSlackStateStoreForTests(store) {
+    slackStateStore = store || null;
   },
 };

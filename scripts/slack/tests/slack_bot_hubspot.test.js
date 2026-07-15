@@ -69,6 +69,7 @@ const {
   getSlackHttpInteractionDedupeKey,
   handleSlackHttpInteractionPayload,
   handleDealSourceSelectAction,
+  processDurableSlackInteraction,
   verifySlackRequestSignature,
   resolveDealHubSpotOwner,
   resolveHubSpotOwner,
@@ -82,6 +83,7 @@ const {
   startHttpServer,
   summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
+  __setSlackStateStoreForTests,
 } = require('../slack_bot');
 
 function seedHubSpotProperty(objectType, name, overrides = {}) {
@@ -901,6 +903,55 @@ async function testSupportedSlackHttpInteractionRunsSharedHandlerInHttpMode() {
   }
   assert.strictEqual(posts.length, 1);
   assert.match(posts[0].text, /expired or was already used/);
+}
+
+async function testDurableSlackInteractionCompletesOrRequeues() {
+  const oldTransport = process.env.SLACK_EVENT_TRANSPORT;
+  process.env.SLACK_EVENT_TRANSPORT = 'http';
+  const payload = {
+    type: 'block_actions',
+    user: { id: 'U_TEST' },
+    channel: { id: 'C_TEST' },
+    message: { ts: '1770000000.000700' },
+    container: { channel_id: 'C_TEST', message_ts: '1770000000.000700' },
+    actions: [{
+      action_id: 'select_deal_source_for_structured_deal',
+      action_ts: '1770000001.000700',
+      block_id: 'deal_source_request:missing-durable-request',
+      selected_option: { value: 'Referral', text: { text: 'Inbound - Referral' } },
+    }],
+  };
+  const completed = [];
+  const failed = [];
+  const store = {
+    claimInteraction: async () => ({ payload, attempts: 1 }),
+    claimPendingDealSourceRequest: async () => null,
+    completeInteraction: async (jobId) => { completed.push(jobId); },
+    failInteraction: async (jobId, error) => { failed.push({ jobId, error }); },
+    markPendingDealSourceNeedsReview: async () => {},
+  };
+  __setSlackStateStoreForTests(store);
+  try {
+    const processed = await processDurableSlackInteraction('job-success', {
+      client: { chat: { postMessage: async () => ({ ok: true }) } },
+    });
+    assert.strictEqual(processed, true);
+    assert.deepStrictEqual(completed, ['job-success']);
+
+    await assert.rejects(
+      processDurableSlackInteraction('job-failure', {
+        client: { chat: { postMessage: async () => { throw new Error('transient Slack failure'); } } },
+      }),
+      /transient Slack failure/,
+    );
+    assert.strictEqual(failed.length, 1);
+    assert.strictEqual(failed[0].jobId, 'job-failure');
+    assert.match(failed[0].error, /transient Slack failure/);
+  } finally {
+    __setSlackStateStoreForTests(null);
+    if (oldTransport == null) delete process.env.SLACK_EVENT_TRANSPORT;
+    else process.env.SLACK_EVENT_TRANSPORT = oldTransport;
+  }
 }
 
 function slackSignatureForBody(rawBody, timestamp, signingSecret = process.env.SLACK_SIGNING_SECRET) {
@@ -2012,6 +2063,7 @@ async function run() {
   testSlackHttpInteractionParsingAndDedupe();
   await testDealSourceHttpActionUsesExistingExpiredRequestBehavior();
   await testSupportedSlackHttpInteractionRunsSharedHandlerInHttpMode();
+  await testDurableSlackInteractionCompletesOrRequeues();
   await testSlackHttpEventsRouteVerifiesUrlChallenge();
   await testSlackHttpEventsRouteRejectsInvalidSignature();
   await testSlackHttpEventsRouteRejectsMalformedJson();

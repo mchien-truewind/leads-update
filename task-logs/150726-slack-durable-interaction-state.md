@@ -48,6 +48,8 @@ Continue implementing the reliability work after the signed HTTP interactions fo
 - Initial review found that job-level atomicity did not prevent two different clicks from reading the same pending request. Added a second atomic pending-request claim bound to one job.
 - Initial stale-lock recovery could replay an uncertain HubSpot write. Replaced automatic stale retry with terminal `needs_review` quarantine and a manual inspection command.
 - The first real database run created v1 status constraints. Added idempotent schema migration logic with v2 constraints before rerunning integration successfully.
+- After binding the merged code to the worker, PostgreSQL rejected `pruneCompleted` because `pg` prepared statements cannot contain multiple SQL commands. Split retention cleanup into two parameterized queries and added a regression test.
+- Alex's 07:42 PDT mention was present in Slack with zero replies and no Railway receipt log, confirming the Socket Mode delivery failure recurred independently of the PostgreSQL worker issue. Restarted only `leads-update-bot` for immediate recovery.
 
 ## What Was Learned
 

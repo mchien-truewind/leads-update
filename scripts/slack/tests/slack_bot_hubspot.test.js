@@ -63,7 +63,12 @@ const {
   slackTextMentionsUser,
   markEditedMentionSeen,
   markSlackHttpEventSeen,
+  markSlackHttpInteractionSeen,
   normalizeSlackHttpEvent,
+  parseSlackHttpInteractionBody,
+  getSlackHttpInteractionDedupeKey,
+  handleSlackHttpInteractionPayload,
+  handleDealSourceSelectAction,
   verifySlackRequestSignature,
   resolveDealHubSpotOwner,
   resolveHubSpotOwner,
@@ -820,6 +825,84 @@ function testSlackHttpEventDedupeAllowsRetriesOnlyOnce() {
   assert.strictEqual(markSlackHttpEventSeen('C_TEST:1770000000.000100', 24 * 60 * 60 * 1000 + 5000), true);
 }
 
+function testSlackHttpInteractionParsingAndDedupe() {
+  const payload = {
+    type: 'block_actions',
+    user: { id: 'U_TEST' },
+    container: { channel_id: 'C_TEST', message_ts: '1770000000.000400' },
+    actions: [{
+      action_id: 'select_deal_source_for_structured_deal',
+      action_ts: '1770000001.000400',
+      selected_option: { value: 'Referral', text: { text: 'Inbound - Referral' } },
+    }],
+  };
+  const rawBody = new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
+  assert.deepStrictEqual(parseSlackHttpInteractionBody(rawBody), payload);
+  assert.throws(() => parseSlackHttpInteractionBody(''), /missing_payload/);
+  assert.throws(() => parseSlackHttpInteractionBody('payload=%7B'), SyntaxError);
+
+  const key = getSlackHttpInteractionDedupeKey(payload);
+  assert.strictEqual(
+    key,
+    'block_actions:select_deal_source_for_structured_deal:U_TEST:1770000000.000400:1770000001.000400',
+  );
+  assert.strictEqual(markSlackHttpInteractionSeen(key, 1000), true);
+  assert.strictEqual(markSlackHttpInteractionSeen(key, 2000), false);
+  assert.strictEqual(markSlackHttpInteractionSeen(key, 24 * 60 * 60 * 1000 + 5000), true);
+}
+
+async function testDealSourceHttpActionUsesExistingExpiredRequestBehavior() {
+  const posts = [];
+  await handleDealSourceSelectAction({
+    body: {
+      channel: { id: 'C_TEST' },
+      message: { ts: '1770000000.000400' },
+      actions: [{
+        action_id: 'select_deal_source_for_structured_deal',
+        block_id: 'deal_source_request:missing-request',
+        selected_option: { value: 'Referral', text: { text: 'Inbound - Referral' } },
+      }],
+    },
+    action: {
+      action_id: 'select_deal_source_for_structured_deal',
+      block_id: 'deal_source_request:missing-request',
+      selected_option: { value: 'Referral', text: { text: 'Inbound - Referral' } },
+    },
+    client: { chat: { postMessage: async (payload) => { posts.push(payload); } } },
+  });
+  assert.strictEqual(posts.length, 1);
+  assert.strictEqual(posts[0].channel, 'C_TEST');
+  assert.match(posts[0].text, /expired or was already used/);
+}
+
+async function testSupportedSlackHttpInteractionRunsSharedHandlerInHttpMode() {
+  const oldTransport = process.env.SLACK_EVENT_TRANSPORT;
+  const posts = [];
+  process.env.SLACK_EVENT_TRANSPORT = 'http';
+  try {
+    await handleSlackHttpInteractionPayload({
+      type: 'block_actions',
+      user: { id: 'U_TEST' },
+      channel: { id: 'C_TEST' },
+      message: { ts: '1770000000.000600' },
+      container: { channel_id: 'C_TEST', message_ts: '1770000000.000600' },
+      actions: [{
+        action_id: 'select_deal_source_for_structured_deal',
+        action_ts: '1770000001.000600',
+        block_id: 'deal_source_request:missing-http-request',
+        selected_option: { value: 'Referral', text: { text: 'Inbound - Referral' } },
+      }],
+    }, {
+      client: { chat: { postMessage: async (payload) => { posts.push(payload); } } },
+    });
+  } finally {
+    if (oldTransport == null) delete process.env.SLACK_EVENT_TRANSPORT;
+    else process.env.SLACK_EVENT_TRANSPORT = oldTransport;
+  }
+  assert.strictEqual(posts.length, 1);
+  assert.match(posts[0].text, /expired or was already used/);
+}
+
 function slackSignatureForBody(rawBody, timestamp, signingSecret = process.env.SLACK_SIGNING_SECRET) {
   return `v0=${crypto
     .createHmac('sha256', signingSecret)
@@ -847,6 +930,37 @@ function postSlackEvent(port, rawBody, { signature, timestamp = String(Math.floo
     });
     req.on('error', reject);
     req.write(rawBody);
+    req.end();
+  });
+}
+
+function postSlackInteraction(port, payload, {
+  signature,
+  timestamp = String(Math.floor(Date.now() / 1000)),
+  rawBody,
+} = {}) {
+  const body = rawBody == null
+    ? new URLSearchParams({ payload: JSON.stringify(payload) }).toString()
+    : rawBody;
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: '/slack/interactions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+        'X-Slack-Request-Timestamp': timestamp,
+        'X-Slack-Signature': signature || slackSignatureForBody(body, timestamp),
+      },
+    }, (res) => {
+      let responseBody = '';
+      res.on('data', chunk => { responseBody += chunk; });
+      res.on('end', () => resolve({ statusCode: res.statusCode, body: responseBody }));
+    });
+    req.on('error', reject);
+    req.write(body);
     req.end();
   });
 }
@@ -926,6 +1040,36 @@ async function testSlackHttpEventsRouteAcksEventCallbacks() {
     const response = await postSlackEvent(port, rawBody);
     assert.strictEqual(response.statusCode, 200);
     assert.strictEqual(response.body, 'ok');
+  });
+}
+
+async function testSlackHttpInteractionsRouteAcksValidPayload() {
+  await withEphemeralSlackHttpServer(async (port) => {
+    const response = await postSlackInteraction(port, {
+      type: 'block_actions',
+      user: { id: 'U_TEST' },
+      container: { channel_id: 'C_TEST', message_ts: '1770000000.000500' },
+      actions: [{
+        action_id: 'unsupported_test_action',
+        action_ts: '1770000001.000500',
+      }],
+    });
+    assert.strictEqual(response.statusCode, 200);
+    assert.strictEqual(response.body, '');
+  });
+}
+
+async function testSlackHttpInteractionsRouteRejectsInvalidSignatureAndPayload() {
+  await withEphemeralSlackHttpServer(async (port) => {
+    const payload = { type: 'block_actions', actions: [] };
+    const invalidSignature = await postSlackInteraction(port, payload, { signature: 'v0=bad' });
+    assert.strictEqual(invalidSignature.statusCode, 401);
+    assert.strictEqual(invalidSignature.body, 'invalid_signature');
+
+    const malformed = 'payload=%7B';
+    const invalidPayload = await postSlackInteraction(port, null, { rawBody: malformed });
+    assert.strictEqual(invalidPayload.statusCode, 400);
+    assert.strictEqual(invalidPayload.body, 'invalid_payload');
   });
 }
 
@@ -1865,10 +2009,15 @@ async function run() {
   testNormalizeSlackHttpAppMention();
   testNormalizeSlackHttpEditedMention();
   testSlackHttpEventDedupeAllowsRetriesOnlyOnce();
+  testSlackHttpInteractionParsingAndDedupe();
+  await testDealSourceHttpActionUsesExistingExpiredRequestBehavior();
+  await testSupportedSlackHttpInteractionRunsSharedHandlerInHttpMode();
   await testSlackHttpEventsRouteVerifiesUrlChallenge();
   await testSlackHttpEventsRouteRejectsInvalidSignature();
   await testSlackHttpEventsRouteRejectsMalformedJson();
   await testSlackHttpEventsRouteAcksEventCallbacks();
+  await testSlackHttpInteractionsRouteAcksValidPayload();
+  await testSlackHttpInteractionsRouteRejectsInvalidSignatureAndPayload();
   await testDailyProgressHttpRouteIsDisabledWithoutAFlag();
   testRecruitingAtsToolRegistrationAndPrompt();
   testRecruitingNotionPropertyHelpers();

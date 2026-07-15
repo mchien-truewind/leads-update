@@ -52,6 +52,23 @@ The Slack reply path routes simple/direct asks to `CLAUDE_MODEL_DEFAULT` and mor
 `CLAUDE_DIGEST_MODEL` controls the discovery digest transcript extraction model separately.
 All model variables are optional in code; use exact Anthropic API model IDs, not Claude.ai plan names.
 
+### Slack event transport
+
+`SLACK_EVENT_TRANSPORT` selects one production ingress path:
+
+- `socket` (default): Slack Socket Mode handles events and interactive actions.
+- `http`: the public worker handles signed Slack callbacks and Socket Mode is disabled.
+- `dual`: local/canary use only; do not use for the split production services.
+
+For HTTP mode, configure the Slack app with:
+
+- Event Subscriptions Request URL: `https://leads-update-production.up.railway.app/slack/events`
+- Interactivity Request URL: `https://leads-update-production.up.railway.app/slack/interactions`
+
+Both routes verify Slack's timestamped HMAC signature before acknowledging. The interactions route acknowledges before running HubSpot work and suppresses duplicate retries within one process lifetime. This process-local guard is not durable across Railway restarts, and pending deal-source requests are also process-local; do not cut production over to HTTP until an atomic durable interaction queue/idempotency store is implemented and verified.
+
+After that durability gate is satisfied, stage `SLACK_EVENT_TRANSPORT=http` on the public `leads-update` worker first, verify its startup and signed routes, then disable Socket Mode in Slack and run top-level mention, thread mention, DM, edited-mention, and deal-source-button canaries. Keep `leads-update-bot` on `socket` until the HTTP canaries pass. For rollback, set the bot service back to `socket`, re-enable Socket Mode in Slack, and immediately redeploy the bot while the HTTP worker remains available.
+
 Required for HubSpot writes:
 
 ```sh

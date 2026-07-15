@@ -246,6 +246,7 @@ const DEFAULT_RECRUITING_CALENDAR_SLACK_USER_ID = (
 ).trim();
 const editedMentionEventsSeen = new Map();
 const slackHttpEventSeen = new Map();
+const slackHttpInteractionSeen = new Map();
 let slackBotUserIdPromise = null;
 
 function resolveSlackEventTransport(value = process.env.SLACK_EVENT_TRANSPORT) {
@@ -324,6 +325,33 @@ function markSlackHttpEventSeen(key, now = Date.now()) {
   if (!key) return false;
   if (slackHttpEventSeen.has(key)) return false;
   slackHttpEventSeen.set(key, now);
+  return true;
+}
+
+function pruneSlackHttpInteractionDedupe(now = Date.now()) {
+  const configuredTtlMs = Number(process.env.SLACK_HTTP_INTERACTION_DEDUPE_TTL_MS);
+  const ttlMs = Number.isFinite(configuredTtlMs) && configuredTtlMs > 0
+    ? Math.min(configuredTtlMs, 7 * 24 * 60 * 60 * 1000)
+    : 24 * 60 * 60 * 1000;
+  for (const [key, seenAt] of slackHttpInteractionSeen.entries()) {
+    if (now - seenAt > ttlMs) slackHttpInteractionSeen.delete(key);
+  }
+}
+
+function markSlackHttpInteractionSeen(key, now = Date.now()) {
+  pruneSlackHttpInteractionDedupe(now);
+  if (!key) return false;
+  if (slackHttpInteractionSeen.has(key)) return false;
+  const configuredMaxEntries = Number(process.env.SLACK_HTTP_INTERACTION_DEDUPE_MAX_ENTRIES);
+  const maxEntries = Number.isFinite(configuredMaxEntries) && configuredMaxEntries > 0
+    ? Math.min(Math.floor(configuredMaxEntries), 100000)
+    : 10000;
+  while (slackHttpInteractionSeen.size >= maxEntries) {
+    const oldestKey = slackHttpInteractionSeen.keys().next().value;
+    if (!oldestKey) break;
+    slackHttpInteractionSeen.delete(oldestKey);
+  }
+  slackHttpInteractionSeen.set(key, now);
   return true;
 }
 
@@ -4068,6 +4096,24 @@ function verifySlackRequestSignature({
   return crypto.timingSafeEqual(expectedBuffer, actualBuffer);
 }
 
+function parseSlackHttpInteractionBody(rawBody) {
+  const encodedPayload = new URLSearchParams(String(rawBody || '')).get('payload');
+  if (!encodedPayload) throw new Error('missing_payload');
+  const payload = JSON.parse(encodedPayload);
+  if (!payload || typeof payload !== 'object') throw new Error('invalid_payload');
+  return payload;
+}
+
+function getSlackHttpInteractionDedupeKey(payload) {
+  const action = payload?.actions?.[0] || {};
+  const messageTs = payload?.message?.ts || payload?.container?.message_ts || '';
+  const actionTs = action.action_ts || payload?.action_ts || '';
+  const actionId = action.action_id || '';
+  const userId = payload?.user?.id || '';
+  if (!actionId || !userId || (!messageTs && !actionTs)) return '';
+  return [payload.type || 'interaction', actionId, userId, messageTs, actionTs].join(':');
+}
+
 function getSlackEventDedupeKey({ channel = '', messageTs = '', editedTs = '' } = {}) {
   if (!channel || !messageTs) return '';
   return editedTs ? `${channel}:${messageTs}:${editedTs}` : `${channel}:${messageTs}`;
@@ -4560,9 +4606,7 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
   }
 }
 
-app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) => {
-  await ack();
-
+async function handleDealSourceSelectAction({ body, action, client = app.client }) {
   const blockId = action?.block_id || body?.actions?.[0]?.block_id || '';
   const requestId = parseDealSourceRequestId(blockId);
   const pending = requestId ? pendingDealSourceRequests.get(requestId) : null;
@@ -4608,7 +4652,56 @@ app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) =
     deal_source: dealSource,
   });
   await client.chat.postMessage({ channel, thread_ts: threadTs, text: reply });
+}
+
+app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) => {
+  await ack();
+  await handleDealSourceSelectAction({ body, action, client });
 });
+
+async function handleSlackHttpInteractionPayload(payload, { client = app.client } = {}) {
+  if (!slackHttpEventsEnabled()) {
+    logSlackMessageLifecycle('http_interaction_ignored', {
+      reason: 'http_transport_disabled',
+      interaction_type: payload?.type || '',
+    });
+    return;
+  }
+
+  if (payload?.type !== 'block_actions') {
+    logSlackMessageLifecycle('http_interaction_ignored', {
+      reason: `unsupported_interaction_${payload?.type || 'unknown'}`,
+    });
+    return;
+  }
+
+  const action = payload.actions?.[0] || {};
+  if (action.action_id !== DEAL_SOURCE_SELECT_ACTION_ID) {
+    logSlackMessageLifecycle('http_interaction_ignored', {
+      reason: 'unsupported_action',
+      action_id: action.action_id || '',
+    });
+    return;
+  }
+
+  const dedupeKey = getSlackHttpInteractionDedupeKey(payload);
+  if (!markSlackHttpInteractionSeen(dedupeKey)) {
+    logSlackMessageLifecycle('http_interaction_duplicate_skipped', {
+      action_id: action.action_id,
+      channel: payload.channel?.id || payload.container?.channel_id || '',
+      message_ts: payload.message?.ts || payload.container?.message_ts || '',
+    });
+    return;
+  }
+
+  logSlackMessageLifecycle('http_interaction_received', {
+    action_id: action.action_id,
+    channel: payload.channel?.id || payload.container?.channel_id || '',
+    message_ts: payload.message?.ts || payload.container?.message_ts || '',
+    has_user: Boolean(payload.user?.id),
+  });
+  await handleDealSourceSelectAction({ body: payload, action, client });
+}
 
 // Respond to @mentions in channels
 app.event('app_mention', async ({ event, say }) => {
@@ -5947,6 +6040,63 @@ function startHttpServer() {
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = Number(process.env.PORT || 3000);
   const server = http.createServer(async (req, res) => {
+    if (req.method === 'POST' && req.url.split('?')[0] === '/slack/interactions') {
+      let rawBody = '';
+      try {
+        rawBody = await readRawRequestBody(req);
+      } catch (err) {
+        console.error(`Slack HTTP interaction body read failed: ${sanitizeLogValue(err.message)}`);
+        res.writeHead(413);
+        res.end('body_too_large');
+        return;
+      }
+
+      const signatureOk = verifySlackRequestSignature({
+        timestamp: req.headers['x-slack-request-timestamp'],
+        rawBody,
+        signature: req.headers['x-slack-signature'],
+      });
+      if (!signatureOk) {
+        logSlackMessageLifecycle('http_interaction_signature_rejected', {
+          has_timestamp: Boolean(req.headers['x-slack-request-timestamp']),
+          has_signature: Boolean(req.headers['x-slack-signature']),
+        });
+        res.writeHead(401);
+        res.end('invalid_signature');
+        return;
+      }
+
+      let payload;
+      try {
+        payload = parseSlackHttpInteractionBody(rawBody);
+      } catch (err) {
+        logSlackMessageLifecycle('http_interaction_payload_rejected', {
+          error: sanitizeLogValue(err.message),
+        });
+        res.writeHead(400);
+        res.end('invalid_payload');
+        return;
+      }
+
+      // Slack requires interactive requests to be acknowledged within three seconds.
+      // Business logic continues asynchronously after the deterministic signature and
+      // payload checks so HubSpot/Claude latency cannot cause Slack retries.
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('');
+
+      setImmediate(() => {
+        handleSlackHttpInteractionPayload(payload).catch((err) => {
+          console.error(`Slack HTTP interaction processing failed: ${sanitizeLogValue(err.message)}`);
+          logSlackMessageLifecycle('http_interaction_handler_error', {
+            error: sanitizeLogValue(err.message),
+            interaction_type: payload?.type || '',
+            action_id: payload?.actions?.[0]?.action_id || '',
+          });
+        });
+      });
+      return;
+    }
+
     if (req.method === 'POST' && req.url.split('?')[0] === '/slack/events') {
       let rawBody = '';
       try {
@@ -6328,7 +6478,12 @@ module.exports = {
   slackTextMentionsUser,
   markEditedMentionSeen,
   markSlackHttpEventSeen,
+  markSlackHttpInteractionSeen,
   normalizeSlackHttpEvent,
+  parseSlackHttpInteractionBody,
+  getSlackHttpInteractionDedupeKey,
+  handleSlackHttpInteractionPayload,
+  handleDealSourceSelectAction,
   verifySlackRequestSignature,
   resolveDealHubSpotOwner,
   resolveProspectWorkflowOwner,

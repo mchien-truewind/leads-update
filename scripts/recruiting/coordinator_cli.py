@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import mimetypes
 import os
 import re
 import socket
 import tempfile
+import threading
 import time as time_module
 import unicodedata
 import zipfile
@@ -209,6 +211,7 @@ class NotionPropertyMap:
     scheduling_draft_id: str = "Scheduling draft id"
     proposed_slot: str = "Proposed Slot"
     last_sync_at: str = "Last sync at"
+    slack_review_url: str = "Slack Review URL"
 
 
 @dataclass
@@ -503,6 +506,7 @@ def load_config() -> Config:
         scheduling_draft_id=os.getenv("RECRUITING_NOTION_PROP_SCHEDULING_DRAFT_ID", "Scheduling draft id").strip(),
         proposed_slot=os.getenv("RECRUITING_NOTION_PROP_PROPOSED_SLOT", "Proposed Slot").strip(),
         last_sync_at=os.getenv("RECRUITING_NOTION_PROP_LAST_SYNC_AT", "Last sync at").strip(),
+        slack_review_url=os.getenv("RECRUITING_NOTION_PROP_SLACK_REVIEW_URL", "Slack Review URL").strip(),
     )
 
     timezone_name = os.getenv("RECRUITING_SCHEDULING_TIMEZONE", "America/Los_Angeles").strip()
@@ -657,6 +661,9 @@ class NotionClient:
     def update_page(self, page_id: str, properties: dict[str, Any]) -> dict[str, Any]:
         return self._request("PATCH", f"/pages/{page_id}", {"properties": properties})
 
+    def get_page(self, page_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/pages/{page_id}")
+
 
 class SlackClient:
     def __init__(self, token: str):
@@ -733,7 +740,7 @@ class SlackClient:
         response = self._request("chat.getPermalink", {"channel": channel_id, "message_ts": message_ts})
         return str(response.get("permalink", "") or "")
 
-    def list_channel_messages(self, channel_id: str, oldest_ts: float) -> list[dict[str, Any]]:
+    def list_channel_messages(self, channel_id: str, oldest_ts: float = 1.0) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         cursor = ""
         while True:
@@ -751,6 +758,9 @@ class SlackClient:
             if not cursor:
                 break
         return messages
+
+
+SLACK_RECONCILIATION_MUTEX = threading.Lock()
 
 
 def notion_prop_value(prop: dict[str, Any]) -> str:
@@ -4162,7 +4172,12 @@ def load_recent_slack_posted_threads(
     return thread_ids, thread_links
 
 
-def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, str]]) -> tuple[int, int]:
+def post_candidate_reviews_to_slack(
+    config: Config,
+    candidates: list[dict[str, str]],
+    *,
+    ignore_local_state: bool = False,
+) -> tuple[int, int]:
     if not candidates or not slack_post_enabled(config):
         return 0, 0
 
@@ -4199,7 +4214,7 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
         if not thread_id:
             failed += 1
             continue
-        if thread_id in posted_threads or thread_id in history_posted_threads:
+        if (not ignore_local_state and thread_id in posted_threads) or thread_id in history_posted_threads:
             continue
 
         marker = slack_thread_marker(thread_id)
@@ -4280,6 +4295,96 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
     return posted, failed
 
 
+def full_slack_marker_history(client: SlackClient, channel_id: str) -> dict[str, str]:
+    """Return exact ATS marker permalinks; any Slack failure propagates to the caller."""
+    found: dict[str, str] = {}
+    for message in client.list_channel_messages(channel_id, 1.0):
+        thread_id = extract_thread_id_from_slack_message(str(message.get("text", "") or ""))
+        if not thread_id:
+            continue
+        message_ts = str(message.get("ts", "") or "").strip()
+        if not message_ts:
+            raise RuntimeError(f"Slack marker {thread_id} has no message timestamp")
+        permalink = client.get_message_permalink(channel_id, message_ts)
+        if not permalink:
+            raise RuntimeError(f"Slack marker {thread_id} has no permalink")
+        found[thread_id] = permalink
+    return found
+
+
+def ensure_slack_review_url_schema(
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+    *,
+    create: bool = True,
+) -> dict[str, Any]:
+    properties = database_schema.get("properties", {})
+    existing = properties.get(prop_map.slack_review_url)
+    if existing is None:
+        if not create:
+            raise RuntimeError(
+                f"Notion property '{prop_map.slack_review_url}' is missing; run --apply to create it"
+            )
+        return notion.update_database({prop_map.slack_review_url: {"url": {}}})
+    if existing.get("type") != "url":
+        raise RuntimeError(
+            f"Notion property '{prop_map.slack_review_url}' must be type URL, got {existing.get('type', 'unknown')}"
+        )
+    return database_schema
+
+
+def reconcile_slack_reviews(
+    config: Config,
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+    *,
+    apply: bool,
+) -> dict[str, Any]:
+    if not SLACK_RECONCILIATION_MUTEX.acquire(blocking=False):
+        raise RuntimeError("Slack review reconciliation is already running in this process")
+    try:
+        if not slack_post_enabled(config):
+            raise RuntimeError("Slack review reconciliation requires a configured Slack post token and channel")
+        database_schema = ensure_slack_review_url_schema(notion, database_schema, prop_map, create=apply)
+        prop_map = resolve_property_map(prop_map, database_schema)
+        candidates = collect_review_candidates_for_slack(notion, database_schema, prop_map)
+        client = slack_post_client(config)
+        channel_id = client.resolve_channel_id(config.slack_review_channel)
+        history = full_slack_marker_history(client, channel_id)
+        result: dict[str, Any] = {"eligible": len(candidates), "recovered": [], "missing": [], "posted": []}
+        url_schema = database_schema["properties"][prop_map.slack_review_url]
+        for candidate in candidates:
+            thread_id = candidate["thread_id"]
+            permalink = history.get(thread_id, "")
+            if permalink:
+                result["recovered"].append({"page_id": candidate["page_id"], "thread_id": thread_id, "url": permalink})
+            else:
+                result["missing"].append({"page_id": candidate["page_id"], "thread_id": thread_id, "candidate_name": candidate["candidate_name"]})
+                if apply:
+                    # Recheck immediately before the only posting operation.
+                    permalink = full_slack_marker_history(client, channel_id).get(thread_id, "")
+                    if not permalink:
+                        posted, failed = post_candidate_reviews_to_slack(
+                            config, [candidate], ignore_local_state=True
+                        )
+                        if posted != 1 or failed:
+                            raise RuntimeError(f"Failed to post Slack review for ATS thread {thread_id}")
+                        permalink = full_slack_marker_history(client, channel_id).get(thread_id, "")
+                    if not permalink:
+                        raise RuntimeError(f"Posted Slack review for {thread_id} but could not recover its permalink")
+                    result["posted"].append({"page_id": candidate["page_id"], "thread_id": thread_id, "url": permalink})
+            if apply and permalink:
+                built = build_notion_value(url_schema, permalink)
+                if built is None:
+                    raise RuntimeError("Could not build Slack Review URL Notion value")
+                notion.update_page(candidate["page_id"], {prop_map.slack_review_url: built})
+        return result
+    finally:
+        SLACK_RECONCILIATION_MUTEX.release()
+
+
 def select_ingest_review_candidates(created_candidates: list[dict[str, str]]) -> list[dict[str, str]]:
     return [
         candidate
@@ -4299,13 +4404,17 @@ def collect_review_candidates_for_slack(
     for page in notion.query_pages({"page_size": 100}):
         props = page.get("properties", {})
         status = status_key(notion_prop_value(props.get(prop_map.status, {})))
-        if status and status != "awaiting decision":
+        if status != "awaiting decision":
             continue
         decision = notion_prop_value(props.get(prop_map.decision, {})).strip()
         if decision:
             continue
         source = notion_prop_value(props.get(prop_map.source, {})).strip()
-        if is_superposition_source(source):
+        if clean_text(source).lower() != SOURCE_INBOUND.lower():
+            continue
+
+        slack_review_url = notion_prop_value(props.get(prop_map.slack_review_url, {})).strip()
+        if slack_review_url:
             continue
 
         thread_id = notion_prop_value(props.get(prop_map.gmail_thread_id, {})).strip()
@@ -4326,6 +4435,7 @@ def collect_review_candidates_for_slack(
                 "thread_id": thread_id,
                 "notion_url": notion_page_url(page.get("id", "")),
                 "date_first_entered": notion_prop_value(props.get(prop_map.date_first_entered, {})).strip(),
+                "page_id": str(page.get("id", "") or "").strip(),
             }
         )
 
@@ -5834,9 +5944,12 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         recruiter_sender_names=config.recruiter_sender_names,
     )
 
-    if slack_enabled(config):
-        review_candidates = select_ingest_review_candidates(created_candidates)
-        slack_posts, slack_post_failures = post_candidate_reviews_to_slack(config, review_candidates)
+    if slack_post_enabled(config):
+        reconciliation = reconcile_slack_reviews(
+            config, notion, database_schema, prop_map, apply=True
+        )
+        slack_posts = len(reconciliation["posted"])
+        slack_post_failures = 0
 
     print(f"Processed messages: {processed}")
     print(f"Created Notion records: {created}")
@@ -5844,7 +5957,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     print(f"Backfilled Source values: {source_backfilled}")
     print(f"Skipped messages: {skipped}")
     print(f"Skipped (subject format mismatch): {subject_format_skipped}")
-    if slack_enabled(config):
+    if slack_post_enabled(config):
         print(f"Slack review posts created: {slack_posts}")
         print(f"Slack review post failures: {slack_post_failures}")
 
@@ -7123,6 +7236,174 @@ def post_ats_follow_up_test_cmd(_args: argparse.Namespace) -> None:
     print(f"Test ATS follow-up candidates included: {candidates}")
 
 
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def reconcile_slack_reviews_cmd(args: argparse.Namespace) -> None:
+    config = load_config()
+    notion = NotionClient(config.notion_token, config.notion_database_id)
+    schema = notion.get_database()
+    prop = resolve_property_map(config.property_map, schema)
+    result = reconcile_slack_reviews(config, notion, schema, prop, apply=bool(args.apply))
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def classify_superposition_evidence(text: str, actor: str = "unknown") -> tuple[str, str, str]:
+    cleaned = clean_text(text)
+    lower = cleaned.lower()
+    rules = (
+        ("candidate", r"\b(withdraw|withdrawing|no longer interested|decline the opportunity|must pass)\b", "Passed", "candidate_withdrawal"),
+        ("company", r"\b(will not be moving forward|won't be moving forward|not moving forward|decided not to proceed)\b", "Rejected", "company_rejection"),
+        ("any", r"\b(schedule|scheduling|calendar|calendly|book(?:ed|ing)?|availability|times? work)\b", "Round 1 Scheduling", "active_scheduling"),
+        ("any", r"\b(follow up|following up|checking in|next step|still interested|haven't heard)\b", "Needs Attention", "stalled_or_ambiguous"),
+    )
+    for required_actor, pattern, status, rule in rules:
+        if required_actor not in {"any", actor}:
+            continue
+        if re.search(pattern, lower, re.IGNORECASE):
+            return status, rule, f"Matched {rule.replace('_', ' ')} evidence"
+    return "", "manual_review", "No unambiguous status rule matched"
+
+
+def audit_superposition_statuses_cmd(args: argparse.Namespace) -> None:
+    config = load_config()
+    notion = NotionClient(config.notion_token, config.notion_database_id)
+    schema = notion.get_database()
+    prop = resolve_property_map(config.property_map, schema)
+    gmail = ensure_google_service(
+        api_name="gmail", api_version="v1", scopes=GMAIL_SCOPES,
+        credentials_env="GOOGLE_GMAIL_CREDENTIALS_FILE",
+        credentials_default="secrets/google-gmail-credentials.json",
+        token_env="GOOGLE_GMAIL_TOKEN_FILE", token_default="secrets/google-gmail-token.json",
+        help_text="Set project-scoped Gmail OAuth credentials.",
+    )
+    rows: list[dict[str, Any]] = []
+    verified_company_senders = {normalize_email(config.from_email), normalize_email(config.hiring_alias)}
+    verified_company_senders.update(normalize_email(item) for item in config.recruiter_sender_emails)
+    verified_company_senders.discard("")
+    for page in notion.query_pages({"page_size": 100}):
+        props = page.get("properties", {})
+        if not is_superposition_source(notion_prop_value(props.get(prop.source, {}))):
+            continue
+        thread_id = notion_prop_value(props.get(prop.gmail_thread_id, {})).strip()
+        current = notion_prop_value(props.get(prop.status, {})).strip()
+        candidate_email = normalize_email(notion_prop_value(props.get(prop.email, {})))
+        evidence_at = ""
+        evidence_ref = ""
+        proposed = rule = reason = ""
+        evidence: list[tuple[str, str, str, str, str]] = []
+        if thread_id:
+            thread = gmail.users().threads().get(userId="me", id=thread_id, format="full").execute()
+            for message in sorted_thread_messages(thread):
+                body = extract_message_body_text(message)
+                quote = EMAIL_QUOTE_START_RE.search(body)
+                unquoted = body[: quote.start()] if quote else body
+                sender = normalize_email(parseaddr(header_map(message).get("from", ""))[1])
+                actor = (
+                    "candidate" if sender and candidate_email and sender == candidate_email
+                    else "company" if sender in verified_company_senders
+                    else "unknown"
+                )
+                status, matched, why = classify_superposition_evidence(unquoted, actor)
+                if status:
+                    dt = message_internal_datetime(message)
+                    evidence.append((status, matched, why, iso(dt) if dt else "", str(message.get("id", "") or "")))
+        statuses = {item[0] for item in evidence}
+        if len(statuses) == 1:
+            proposed, rule, reason, evidence_at, evidence_ref = evidence[-1]
+        elif len(statuses) > 1:
+            proposed, rule, reason = "", "manual_review_conflict", "Conflicting unquoted evidence matched multiple status rules"
+        rows.append({
+            "row_id": str(page.get("id", "") or ""), "gmail_thread_id": thread_id,
+            "current_status": current, "proposed_status": proposed,
+            "evidence_timestamp": evidence_at, "evidence_reference": evidence_ref,
+            "matched_rule": rule or "manual_review", "reason": reason or "Missing Gmail evidence",
+        })
+    artifact = {"version": 1, "generated_at": iso(datetime.now(timezone.utc)), "rows": rows}
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps({"output": str(output), "sha256": sha256_file(output), "rows": len(rows)}, indent=2))
+
+
+def apply_superposition_statuses_cmd(args: argparse.Namespace) -> None:
+    path = Path(args.artifact)
+    actual = sha256_file(path)
+    if actual.lower() != args.sha256.lower():
+        raise RuntimeError(f"Artifact SHA-256 mismatch: expected {args.sha256}, got {actual}")
+    artifact = json.loads(path.read_text(encoding="utf-8"))
+    if artifact.get("version") != 1 or not isinstance(artifact.get("rows"), list):
+        raise RuntimeError("Unsupported Superposition audit artifact")
+    config = load_config()
+    notion = NotionClient(config.notion_token, config.notion_database_id)
+    schema = notion.get_database()
+    prop = resolve_property_map(config.property_map, schema)
+    status_schema = schema.get("properties", {}).get(prop.status, {})
+    allowed_statuses = {"Passed", "Rejected", "Round 1 Scheduling", "Needs Attention"}
+    row_ids = [str(row.get("row_id", "") or "").strip() for row in artifact["rows"]]
+    if any(not row_id for row_id in row_ids) or len(set(row_ids)) != len(row_ids):
+        raise RuntimeError("Artifact row IDs must be non-empty and unique")
+    planned: list[tuple[str, str, dict[str, Any]]] = []
+    for row in artifact["rows"]:
+        proposed = str(row.get("proposed_status", "") or "").strip()
+        if proposed and proposed not in allowed_statuses:
+            raise RuntimeError(f"Disallowed proposed status for row {row.get('row_id')}: {proposed}")
+        if not proposed or proposed == str(row.get("current_status", "") or "").strip():
+            continue
+        live_page = notion.get_page(str(row["row_id"]))
+        live_props = live_page.get("properties", {})
+        live_source = notion_prop_value(live_props.get(prop.source, {})).strip()
+        live_status = notion_prop_value(live_props.get(prop.status, {})).strip()
+        if not is_superposition_source(live_source):
+            raise RuntimeError(f"Row {row['row_id']} is no longer Superposition")
+        if live_status != str(row.get("current_status", "") or "").strip():
+            raise RuntimeError(
+                f"Row {row['row_id']} status changed since preview: expected {row.get('current_status')}, got {live_status}"
+            )
+        built = build_notion_value(status_schema, proposed)
+        if built is None:
+            raise RuntimeError(f"Cannot build status value for row {row.get('row_id')}")
+        planned.append((str(row["row_id"]), proposed, built))
+
+    changed: list[str] = []
+    for row_id, proposed, built in planned:
+        notion.update_page(row_id, {prop.status: built})
+        readback = notion.get_page(row_id)
+        readback_status = notion_prop_value(readback.get("properties", {}).get(prop.status, {})).strip()
+        if readback_status != proposed:
+            raise RuntimeError(f"Status readback failed for row {row_id}: got {readback_status}")
+        changed.append(row_id)
+    print(json.dumps({"artifact_sha256": actual, "changed_row_ids": changed}, indent=2))
+
+
+def post_awaiting_digest_cmd(args: argparse.Namespace) -> None:
+    path = Path(args.artifact)
+    artifact = json.loads(path.read_text(encoding="utf-8"))
+    items = artifact.get("items", [])
+    if not isinstance(items, list) or not items:
+        raise RuntimeError("Digest artifact must contain a non-empty items list")
+    config = load_config()
+    client = slack_post_client(config)
+    channel_id = client.resolve_channel_id(config.slack_review_channel)
+    marker = f"ATS_AWAITING_DIGEST_RUN_ID:{args.run_id}"
+    if any(marker in str(message.get("text", "") or "") for message in client.list_channel_messages(channel_id, 1.0)):
+        print(json.dumps({"posted": False, "reason": "already_posted", "run_id": args.run_id}))
+        return
+    lines = [f"*Awaiting candidate reviews*  {marker}"]
+    for item in items:
+        name = clean_text(str(item.get("candidate_name", "") or ""))
+        url = str(item.get("slack_review_url", "") or "").strip()
+        thread_id = str(item.get("thread_id", "") or "").strip()
+        if not name or not url or not thread_id:
+            raise RuntimeError("Every digest item requires candidate_name, thread_id, and slack_review_url")
+        lines.append(f"• <{url}|{name}> — `{slack_thread_marker(thread_id)}`")
+    text = "\n".join(lines)
+    response = client.post_message(channel_id, text, [{"type": "section", "text": {"type": "mrkdwn", "text": text}}])
+    permalink = client.get_message_permalink(channel_id, str(response.get("ts", "") or ""))
+    print(json.dumps({"posted": True, "run_id": args.run_id, "count": len(items), "permalink": permalink}, indent=2))
+
+
 def run_cmd(_args: argparse.Namespace) -> None:
     failures: list[str] = []
     for step_name, step_func in (
@@ -7205,6 +7486,7 @@ def schema_check_cmd(_args: argparse.Namespace) -> None:
         prop_map.scheduling_draft_id,
         prop_map.proposed_slot,
         prop_map.last_sync_at,
+        prop_map.slack_review_url,
     ]
 
     missing = [name for name in required if name not in properties]
@@ -7307,6 +7589,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Post the non-terminal ATS Slack digest immediately without consuming a scheduled slot",
     )
     follow_up_test_parser.set_defaults(func=post_ats_follow_up_test_cmd)
+
+    reconcile_parser = subparsers.add_parser(
+        "reconcile-slack-reviews", help="Preview or apply durable ATS-to-Slack review reconciliation"
+    )
+    reconcile_mode = reconcile_parser.add_mutually_exclusive_group(required=True)
+    reconcile_mode.add_argument("--dry-run", action="store_true")
+    reconcile_mode.add_argument("--apply", action="store_true")
+    reconcile_parser.set_defaults(func=reconcile_slack_reviews_cmd)
+
+    audit_superposition_parser = subparsers.add_parser(
+        "audit-superposition-statuses", help="Write a Gmail-evidence status preview artifact"
+    )
+    audit_superposition_parser.add_argument("--output", required=True)
+    audit_superposition_parser.set_defaults(func=audit_superposition_statuses_cmd)
+
+    apply_superposition_parser = subparsers.add_parser(
+        "apply-superposition-statuses", help="Apply a hash-approved Superposition status artifact"
+    )
+    apply_superposition_parser.add_argument("--artifact", required=True)
+    apply_superposition_parser.add_argument("--sha256", required=True)
+    apply_superposition_parser.set_defaults(func=apply_superposition_statuses_cmd)
+
+    digest_parser = subparsers.add_parser(
+        "post-awaiting-digest", help="Post an idempotent digest from an approved candidate/post artifact"
+    )
+    digest_parser.add_argument("--artifact", required=True)
+    digest_parser.add_argument("--run-id", required=True)
+    digest_parser.set_defaults(func=post_awaiting_digest_cmd)
 
     close_custom_gpt_parser = subparsers.add_parser(
         "close-stale-custom-gpt",

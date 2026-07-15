@@ -69,3 +69,10 @@ Start implementing the reliability improvements needed to retire production Sock
 - Deliver this signed HTTP interactivity foundation through PR review.
 - Implement an atomic durable interaction queue/idempotency store and durable pending deal-source records as the next slice. The store must persist across Railway deploys and avoid exposing prospect context.
 - Perform the production transport cutover only after the durability slice is reviewed, deployed, and verified.
+
+## Delivery
+
+- Commit: `5746c69` (`Add signed Slack HTTP interactions foundation`)
+- Branch: `codex/slack-http-interactions-reliability`
+- Pull request: `https://github.com/mchien-truewind/leads-update/pull/105`
+- Production transport remains unchanged on Socket Mode.

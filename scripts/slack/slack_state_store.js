@@ -231,8 +231,13 @@ class PostgresSlackStateStore {
   async pruneCompleted(retentionDays = 30) {
     const days = Number.isFinite(retentionDays) && retentionDays > 0 ? Math.min(Math.floor(retentionDays), 365) : 30;
     await this.pool.query(
-      `DELETE FROM slack_interaction_jobs WHERE status = 'completed' AND completed_at < NOW() - ($1 * INTERVAL '1 day');
-       DELETE FROM slack_pending_deal_source_requests WHERE status = 'completed' AND completed_at < NOW() - ($1 * INTERVAL '1 day')`,
+      `DELETE FROM slack_interaction_jobs
+       WHERE status = 'completed' AND completed_at < NOW() - ($1 * INTERVAL '1 day')`,
+      [days],
+    );
+    await this.pool.query(
+      `DELETE FROM slack_pending_deal_source_requests
+       WHERE status = 'completed' AND completed_at < NOW() - ($1 * INTERVAL '1 day')`,
       [days],
     );
   }

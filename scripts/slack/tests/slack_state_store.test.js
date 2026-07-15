@@ -101,6 +101,17 @@ test('stale processing jobs move to needs_review instead of replaying', async ()
   assert.match(calls[0].sql, /status = 'processing'/);
 });
 
+test('completed retention uses separate prepared statements', async () => {
+  const calls = [];
+  const pool = { query: async (sql, params = []) => { calls.push({ sql, params }); return { rows: [] }; } };
+  const store = new PostgresSlackStateStore({ pool });
+  await store.pruneCompleted(30);
+  assert.strictEqual(calls.length, 2);
+  assert.match(calls[0].sql, /DELETE FROM slack_interaction_jobs/);
+  assert.match(calls[1].sql, /DELETE FROM slack_pending_deal_source_requests/);
+  assert.strictEqual(calls.every((call) => !call.sql.includes(';')), true);
+});
+
 test('missing connection string fails closed by returning no store', () => {
   assert.strictEqual(createPostgresSlackStateStore({ connectionString: '' }), null);
 });

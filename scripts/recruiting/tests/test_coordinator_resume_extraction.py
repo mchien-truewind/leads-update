@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import sys
 import tempfile
@@ -371,6 +373,156 @@ class SlackMentionBehaviorTests(unittest.TestCase):
         selected = cli.select_ingest_review_candidates([inbound, superposition])
 
         self.assertEqual(selected, [inbound])
+
+
+class DurableSlackReconciliationTests(unittest.TestCase):
+    @staticmethod
+    def _schema(slack_type="url"):
+        prop = cli.NotionPropertyMap()
+        return {
+            "properties": {
+                prop.candidate_name: {"type": "title"}, prop.source: {"type": "select"},
+                prop.status: {"type": "status"}, prop.decision: {"type": "select"},
+                prop.gmail_thread_id: {"type": "rich_text"}, prop.slack_review_url: {"type": slack_type},
+            }
+        }
+
+    @staticmethod
+    def _page(page_id, *, source="Inbound", status="Awaiting Decision", decision="", thread="t1", receipt=""):
+        prop = cli.NotionPropertyMap()
+        return {"id": page_id, "properties": {
+            prop.candidate_name: {"type": "title", "title": [{"plain_text": page_id}]},
+            prop.source: {"type": "select", "select": {"name": source}},
+            prop.status: {"type": "status", "status": {"name": status}},
+            prop.decision: {"type": "select", "select": ({"name": decision} if decision else None)},
+            prop.gmail_thread_id: {"type": "rich_text", "rich_text": ([{"plain_text": thread}] if thread else [])},
+            prop.slack_review_url: {"type": "url", "url": receipt or None},
+        }}
+
+    def test_eligibility_excludes_non_inbound_decided_non_awaiting_missing_thread_and_receipt(self):
+        pages = [
+            self._page("eligible"), self._page("super", source="Superposition"),
+            self._page("decided", decision="Proceed"), self._page("other", status="Needs Attention"),
+            self._page("no-thread", thread=""), self._page("delivered", receipt="https://slack.test/p1"),
+        ]
+        notion = mock.Mock()
+        notion.query_pages.return_value = pages
+        selected = cli.collect_review_candidates_for_slack(notion, self._schema(), cli.NotionPropertyMap())
+        self.assertEqual([item["page_id"] for item in selected], ["eligible"])
+
+    def test_wrong_receipt_schema_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "must be type URL"):
+            cli.ensure_slack_review_url_schema(mock.Mock(), self._schema("rich_text"), cli.NotionPropertyMap())
+
+    def test_dry_run_missing_schema_does_not_create_property(self):
+        notion = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, "run --apply"):
+            cli.ensure_slack_review_url_schema(
+                notion, {"properties": {}}, cli.NotionPropertyMap(), create=False
+            )
+        notion.update_database.assert_not_called()
+
+    def test_apply_creates_missing_url_schema(self):
+        notion = mock.Mock()
+        notion.update_database.return_value = self._schema()
+        result = cli.ensure_slack_review_url_schema(notion, {"properties": {}}, cli.NotionPropertyMap())
+        self.assertIn(cli.NotionPropertyMap().slack_review_url, result["properties"])
+        notion.update_database.assert_called_once()
+
+    def test_marker_history_is_fully_paginated_by_client_and_requires_permalink(self):
+        client = mock.Mock()
+        client.list_channel_messages.return_value = [{"text": "ATS_THREAD_ID:t1", "ts": "1.2"}]
+        client.get_message_permalink.return_value = "https://slack.test/p1"
+        self.assertEqual(cli.full_slack_marker_history(client, "C1"), {"t1": "https://slack.test/p1"})
+        client.get_message_permalink.return_value = ""
+        with self.assertRaisesRegex(RuntimeError, "no permalink"):
+            cli.full_slack_marker_history(client, "C1")
+
+    def test_superposition_rules_and_quoted_only_hold(self):
+        self.assertEqual(cli.classify_superposition_evidence("I am withdrawing", "candidate")[0], "Passed")
+        self.assertEqual(cli.classify_superposition_evidence("We will not be moving forward", "company")[0], "Rejected")
+        self.assertEqual(cli.classify_superposition_evidence("We will not be moving forward", "candidate")[0], "")
+        self.assertEqual(cli.classify_superposition_evidence("Please book a time on my calendar")[0], "Round 1 Scheduling")
+        self.assertEqual(cli.classify_superposition_evidence("Just following up")[0], "Needs Attention")
+        self.assertEqual(cli.classify_superposition_evidence("Thanks for the update")[0], "")
+
+    def test_digest_rerun_is_noop_when_marker_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact = Path(tmpdir) / "digest.json"
+            artifact.write_text(json.dumps({"items": [{
+                "candidate_name": "Jordan", "thread_id": "t1", "slack_review_url": "https://slack.test/p1"
+            }]}))
+            args = argparse.Namespace(artifact=str(artifact), run_id="repair-1")
+            client = mock.Mock()
+            client.resolve_channel_id.return_value = "C1"
+            client.list_channel_messages.return_value = [{"text": "ATS_AWAITING_DIGEST_RUN_ID:repair-1"}]
+            with mock.patch.object(cli, "load_config", return_value=build_config()), mock.patch.object(
+                cli, "slack_post_client", return_value=client
+            ), mock.patch("builtins.print"):
+                cli.post_awaiting_digest_cmd(args)
+            client.post_message.assert_not_called()
+
+    def test_recovered_marker_persists_receipt_without_posting(self):
+        notion = mock.Mock()
+        notion.query_pages.return_value = [self._page("p1")]
+        client = mock.Mock()
+        client.resolve_channel_id.return_value = "C1"
+        with mock.patch.object(cli, "slack_post_client", return_value=client), mock.patch.object(
+            cli, "full_slack_marker_history", return_value={"t1": "https://slack.test/p1"}
+        ), mock.patch.object(cli, "post_candidate_reviews_to_slack") as post:
+            result = cli.reconcile_slack_reviews(
+                build_config(), notion, self._schema(), cli.NotionPropertyMap(), apply=True
+            )
+        self.assertEqual(len(result["recovered"]), 1)
+        notion.update_page.assert_called_once()
+        post.assert_not_called()
+
+    def test_missing_marker_posts_then_persists_and_retries_after_receipt_failure(self):
+        notion = mock.Mock()
+        notion.query_pages.return_value = [self._page("p1")]
+        notion.update_page.side_effect = RuntimeError("Notion unavailable")
+        client = mock.Mock()
+        client.resolve_channel_id.return_value = "C1"
+        histories = [{}, {}, {"t1": "https://slack.test/p1"}]
+        with mock.patch.object(cli, "slack_post_client", return_value=client), mock.patch.object(
+            cli, "full_slack_marker_history", side_effect=histories
+        ), mock.patch.object(cli, "post_candidate_reviews_to_slack", return_value=(1, 0)) as post:
+            with self.assertRaisesRegex(RuntimeError, "Notion unavailable"):
+                cli.reconcile_slack_reviews(
+                    build_config(), notion, self._schema(), cli.NotionPropertyMap(), apply=True
+                )
+        post.assert_called_once()
+
+        notion.update_page.side_effect = None
+        with mock.patch.object(cli, "slack_post_client", return_value=client), mock.patch.object(
+            cli, "full_slack_marker_history", return_value={"t1": "https://slack.test/p1"}
+        ), mock.patch.object(cli, "post_candidate_reviews_to_slack") as repost:
+            cli.reconcile_slack_reviews(
+                build_config(), notion, self._schema(), cli.NotionPropertyMap(), apply=True
+            )
+        repost.assert_not_called()
+
+    def test_history_failure_and_mutex_contention_fail_closed(self):
+        notion = mock.Mock()
+        notion.query_pages.return_value = [self._page("p1")]
+        client = mock.Mock()
+        client.resolve_channel_id.return_value = "C1"
+        with mock.patch.object(cli, "slack_post_client", return_value=client), mock.patch.object(
+            cli, "full_slack_marker_history", side_effect=RuntimeError("Slack unavailable")
+        ), mock.patch.object(cli, "post_candidate_reviews_to_slack") as post:
+            with self.assertRaisesRegex(RuntimeError, "Slack unavailable"):
+                cli.reconcile_slack_reviews(
+                    build_config(), notion, self._schema(), cli.NotionPropertyMap(), apply=True
+                )
+            post.assert_not_called()
+        cli.SLACK_RECONCILIATION_MUTEX.acquire()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                cli.reconcile_slack_reviews(
+                    build_config(), notion, self._schema(), cli.NotionPropertyMap(), apply=True
+                )
+        finally:
+            cli.SLACK_RECONCILIATION_MUTEX.release()
 
 
 class ProceedRoleRoutingTests(unittest.TestCase):

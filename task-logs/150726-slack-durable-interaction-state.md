@@ -72,3 +72,10 @@ Continue implementing the reliability work after the signed HTTP interactions fo
 - The dedicated Railway PostgreSQL service is provisioned; keep it unbound until the merged code deploys.
 - After merge/deploy, bind the private Postgres URL only as `SLACK_STATE_DATABASE_URL` on `leads-update`, verify schema/readback/health, and leave `leads-update-bot` unbound.
 - Perform Slack HTTP transport cutover as a separate controlled operation.
+
+## Delivery
+
+- Commit: `00f72ab` (`Persist Slack interaction state in Postgres`)
+- Branch: `codex/slack-durable-interaction-state`
+- Pull request: `https://github.com/mchien-truewind/leads-update/pull/106`
+- Railway PostgreSQL: healthy and unbound; production Slack transport unchanged.

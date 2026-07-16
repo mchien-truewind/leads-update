@@ -4305,7 +4305,12 @@ def full_slack_marker_history(client: SlackClient, channel_id: str) -> dict[str,
         message_ts = str(message.get("ts", "") or "").strip()
         if not message_ts:
             raise RuntimeError(f"Slack marker {thread_id} has no message timestamp")
-        permalink = client.get_message_permalink(channel_id, message_ts)
+        try:
+            permalink = client.get_message_permalink(channel_id, message_ts)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Slack permalink lookup failed for ATS thread {thread_id} at message {message_ts}: {exc}"
+            ) from exc
         if not permalink:
             raise RuntimeError(f"Slack marker {thread_id} has no permalink")
         found[thread_id] = permalink

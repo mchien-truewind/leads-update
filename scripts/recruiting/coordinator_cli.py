@@ -15,6 +15,7 @@ import time as time_module
 import unicodedata
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 from email.message import EmailMessage
@@ -4310,7 +4311,7 @@ def post_candidate_reviews_to_slack(
 
 def full_slack_marker_history(client: SlackClient, channel_id: str) -> dict[str, str]:
     """Return exact ATS marker permalinks; any Slack failure propagates to the caller."""
-    found: dict[str, str] = {}
+    marker_messages: list[tuple[str, str]] = []
     for message in client.list_channel_messages(channel_id, 1.0):
         thread_id = extract_thread_id_from_slack_message(str(message.get("text", "") or ""))
         if not thread_id:
@@ -4318,6 +4319,10 @@ def full_slack_marker_history(client: SlackClient, channel_id: str) -> dict[str,
         message_ts = str(message.get("ts", "") or "").strip()
         if not message_ts:
             raise RuntimeError(f"Slack marker {thread_id} has no message timestamp")
+        marker_messages.append((thread_id, message_ts))
+
+    def fetch_permalink(item: tuple[str, str]) -> tuple[str, str]:
+        thread_id, message_ts = item
         try:
             permalink = client.get_message_permalink(channel_id, message_ts)
         except Exception as exc:
@@ -4326,8 +4331,10 @@ def full_slack_marker_history(client: SlackClient, channel_id: str) -> dict[str,
             ) from exc
         if not permalink:
             raise RuntimeError(f"Slack marker {thread_id} has no permalink")
-        found[thread_id] = permalink
-    return found
+        return thread_id, permalink
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(marker_messages)))) as pool:
+        return dict(pool.map(fetch_permalink, marker_messages))
 
 
 def ensure_slack_review_url_schema(

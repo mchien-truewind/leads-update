@@ -438,6 +438,21 @@ class DurableSlackReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no permalink"):
             cli.full_slack_marker_history(client, "C1")
 
+    def test_permalink_uses_documented_get_transport(self):
+        response = mock.Mock(ok=True, status_code=200)
+        response.json.return_value = {"ok": True, "permalink": "https://slack.test/p1"}
+        requests_mock = mock.Mock()
+        requests_mock.get.return_value = response
+        with mock.patch.object(cli, "requests", requests_mock):
+            client = cli.SlackClient("xoxb-test")
+            self.assertEqual(client.get_message_permalink("C1", "123.456"), "https://slack.test/p1")
+        requests_mock.get.assert_called_once_with(
+            "https://slack.com/api/chat.getPermalink",
+            headers={"Authorization": "Bearer xoxb-test"},
+            params={"channel": "C1", "message_ts": "123.456"},
+            timeout=30,
+        )
+
     def test_superposition_rules_and_quoted_only_hold(self):
         self.assertEqual(cli.classify_superposition_evidence("I am withdrawing", "candidate")[0], "Passed")
         self.assertEqual(cli.classify_superposition_evidence("We will not be moving forward", "company")[0], "Rejected")

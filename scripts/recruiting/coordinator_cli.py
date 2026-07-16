@@ -737,8 +737,21 @@ class SlackClient:
         )
 
     def get_message_permalink(self, channel_id: str, message_ts: str) -> str:
-        response = self._request("chat.getPermalink", {"channel": channel_id, "message_ts": message_ts})
-        return str(response.get("permalink", "") or "")
+        response = requests.get(
+            f"{self._base_url}/chat.getPermalink",
+            headers={"Authorization": f"Bearer {self._token}"},
+            params={"channel": channel_id, "message_ts": message_ts},
+            timeout=30,
+        )
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "unknown")
+            raise RuntimeError(f"Slack API rate-limited for chat.getPermalink (retry_after={retry_after}s)")
+        if not response.ok:
+            raise RuntimeError(f"Slack API HTTP error {response.status_code}: {response.text}")
+        body = response.json()
+        if not body.get("ok"):
+            raise RuntimeError(f"Slack API error chat.getPermalink: {body.get('error', 'unknown_error')}")
+        return str(body.get("permalink", "") or "")
 
     def list_channel_messages(self, channel_id: str, oldest_ts: float = 1.0) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []

@@ -7313,6 +7313,8 @@ def audit_superposition_statuses_cmd(args: argparse.Namespace) -> None:
             continue
         thread_id = notion_prop_value(props.get(prop.gmail_thread_id, {})).strip()
         current = notion_prop_value(props.get(prop.status, {})).strip()
+        if status_key(current) != "awaiting decision":
+            continue
         candidate_email = normalize_email(notion_prop_value(props.get(prop.email, {})))
         evidence_at = ""
         evidence_ref = ""

@@ -455,6 +455,20 @@ class DurableSlackReconciliationTests(unittest.TestCase):
 
     def test_superposition_rules_and_quoted_only_hold(self):
         self.assertEqual(cli.classify_superposition_evidence("I am withdrawing", "candidate")[0], "Passed")
+        self.assertEqual(
+            cli.classify_superposition_evidence(
+                "The comp is significantly lower than where I need to be. Good luck.", "candidate"
+            )[0],
+            "Passed",
+        )
+        self.assertNotEqual(
+            cli.classify_superposition_evidence(
+                "The compensation is significantly lower than I need; can you increase it? "
+                "I can book time on your calendar to discuss.",
+                "candidate",
+            )[0],
+            "Passed",
+        )
         self.assertEqual(cli.classify_superposition_evidence("We will not be moving forward", "company")[0], "Rejected")
         self.assertEqual(cli.classify_superposition_evidence("We will not be moving forward", "candidate")[0], "")
         self.assertEqual(cli.classify_superposition_evidence("Please book a time on my calendar", "company")[0], "Round 1 Scheduling")

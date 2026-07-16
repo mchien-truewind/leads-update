@@ -457,8 +457,9 @@ class DurableSlackReconciliationTests(unittest.TestCase):
         self.assertEqual(cli.classify_superposition_evidence("I am withdrawing", "candidate")[0], "Passed")
         self.assertEqual(cli.classify_superposition_evidence("We will not be moving forward", "company")[0], "Rejected")
         self.assertEqual(cli.classify_superposition_evidence("We will not be moving forward", "candidate")[0], "")
-        self.assertEqual(cli.classify_superposition_evidence("Please book a time on my calendar")[0], "Round 1 Scheduling")
-        self.assertEqual(cli.classify_superposition_evidence("Just following up")[0], "Needs Attention")
+        self.assertEqual(cli.classify_superposition_evidence("Please book a time on my calendar", "company")[0], "Round 1 Scheduling")
+        self.assertEqual(cli.classify_superposition_evidence("Just following up", "candidate")[0], "Needs Attention")
+        self.assertEqual(cli.classify_superposition_evidence("Please book a time on my calendar", "unknown")[0], "")
         self.assertEqual(cli.classify_superposition_evidence("Thanks for the update")[0], "")
 
     def test_digest_rerun_is_noop_when_marker_exists(self):

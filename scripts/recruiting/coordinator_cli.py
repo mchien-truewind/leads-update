@@ -7277,6 +7277,8 @@ def reconcile_slack_reviews_cmd(args: argparse.Namespace) -> None:
 def classify_superposition_evidence(text: str, actor: str = "unknown") -> tuple[str, str, str]:
     cleaned = clean_text(text)
     lower = cleaned.lower()
+    if actor not in {"candidate", "company"}:
+        return "", "manual_review_unknown_sender", "Sender could not be positively verified"
     rules = (
         ("candidate", r"\b(withdraw|withdrawing|no longer interested|decline the opportunity|must pass)\b", "Passed", "candidate_withdrawal"),
         ("company", r"\b(will not be moving forward|won't be moving forward|not moving forward|decided not to proceed)\b", "Rejected", "company_rejection"),

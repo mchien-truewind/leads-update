@@ -7280,7 +7280,14 @@ def classify_superposition_evidence(text: str, actor: str = "unknown") -> tuple[
     if actor not in {"candidate", "company"}:
         return "", "manual_review_unknown_sender", "Sender could not be positively verified"
     rules = (
-        ("candidate", r"\b(withdraw|withdrawing|no longer interested|decline the opportunity|must pass)\b", "Passed", "candidate_withdrawal"),
+        (
+            "candidate",
+            r"\b(withdraw|withdrawing|no longer interested|decline the opportunity|must pass|"
+            r"comp(?:ensation)?.{0,50}(?:significantly\s+)?lower.{0,40}(?:need|require)"
+            r".{0,120}(?:good luck|cannot proceed|won't work|will not work|pass on|decline))\b",
+            "Passed",
+            "candidate_withdrawal",
+        ),
         ("company", r"\b(will not be moving forward|won't be moving forward|not moving forward|decided not to proceed)\b", "Rejected", "company_rejection"),
         ("any", r"\b(schedule|scheduling|calendar|calendly|book(?:ed|ing)?|availability|times? work)\b", "Round 1 Scheduling", "active_scheduling"),
         ("any", r"\b(follow up|following up|checking in|next step|still interested|haven't heard)\b", "Needs Attention", "stalled_or_ambiguous"),

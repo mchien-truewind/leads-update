@@ -169,7 +169,7 @@ class HubSpotSalesAdminClient {
     return uniqueValues(dealIds);
   }
 
-  async attachAssociations(meeting) {
+  async attachAssociations(meeting, { ownerId = '' } = {}) {
     const enriched = {
       ...meeting,
       _contacts: [],
@@ -213,10 +213,19 @@ class HubSpotSalesAdminClient {
       enriched._dealIds = await this.fallbackDealIdsForMeeting(contactIds, companyIds);
     }
 
-    enriched._deals = await Promise.all(enriched._dealIds.slice(0, 3).map(async dealId => {
-      const deal = await this.getObject('deals', dealId, ['dealname', 'dealstage', 'pipeline', 'amount', 'closedate']);
+    const associatedDeals = await Promise.all(enriched._dealIds.slice(0, 3).map(async dealId => {
+      const deal = await this.getObject('deals', dealId, ['dealname', 'dealstage', 'pipeline', 'amount', 'closedate', 'hubspot_owner_id']);
       return { id: deal.id, ...(deal.properties || {}), _associationSource: directDealIds.includes(dealId) ? 'meeting' : 'fallback' };
     })).catch(() => []);
+
+    const normalizedOwnerId = String(ownerId || '').trim();
+    enriched._deals = normalizedOwnerId
+      ? associatedDeals.filter(deal => String(deal.hubspot_owner_id || '').trim() === normalizedOwnerId)
+      : associatedDeals;
+    enriched._dealIds = enriched._deals.map(deal => String(deal.id || '')).filter(Boolean);
+    if (normalizedOwnerId && enriched._deals.length !== associatedDeals.length) {
+      this.logger.warn(`Sales admin excluded ${associatedDeals.length - enriched._deals.length} associated deal(s) not owned by HubSpot owner ${normalizedOwnerId} for meeting ${id}`);
+    }
 
     return enriched;
   }

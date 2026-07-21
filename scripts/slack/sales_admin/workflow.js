@@ -318,6 +318,12 @@ function primaryDeal(meeting) {
   return meeting?._deals?.[0] || null;
 }
 
+function dealsOwnedByAe(meeting, ae) {
+  const ownerId = String(ae?.hubspotOwnerId || '').trim();
+  if (!ownerId) return [];
+  return (meeting?._deals || []).filter(deal => String(deal?.hubspot_owner_id || '').trim() === ownerId);
+}
+
 function contactLabel(contact) {
   if (!contact) return '';
   const name = `${contact.firstname || ''} ${contact.lastname || ''}`.trim();
@@ -1151,7 +1157,7 @@ class SalesAdminWorkflow {
   async meetingsForDayOffset(ae, now = new Date(), dayOffset = 0) {
     const { start, end } = getLocalDayRange(now, this.timeZoneForAe(ae), dayOffset);
     const meetings = await this.hubspot.searchMeetingsForOwnerBetween(ae.hubspotOwnerId, start, end);
-    const enriched = await Promise.all(meetings.map(meeting => this.hubspot.attachAssociations(meeting)));
+    const enriched = await Promise.all(meetings.map(meeting => this.hubspot.attachAssociations(meeting, { ownerId: ae.hubspotOwnerId })));
     const deduped = dedupeDigestMeetings(enriched);
     await this.annotateCalendlyStatus(ae, deduped, { start, end });
     return deduped;
@@ -1320,7 +1326,7 @@ class SalesAdminWorkflow {
           const meetings = await this.hubspot.searchRecentlyUpdatedMeetingsForOwner(ae.hubspotOwnerId, updatedSince, startAfter);
           for (const rawMeeting of meetings) {
             if (classifyMeetingStatus(rawMeeting) !== 'cancelled') continue;
-            const meeting = await this.hubspot.attachAssociations(rawMeeting);
+            const meeting = await this.hubspot.attachAssociations(rawMeeting, { ownerId: ae.hubspotOwnerId });
             const keys = cancellationStateKeys(meeting, ae);
             if (keys.some(key => this.state.has(key))) { stats.skipped += 1; continue; }
             const source = cancellationSourceLabel(meeting);
@@ -1529,6 +1535,8 @@ class SalesAdminWorkflow {
   async applySelectedStage(record, selectedStageId) {
     const stageDecision = record.stageDecision;
     if (!stageDecision || !selectedStageId) return { updated: false, reason: 'No deal stage selected.' };
+    const ownedDeal = dealsOwnedByAe(record.meeting, record.ae).find(deal => String(deal.id) === String(stageDecision.dealId));
+    if (!ownedDeal) return { updated: false, reason: 'Associated deal is not owned by this AE.' };
     const selectedLabel = selectedStageLabel(stageDecision, selectedStageId) || selectedStageId;
     if (selectedStageId === stageDecision.currentStageId) {
       return { updated: false, reason: `Deal stayed in ${stageDecision.currentStageLabel}.`, fromLabel: stageDecision.currentStageLabel, toLabel: selectedLabel };
@@ -1538,7 +1546,9 @@ class SalesAdminWorkflow {
   }
 
   async updateHubSpotNextStep(record, value) {
-    const dealId = record.stageDecision?.dealId || primaryDeal(record.meeting)?.id || '';
+    const ownedDeals = dealsOwnedByAe(record.meeting, record.ae);
+    const stageDealId = String(record.stageDecision?.dealId || '');
+    const dealId = ownedDeals.find(deal => String(deal.id) === stageDealId)?.id || ownedDeals[0]?.id || '';
     if (!dealId) return { updated: false, reason: 'No associated deal found for HubSpot Next step.' };
     if (!this.config.hubspotNextStepProperty) return { updated: false, reason: 'No HubSpot Next step property configured.' };
     await this.hubspot.updateDealProperty(dealId, this.config.hubspotNextStepProperty, value);
@@ -1551,6 +1561,7 @@ class SalesAdminWorkflow {
     if (record.writebackStatus === 'written') return record;
     const meeting = record.meeting;
     const ae = record.ae;
+    const ownedDeals = dealsOwnedByAe(meeting, ae);
     const effectiveStageId = status === 'no_show' ? '' : (selectedStageId || record.stageDecision?.recommendedStageId || '');
     const stageUpdate = status === 'no_show' ? { updated: false, reason: 'No-show confirmation does not move deal stage.' } : await this.applySelectedStage(record, effectiveStageId);
     const effectiveHubSpotNextStep = status === 'no_show' ? '' : (hubspotNextStep || hubspotNextStepSummary({ meeting, extraction: record.extraction, datePrefix: record.nextStepDatePrefix }));
@@ -1583,7 +1594,7 @@ class SalesAdminWorkflow {
       meeting,
       contacts: meeting._contacts || [],
       companies: meeting._companies || [],
-      deals: meeting._deals || [],
+      deals: ownedDeals,
     });
     const taskIds = [];
     if (this.config.createTasks && status !== 'no_show') {
@@ -1597,7 +1608,7 @@ class SalesAdminWorkflow {
           meeting,
           contacts: meeting._contacts || [],
           companies: meeting._companies || [],
-          deals: meeting._deals || [],
+          deals: ownedDeals,
         });
         taskIds.push(task.id);
       }
@@ -1814,6 +1825,7 @@ module.exports = {
   cancellationSourceLabel,
   classifyMeetingStatus,
   createSalesAdminWorkflow,
+  dealsOwnedByAe,
   extractNextSteps,
   getLocalDayRange,
   buildStageDecision,

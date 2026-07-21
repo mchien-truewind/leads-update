@@ -12,6 +12,7 @@ const {
   SalesAdminWorkflow,
   cancellationSourceLabel,
   classifyMeetingStatus,
+  dealsOwnedByAe,
   getLocalDayRange,
   hubspotNextStepSummary,
   meetingEndMs,
@@ -287,6 +288,52 @@ test('sales admin HubSpot enrichment falls back to company and contact deals', a
   assert.deepEqual(enriched._dealIds, ['deal-from-company', 'deal-from-contact']);
   assert.equal(enriched._deals[0].dealname, 'Trove - New Deal');
   assert.equal(enriched._deals[0]._associationSource, 'fallback');
+});
+
+test('sales admin HubSpot enrichment keeps only deals owned by the roster AE', async () => {
+  const requestedDealProperties = [];
+  const client = new HubSpotSalesAdminClient({
+    hubspotRequest: async () => {
+      throw new Error('unexpected raw HubSpot request');
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  client.getAssociations = async (fromType, fromId, toType) => {
+    if (fromType === 'meetings' && fromId === 'm1' && toType === 'deals') return ['andrew-deal', 'other-deal'];
+    return [];
+  };
+  client.getObject = async (objectType, objectId, properties) => {
+    if (objectType !== 'deals') throw new Error(`unexpected object ${objectType}/${objectId}`);
+    requestedDealProperties.push(properties);
+    return {
+      id: objectId,
+      properties: {
+        dealname: objectId,
+        pipeline: '105321581',
+        dealstage: '190380582',
+        hubspot_owner_id: objectId === 'andrew-deal' ? '93961770' : '84547076',
+      },
+    };
+  };
+
+  const enriched = await client.attachAssociations(meeting({ hubspot_owner_id: '93961770' }), { ownerId: '93961770' });
+
+  assert.deepEqual(enriched._dealIds, ['andrew-deal']);
+  assert.deepEqual(enriched._deals.map(deal => deal.id), ['andrew-deal']);
+  assert.ok(requestedDealProperties.every(properties => properties.includes('hubspot_owner_id')));
+});
+
+test('sales admin deal writeback scope accepts only exact AE ownership', () => {
+  const ae = { hubspotOwnerId: '93961770' };
+  const meetingRecord = {
+    _deals: [
+      { id: 'andrew-deal', hubspot_owner_id: '93961770' },
+      { id: 'sarah-deal', hubspot_owner_id: '84547076' },
+      { id: 'unknown-deal' },
+    ],
+  };
+
+  assert.deepEqual(dealsOwnedByAe(meetingRecord, ae).map(deal => deal.id), ['andrew-deal']);
 });
 
 test('sales admin createNote associates to contacts/companies/deals, never the meeting', async () => {
@@ -1340,7 +1387,7 @@ test('sales admin confirmation updates HubSpot deal next step summary', async ()
   });
   workflow.state.set('post:m1:84547076', {
     ae: { name: 'Sarah Elix', email: 'sarah@trytruewind.com', hubspotOwnerId: '84547076' },
-    meeting: { id: 'm1', properties: { hs_meeting_title: 'Intro', hs_meeting_start_time: '2026-06-03T18:00:00.000Z' }, _deals: [{ id: 'deal-1' }] },
+    meeting: { id: 'm1', properties: { hs_meeting_title: 'Intro', hs_meeting_start_time: '2026-06-03T18:00:00.000Z' }, _deals: [{ id: 'deal-1', hubspot_owner_id: '84547076' }] },
     extraction: { summary: 'Acme is interested in AP automation and needs pricing follow-up.', nextSteps: [{ text: 'Send pricing' }] },
     nextStepDatePrefix: '06/08',
     grainUrl: 'https://grain.com/share/recording/grain-1',

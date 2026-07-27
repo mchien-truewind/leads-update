@@ -45,6 +45,9 @@ const {
   runLeadStatusSync,
 } = require('./lead_status_sync');
 const {
+  handleRb2bHubSpotWebhook,
+} = require('./rb2b_hubspot');
+const {
   createPostgresSlackStateStore,
 } = require('./slack_state_store');
 const {
@@ -6282,6 +6285,19 @@ function startHttpServer() {
         });
       } catch (err) {
         console.error('Instantly positive reply webhook failed:', err.message);
+        res.writeHead(500);
+        res.end('webhook_failed');
+      }
+      return;
+    }
+    if (req.method === 'POST' && req.url.split('?')[0] === '/webhooks/rb2b') {
+      try {
+        await handleRb2bHubSpotWebhook(req, res, {
+          hubspot: hubspotRequest,
+          logger: console,
+        });
+      } catch (err) {
+        console.error('RB2B HubSpot webhook failed:', err.message);
         res.writeHead(500);
         res.end('webhook_failed');
       }

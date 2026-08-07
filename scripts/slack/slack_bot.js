@@ -3830,13 +3830,24 @@ async function withRetry(fn, { label = 'Claude call', maxAttempts = 5 } = {}) {
     }
   }
 }
-const CLAUDE_DEFAULT_MODEL = process.env.CLAUDE_MODEL_DEFAULT
-  || process.env.CLAUDE_MODEL_SONNET
-  || 'claude-sonnet-4-6';
-const CLAUDE_HIGH_MODEL = process.env.CLAUDE_MODEL_HIGH
-  || process.env.CLAUDE_MODEL_OPUS
-  || 'claude-opus-4-1-20250805';
-const CLAUDE_DIGEST_MODEL = process.env.CLAUDE_DIGEST_MODEL || CLAUDE_DEFAULT_MODEL;
+function resolveClaudeModels(env = process.env) {
+  const defaultModel = env.CLAUDE_MODEL_DEFAULT
+    || env.CLAUDE_MODEL_SONNET
+    || 'claude-sonnet-4-6';
+  return {
+    defaultModel,
+    highModel: env.CLAUDE_MODEL_HIGH
+      || env.CLAUDE_MODEL_OPUS
+      || 'claude-opus-4-8',
+    digestModel: env.CLAUDE_DIGEST_MODEL || defaultModel,
+  };
+}
+
+const {
+  defaultModel: CLAUDE_DEFAULT_MODEL,
+  highModel: CLAUDE_HIGH_MODEL,
+  digestModel: CLAUDE_DIGEST_MODEL,
+} = resolveClaudeModels();
 
 const PRIORITY_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI/edit?gid=0#gid=0';
 const PRIORITY_SHEET_ID = '1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI';
@@ -6625,6 +6636,7 @@ module.exports = {
   startHttpServer,
   scheduleDailyProgress,
   resolveBotRoles,
+  resolveClaudeModels,
   resolveSlackEventTransport,
   summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,

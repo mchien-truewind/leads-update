@@ -44,7 +44,7 @@ Required Claude/Anthropic env:
 ```sh
 ANTHROPIC_API_KEY=...
 CLAUDE_MODEL_DEFAULT=claude-sonnet-4-6
-CLAUDE_MODEL_HIGH=claude-opus-4-1-20250805
+CLAUDE_MODEL_HIGH=claude-opus-4-8
 CLAUDE_DIGEST_MODEL=claude-sonnet-4-6
 ```
 

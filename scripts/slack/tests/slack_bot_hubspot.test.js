@@ -21,6 +21,7 @@ const {
   TRUEWIND_HUBSPOT,
   sanitizeToken,
   resolveBotRoles,
+  resolveClaudeModels,
   shouldCheckDuplicates,
   __setHubSpotRequestOverrideForTests,
   buildDealNoteBody,
@@ -106,6 +107,30 @@ function seedStructuredDealWorkflowProperties() {
   for (const property of ['dealname', 'pipeline', 'dealstage', 'hubspot_owner_id', 'deal_source', 'erp', 'amount', 'closedate']) {
     seedHubSpotProperty('deals', property);
   }
+}
+
+function testClaudeModelDefaultsAndOverrides() {
+  assert.deepStrictEqual(resolveClaudeModels({}), {
+    defaultModel: 'claude-sonnet-4-6',
+    highModel: 'claude-opus-4-8',
+    digestModel: 'claude-sonnet-4-6',
+  });
+  assert.deepStrictEqual(resolveClaudeModels({
+    CLAUDE_MODEL_SONNET: 'sonnet-override',
+    CLAUDE_MODEL_OPUS: 'opus-override',
+    CLAUDE_DIGEST_MODEL: 'digest-override',
+  }), {
+    defaultModel: 'sonnet-override',
+    highModel: 'opus-override',
+    digestModel: 'digest-override',
+  });
+  assert.strictEqual(
+    resolveClaudeModels({
+      CLAUDE_MODEL_HIGH: 'high-preferred',
+      CLAUDE_MODEL_OPUS: 'opus-legacy',
+    }).highModel,
+    'high-preferred',
+  );
 }
 
 async function testConvertedLeadStatusUsesInternalValue() {
@@ -2028,6 +2053,7 @@ async function testProspectWorkflowBlocksOpenDuplicateDeal() {
 }
 
 async function run() {
+  testClaudeModelDefaultsAndOverrides();
   await testConvertedLeadStatusUsesInternalValue();
   await testReadOnlyDealPropertiesAreRejectedBeforeWrite();
   await testLowLevelHubSpotWritesRequireAuthorization();

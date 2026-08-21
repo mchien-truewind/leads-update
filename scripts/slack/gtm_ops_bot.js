@@ -26,6 +26,11 @@ if (fs.existsSync(envPath)) {
 const cfg = require('./gtm_ops/config');
 const { runCycle } = require('./gtm_ops/reconciler');
 const { CONFIG } = require('./calendly_hubspot');
+const { createPostgresSlackStateStore } = require('./slack_state_store');
+
+const overrideStore = createPostgresSlackStateStore({
+  connectionString: process.env.DEAL_OWNER_OVERRIDE_DATABASE_URL || process.env.SLACK_STATE_DATABASE_URL,
+});
 
 const INTERVAL_MIN = (() => {
   const n = Number(process.env.INTERVAL_MIN);
@@ -38,6 +43,7 @@ let lastSuccessAt = Date.now(); // seed at boot so the staleness check has a bas
 let lastError = null;
 let cycles = 0;
 let everSucceeded = false; // distinguishes "never succeeded yet" from "was healthy, now wedged"
+let overrideStoreReady = false;
 
 function log(...a) { console.log(new Date().toISOString(), '[gtm-ops]', ...a); }
 
@@ -68,6 +74,7 @@ function startHealthServer() {
       cycles,
       last_success_at: new Date(lastSuccessAt).toISOString(),
       last_error: lastError,
+      deal_owner_override_db: overrideStoreReady ? 'ready' : 'not_configured',
     });
     res.writeHead(stale ? 503 : 200, { 'Content-Type': 'application/json' });
     res.end(body);
@@ -98,6 +105,14 @@ function startStalenessWatchdog() {
 async function main() {
   startHealthServer();
   assertConstantsInSync();
+  if (!overrideStore && !cfg.DRY_RUN) {
+    throw new Error('DEAL_OWNER_OVERRIDE_DATABASE_URL is required when GTM Ops runs live');
+  }
+  if (overrideStore) {
+    await overrideStore.initialize();
+    overrideStoreReady = true;
+    log('deal owner override database: ready');
+  }
   log(`worker start | DRY_RUN=${cfg.DRY_RUN} | every ${INTERVAL_MIN}min | pipeline=${cfg.ACTIVE_PIPELINE}`);
   log(`HubSpot: ${process.env.HUBSPOT_PRIVATE_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
   startStalenessWatchdog();
@@ -105,7 +120,7 @@ async function main() {
   // Sequential loop (never overlaps): run a cycle, then sleep INTERVAL_MIN.
   for (;;) {
     try {
-      await runCycle();
+      await runCycle(overrideStore);
       lastSuccessAt = Date.now();
       lastError = null;
       everSucceeded = true;

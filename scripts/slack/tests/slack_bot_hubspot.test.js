@@ -183,6 +183,48 @@ async function testLowLevelHubSpotWritesRequireAuthorization() {
   assert.match(noteResult, /not authorized to write to HubSpot/);
 }
 
+async function testDealOwnerUpdatePersistsDurableOverrideBeforeHubSpotWrite() {
+  seedHubSpotProperty('deals', 'hubspot_owner_id');
+  const calls = [];
+  __setSlackStateStoreForTests({
+    setDealOwnerOverride: async (override) => {
+      calls.push({ type: 'override', override });
+    },
+  });
+  __setHubSpotRequestOverrideForTests(async (endpoint, method = 'GET', body = null) => {
+    if (endpoint.startsWith('/crm/v3/owners/?limit=100')) {
+      return { results: [{ id: '123456789', firstName: 'Any', lastName: 'Active Owner' }] };
+    }
+    if (endpoint === '/crm/v3/objects/deals/63371614052' && method === 'PATCH') {
+      calls.push({ type: 'patch', body });
+      return { id: '63371614052', properties: body.properties };
+    }
+    throw new Error(`Unexpected HubSpot mock call: ${method} ${endpoint}`);
+  });
+
+  try {
+    const result = await executeTool('hubspot_update_deal', {
+      deal_id: '63371614052',
+      slack_user_id: 'U_SPOOFED',
+      properties: { hubspot_owner_id: '123456789' },
+    }, {
+      channel_id: 'C_TEST',
+      slack_user_id: 'U_TEST',
+    });
+    assert.strictEqual(JSON.parse(result).id, '63371614052');
+    assert.deepStrictEqual(calls.map((call) => call.type), ['override', 'patch']);
+    assert.deepStrictEqual(calls[0].override, {
+      dealId: '63371614052',
+      ownerId: '123456789',
+      requestedBySlackUserId: 'U_TEST',
+    });
+    assert.strictEqual(calls[1].body.properties.hubspot_owner_id, '123456789');
+  } finally {
+    __setSlackStateStoreForTests(null);
+    __setHubSpotRequestOverrideForTests(null);
+  }
+}
+
 async function testReadOnlyDefinitionDoesNotBlockWritableStandardFields() {
   seedHubSpotProperty('deals', 'dealname', {
     modificationMetadata: { readOnlyDefinition: true, readOnlyValue: false },
@@ -2057,6 +2099,7 @@ async function run() {
   await testConvertedLeadStatusUsesInternalValue();
   await testReadOnlyDealPropertiesAreRejectedBeforeWrite();
   await testLowLevelHubSpotWritesRequireAuthorization();
+  await testDealOwnerUpdatePersistsDurableOverrideBeforeHubSpotWrite();
   await testReadOnlyDefinitionDoesNotBlockWritableStandardFields();
   testStructuredDealRequestParser();
   testStructuredNotesCanBeMultiline();

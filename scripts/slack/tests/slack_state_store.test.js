@@ -115,3 +115,58 @@ test('completed retention uses separate prepared statements', async () => {
 test('missing connection string fails closed by returning no store', () => {
   assert.strictEqual(createPostgresSlackStateStore({ connectionString: '' }), null);
 });
+
+test('store initializes and upserts durable deal owner overrides', async () => {
+  const calls = [];
+  const pool = {
+    query: async (sql, params = []) => {
+      calls.push({ sql, params });
+      if (sql.includes('INSERT INTO deal_owner_overrides')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            deal_id: params[0],
+            owner_id: params[1],
+            requested_by_slack_user_id: params[2],
+          }],
+        };
+      }
+      return { rowCount: 0, rows: [] };
+    },
+  };
+  const store = new PostgresSlackStateStore({ pool });
+  await store.initialize();
+  assert.match(calls[0].sql, /CREATE TABLE IF NOT EXISTS deal_owner_overrides/);
+
+  const saved = await store.setDealOwnerOverride({
+    dealId: '63371614052',
+    ownerId: '84547076',
+    requestedBySlackUserId: 'U_TEST',
+  });
+  assert.strictEqual(saved.deal_id, '63371614052');
+  assert.match(calls[1].sql, /ON CONFLICT \(deal_id\) DO UPDATE/);
+  assert.deepStrictEqual(calls[1].params, ['63371614052', '84547076', 'U_TEST']);
+});
+
+test('store reads deal owner overrides as a deal-keyed map', async () => {
+  const pool = {
+    query: async () => ({
+      rows: [{
+        deal_id: '63371614052',
+        owner_id: '84547076',
+        requested_by_slack_user_id: 'U_TEST',
+        created_at: '2026-08-21T00:00:00.000Z',
+        updated_at: '2026-08-21T00:01:00.000Z',
+      }],
+    }),
+  };
+  const store = new PostgresSlackStateStore({ pool });
+  const overrides = await store.getDealOwnerOverrides(['63371614052', '63371614052']);
+  assert.deepStrictEqual(overrides.get('63371614052'), {
+    dealId: '63371614052',
+    ownerId: '84547076',
+    requestedBySlackUserId: 'U_TEST',
+    createdAt: '2026-08-21T00:00:00.000Z',
+    updatedAt: '2026-08-21T00:01:00.000Z',
+  });
+});

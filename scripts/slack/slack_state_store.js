@@ -73,6 +73,15 @@ class PostgresSlackStateStore {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      CREATE TABLE IF NOT EXISTS deal_owner_overrides (
+        deal_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        requested_by_slack_user_id TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK (BTRIM(deal_id) <> ''),
+        CHECK (BTRIM(owner_id) <> '')
+      );
       CREATE INDEX IF NOT EXISTS slack_interaction_jobs_recovery_idx
         ON slack_interaction_jobs (status, available_at, locked_at);
       ALTER TABLE slack_pending_deal_source_requests
@@ -285,6 +294,43 @@ class PostgresSlackStateStore {
       [safeLimit],
     );
     return result.rows;
+  }
+
+  async setDealOwnerOverride({ dealId, ownerId, requestedBySlackUserId = '' } = {}) {
+    const normalizedDealId = String(dealId || '').trim();
+    const normalizedOwnerId = String(ownerId || '').trim();
+    if (!normalizedDealId || !normalizedOwnerId) {
+      throw new Error('deal owner override requires non-empty dealId and ownerId');
+    }
+    const result = await this.pool.query(
+      `INSERT INTO deal_owner_overrides (deal_id, owner_id, requested_by_slack_user_id)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (deal_id) DO UPDATE
+       SET owner_id = EXCLUDED.owner_id,
+           requested_by_slack_user_id = EXCLUDED.requested_by_slack_user_id,
+           updated_at = NOW()
+       RETURNING deal_id, owner_id, requested_by_slack_user_id, created_at, updated_at`,
+      [normalizedDealId, normalizedOwnerId, String(requestedBySlackUserId || '').trim()],
+    );
+    return result.rows[0] || null;
+  }
+
+  async getDealOwnerOverrides(dealIds = []) {
+    const normalizedIds = [...new Set((dealIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+    if (!normalizedIds.length) return new Map();
+    const result = await this.pool.query(
+      `SELECT deal_id, owner_id, requested_by_slack_user_id, created_at, updated_at
+       FROM deal_owner_overrides
+       WHERE deal_id = ANY($1::text[])`,
+      [normalizedIds],
+    );
+    return new Map((result.rows || []).map((row) => [String(row.deal_id), {
+      dealId: String(row.deal_id),
+      ownerId: String(row.owner_id),
+      requestedBySlackUserId: String(row.requested_by_slack_user_id || ''),
+      createdAt: row.created_at || null,
+      updatedAt: row.updated_at || null,
+    }]));
   }
 
   async close() {

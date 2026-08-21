@@ -251,7 +251,7 @@ const editedMentionEventsSeen = new Map();
 const slackHttpEventSeen = new Map();
 const slackHttpInteractionSeen = new Map();
 let slackStateStore = createPostgresSlackStateStore({
-  connectionString: process.env.SLACK_STATE_DATABASE_URL,
+  connectionString: process.env.DEAL_OWNER_OVERRIDE_DATABASE_URL || process.env.SLACK_STATE_DATABASE_URL,
 });
 let slackBotUserIdPromise = null;
 
@@ -1238,6 +1238,13 @@ async function getHubSpotOwnersCached() {
     console.error(`Could not fetch HubSpot owners for dynamic auth: ${err.message}`);
     return hubspotOwnersCache.owners; // stale-but-better-than-nothing, else []
   }
+}
+
+async function getActiveHubSpotOwnerById(ownerId) {
+  const normalizedOwnerId = String(ownerId || '').trim();
+  if (!normalizedOwnerId) return null;
+  const owners = await getHubSpotOwnersCached();
+  return owners.find((owner) => String(owner.id || '').trim() === normalizedOwnerId) || null;
 }
 
 const slackOwnerMatchCache = new Map();
@@ -3686,6 +3693,32 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
     if (name === 'hubspot_update_deal') {
       const dealId = encodeURIComponent(input.deal_id);
       const validatedProps = await validateHubSpotProperties('deals', input.properties || {});
+      const changesOwner = Object.prototype.hasOwnProperty.call(validatedProps, 'hubspot_owner_id');
+      if (changesOwner) {
+        const requestedOwnerId = String(validatedProps.hubspot_owner_id || '').trim();
+        if (!requestedOwnerId) {
+          return 'Error: deal owner changes require a valid active HubSpot owner ID';
+        }
+        const activeOwner = await getActiveHubSpotOwnerById(requestedOwnerId);
+        if (!activeOwner) {
+          return `Error: HubSpot owner ${requestedOwnerId} is not active or could not be verified`;
+        }
+        if (!slackStateStore || typeof slackStateStore.setDealOwnerOverride !== 'function') {
+          return 'Error: durable deal owner override database is not configured';
+        }
+        const metadata = getSlackMetadata(toolInput);
+        await slackStateStore.setDealOwnerOverride({
+          dealId: String(input.deal_id),
+          ownerId: requestedOwnerId,
+          requestedBySlackUserId: metadata.slack_user_id,
+        });
+        console.log(JSON.stringify({
+          event: 'deal_owner_override_persisted',
+          deal_id: String(input.deal_id),
+          owner_id: requestedOwnerId,
+          requested_by_slack_user_id: metadata.slack_user_id,
+        }));
+      }
       const res = await hubspotRequest(`/crm/v3/objects/deals/${dealId}`, 'PATCH', { properties: validatedProps });
       return JSON.stringify(formatHubSpotObjectResponse(res, 'deals'));
     }

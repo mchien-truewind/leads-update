@@ -7,7 +7,7 @@ const assert = require('node:assert');
 process.env.HUBSPOT_PRIVATE_TOKEN = process.env.HUBSPOT_PRIVATE_TOKEN || 'test-token';
 
 const cfg = require('../gtm_ops/config');
-const { pickAE, latestMeetingHost, latestMeetingHostDetails, isBookedDemoContact, bookedContactOwnerUpdates } = require('../gtm_ops/reconciler');
+const { pickAE, latestMeetingHost, latestMeetingHostDetails, isBookedDemoContact, bookedContactOwnerUpdates, reconcileDealOwners } = require('../gtm_ops/reconciler');
 const { CONFIG } = require('../calendly_hubspot');
 
 test('DRY_RUN defaults to true (read-only unless explicitly disabled)', () => {
@@ -36,6 +36,145 @@ test('latestMeetingHost picks the host of the most recent meeting', () => {
   ]);
   assert.strictEqual(latestMeetingHost(['m1', 'm2', 'm3'], props), '222');
   assert.deepStrictEqual(latestMeetingHostDetails(['m1', 'm2', 'm3'], props), { meetingId: 'm2', host: '222' });
+});
+
+test('latestMeetingHost parses real HubSpot ISO timestamps', () => {
+  const props = new Map([
+    ['older', { hubspot_owner_id: '111', hs_meeting_start_time: '2026-08-13T18:00:00.000Z' }],
+    ['newer', { hubspot_owner_id: '222', hs_meeting_start_time: '2026-08-13T22:00:00.000Z' }],
+  ]);
+  assert.deepStrictEqual(latestMeetingHostDetails(['older', 'newer'], props), { meetingId: 'newer', host: '222' });
+});
+
+test('manual deal owner override wins over the latest meeting host', async () => {
+  const overrideReads = [];
+  const writes = [];
+  const overrideStore = {
+    getDealOwnerOverrides: async (dealIds) => {
+      overrideReads.push(dealIds);
+      return new Map([['deal-1', { dealId: 'deal-1', ownerId: 'owner-sarah' }]]);
+    },
+  };
+  const api = {
+    searchAll: async () => [{ id: 'meeting-1' }],
+    associations: async (fromType, ids, toType) => {
+      if (fromType === 'meetings' && toType === 'deals') return new Map([['meeting-1', ['deal-1']]]);
+      if (fromType === 'deals' && toType === 'meetings') return new Map([['deal-1', ['meeting-1']]]);
+      if (fromType === 'meetings' && toType === 'contacts') return new Map([['meeting-1', []]]);
+      throw new Error(`Unexpected association ${fromType}->${toType}`);
+    },
+    batchRead: async (objectType) => {
+      if (objectType === 'deals') return new Map([['deal-1', {
+        dealname: 'WECU',
+        hubspot_owner_id: 'owner-alex',
+        pipeline: cfg.ACTIVE_PIPELINE,
+      }]]);
+      if (objectType === 'meetings') return new Map([['meeting-1', {
+        hubspot_owner_id: 'owner-alex',
+        hs_meeting_start_time: '2026-08-13T22:00:00.000Z',
+      }]]);
+      if (objectType === 'contacts') return new Map();
+      throw new Error(`Unexpected batch read ${objectType}`);
+    },
+    hub: async (method, path, body) => {
+      if (method === 'GET') return { properties: { hubspot_owner_id: 'owner-alex' } };
+      if (method === 'PATCH') { writes.push({ path, body }); return { id: 'deal-1' }; }
+      throw new Error(`Unexpected HubSpot call ${method} ${path}`);
+    },
+    sleep: async () => {},
+  };
+  const owners = new Map([
+    ['owner-alex', { name: 'Alex Lee' }],
+    ['owner-sarah', { name: 'Sarah Elix' }],
+  ]);
+
+  const result = await reconcileDealOwners(owners, { overrideStore, api, dryRun: false });
+  assert.deepStrictEqual(overrideReads, [['deal-1'], ['deal-1']]);
+  assert.strictEqual(result.fixed, 1, 'Sarah override must be the desired deal owner even though Alex hosted the meeting');
+  assert.deepStrictEqual(writes, [{
+    path: '/crm/v3/objects/deals/deal-1',
+    body: { properties: { hubspot_owner_id: 'owner-sarah' } },
+  }]);
+});
+
+test('concurrent HubSpot owner change prevents stale reconciler PATCH', async () => {
+  const writes = [];
+  const overrideStore = {
+    getDealOwnerOverrides: async () => new Map([['deal-1', { dealId: 'deal-1', ownerId: 'owner-sarah' }]]),
+  };
+  const api = {
+    searchAll: async () => [{ id: 'meeting-1' }],
+    associations: async (fromType, ids, toType) => {
+      if (fromType === 'meetings' && toType === 'deals') return new Map([['meeting-1', ['deal-1']]]);
+      if (fromType === 'deals' && toType === 'meetings') return new Map([['deal-1', ['meeting-1']]]);
+      if (fromType === 'meetings' && toType === 'contacts') return new Map([['meeting-1', []]]);
+      throw new Error(`Unexpected association ${fromType}->${toType}`);
+    },
+    batchRead: async (objectType) => {
+      if (objectType === 'deals') return new Map([['deal-1', { dealname: 'WECU', hubspot_owner_id: 'owner-alex', pipeline: cfg.ACTIVE_PIPELINE }]]);
+      if (objectType === 'meetings') return new Map([['meeting-1', { hubspot_owner_id: 'owner-alex', hs_meeting_start_time: '2026-08-13T22:00:00.000Z' }]]);
+      if (objectType === 'contacts') return new Map();
+      throw new Error(`Unexpected batch read ${objectType}`);
+    },
+    hub: async (method, path, body) => {
+      if (method === 'GET') return { properties: { hubspot_owner_id: 'owner-xavier' } };
+      if (method === 'PATCH') writes.push({ path, body });
+      return {};
+    },
+    sleep: async () => {},
+  };
+  const owners = new Map([
+    ['owner-alex', { name: 'Alex Lee' }],
+    ['owner-sarah', { name: 'Sarah Elix' }],
+    ['owner-xavier', { name: 'Xavier Marco' }],
+  ]);
+
+  const result = await reconcileDealOwners(owners, { overrideStore, api, dryRun: false });
+  assert.strictEqual(result.fixed, 0);
+  assert.deepStrictEqual(writes, []);
+});
+
+test('concurrent DB override prevents stale meeting-host PATCH', async () => {
+  let overrideReadCount = 0;
+  const writes = [];
+  const overrideStore = {
+    getDealOwnerOverrides: async () => {
+      overrideReadCount++;
+      return overrideReadCount === 1
+        ? new Map()
+        : new Map([['deal-1', { dealId: 'deal-1', ownerId: 'owner-sarah' }]]);
+    },
+  };
+  const api = {
+    searchAll: async () => [{ id: 'meeting-1' }],
+    associations: async (fromType, ids, toType) => {
+      if (fromType === 'meetings' && toType === 'deals') return new Map([['meeting-1', ['deal-1']]]);
+      if (fromType === 'deals' && toType === 'meetings') return new Map([['deal-1', ['meeting-1']]]);
+      if (fromType === 'meetings' && toType === 'contacts') return new Map([['meeting-1', []]]);
+      throw new Error(`Unexpected association ${fromType}->${toType}`);
+    },
+    batchRead: async (objectType) => {
+      if (objectType === 'deals') return new Map([['deal-1', { dealname: 'WECU', hubspot_owner_id: 'owner-sarah', pipeline: cfg.ACTIVE_PIPELINE }]]);
+      if (objectType === 'meetings') return new Map([['meeting-1', { hubspot_owner_id: 'owner-alex', hs_meeting_start_time: '2026-08-13T22:00:00.000Z' }]]);
+      if (objectType === 'contacts') return new Map();
+      throw new Error(`Unexpected batch read ${objectType}`);
+    },
+    hub: async (method, path, body) => {
+      if (method === 'GET') return { properties: { hubspot_owner_id: 'owner-sarah' } };
+      if (method === 'PATCH') writes.push({ path, body });
+      return {};
+    },
+    sleep: async () => {},
+  };
+  const owners = new Map([
+    ['owner-alex', { name: 'Alex Lee' }],
+    ['owner-sarah', { name: 'Sarah Elix' }],
+  ]);
+
+  const result = await reconcileDealOwners(owners, { overrideStore, api, dryRun: false });
+  assert.strictEqual(overrideReadCount, 2);
+  assert.strictEqual(result.fixed, 0);
+  assert.deepStrictEqual(writes, []);
 });
 
 test('latestMeetingHost returns null when the latest meeting has no owner', () => {

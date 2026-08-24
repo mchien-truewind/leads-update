@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import email
 import json
 import os
 import sys
@@ -235,6 +237,138 @@ def build_config(**overrides) -> cli.Config:
     }
     values.update(overrides)
     return cli.Config(**values)
+
+
+class RejectionDraftIssueNotificationTests(unittest.TestCase):
+    def _notify(self, config: cli.Config, **overrides) -> bool:
+        values = {
+            "draft_id": "r-legacy-1",
+            "issue_key": "name_verification_failed",
+            "heading": "Rejection draft name verification failed. Auto-send skipped.",
+            "candidate_name": "Abdul Shaik",
+            "candidate_email": "candidate@example.com",
+            "details": ["*Draft greeting:* `Shaik`"],
+            "notion_url": "https://notion.example/row",
+        }
+        values.update(overrides)
+        return cli.notify_rejection_draft_issue(config, **values)
+
+    def test_slack_history_suppresses_legacy_issue_after_local_state_reset(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = build_config(slack_state_file=Path(tmpdir) / "state.json")
+            client = mock.Mock()
+            client.resolve_channel_id.return_value = "C123"
+            client.list_channel_messages.return_value = [{
+                "text": "Rejection draft issue for candidate@example.com",
+                "blocks": [{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "Rejection draft name verification failed. Auto-send skipped.\n"
+                            "*Draft ID:* `r-legacy-1`"
+                        ),
+                    },
+                }],
+            }]
+
+            with (
+                mock.patch.object(cli, "slack_history_client", return_value=client),
+                mock.patch.object(cli, "slack_post_client", return_value=client),
+            ):
+                self.assertFalse(self._notify(config))
+
+            client.post_message.assert_not_called()
+            self.assertIn(
+                "name_verification_failed:r-legacy-1",
+                cli.load_rejection_name_failure_notified_drafts(config.slack_state_file),
+            )
+            with mock.patch.object(
+                cli,
+                "slack_post_client",
+                side_effect=AssertionError("history should not be reread after local rehydration"),
+            ):
+                self.assertFalse(self._notify(config))
+
+    def test_marker_suppresses_exact_issue_but_not_different_issue_type(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = build_config(slack_state_file=Path(tmpdir) / "state.json")
+            client = mock.Mock()
+            client.resolve_channel_id.return_value = "C123"
+            marker = cli.rejection_draft_issue_marker(
+                "name_verification_failed", "r-legacy-1", "candidate@example.com"
+            )
+            client.list_channel_messages.return_value = [{
+                "text": "older alert",
+                "blocks": [{"type": "section", "block_id": marker}],
+            }]
+
+            with (
+                mock.patch.object(cli, "slack_history_client", return_value=client),
+                mock.patch.object(cli, "slack_post_client", return_value=client),
+            ):
+                self.assertFalse(self._notify(config))
+                self.assertTrue(self._notify(
+                    config,
+                    issue_key="draft_missing",
+                    heading="Rejection draft is missing. Auto-send skipped.",
+                ))
+
+            client.post_message.assert_called_once()
+            posted_blocks = client.post_message.call_args.args[2]
+            self.assertNotEqual(posted_blocks[0]["block_id"], marker)
+
+    def test_unrelated_history_does_not_suppress_new_issue(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = build_config(slack_state_file=Path(tmpdir) / "state.json")
+            client = mock.Mock()
+            client.resolve_channel_id.return_value = "C123"
+            client.list_channel_messages.return_value = [{
+                "text": "Rejection draft issue for someone else",
+                "blocks": [{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            "Rejection draft name verification failed. Auto-send skipped.\n"
+                            "*Draft ID:* `r-other`"
+                        ),
+                    },
+                }],
+            }]
+
+            with (
+                mock.patch.object(cli, "slack_history_client", return_value=client),
+                mock.patch.object(cli, "slack_post_client", return_value=client),
+            ):
+                self.assertTrue(self._notify(config))
+
+            client.post_message.assert_called_once()
+
+    def test_history_uses_read_token_and_post_uses_post_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = build_config(
+                slack_token="xoxp-read",
+                slack_post_token="xoxb-post",
+                slack_state_file=Path(tmpdir) / "state.json",
+            )
+            history_client = mock.Mock()
+            history_client.resolve_channel_id.return_value = "C123"
+            history_client.list_channel_messages.return_value = []
+            post_client = mock.Mock()
+
+            with (
+                mock.patch.object(cli, "slack_history_client", return_value=history_client),
+                mock.patch.object(cli, "slack_post_client", return_value=post_client),
+            ):
+                self.assertTrue(self._notify(config))
+
+            history_client.resolve_channel_id.assert_called_once_with(config.slack_review_channel)
+            history_client.list_channel_messages.assert_called_once()
+            history_client.post_message.assert_not_called()
+            post_client.resolve_channel_id.assert_not_called()
+            post_client.list_channel_messages.assert_not_called()
+            post_client.post_message.assert_called_once()
 
 
 def slack_candidate(thread_id: str) -> dict[str, str]:
@@ -890,6 +1024,48 @@ class ActiveAtsDigestTests(unittest.TestCase):
 
 
 class NameAndExtractorWaterfallTests(unittest.TestCase):
+    def test_trusted_candidate_first_name_rejects_unknown_or_non_name(self):
+        self.assertEqual(cli.trusted_candidate_first_name("Abdul Shaik"), "Abdul")
+        self.assertEqual(cli.trusted_candidate_first_name("Unknown"), "")
+        self.assertEqual(cli.trusted_candidate_first_name("Senior Software Engineer"), "")
+
+    def test_create_reply_draft_prefers_trusted_ats_first_name(self):
+        gmail = mock.Mock()
+        gmail.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+            "messages": [{
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Application"},
+                        {"name": "Message-ID", "value": "<message-1@example.com>"},
+                        {"name": "References", "value": ""},
+                    ]
+                }
+            }]
+        }
+        gmail.users.return_value.drafts.return_value.create.return_value.execute.return_value = {
+            "id": "r-new"
+        }
+
+        with mock.patch.object(
+            cli,
+            "resolve_recipient_first_name",
+            side_effect=AssertionError("Gmail display name should not be consulted"),
+        ):
+            draft_id = cli.create_reply_draft(
+                gmail,
+                sender_email="hiring@example.com",
+                to_email="candidate@example.com",
+                thread_id="thread-1",
+                body_text="Thanks for your interest.",
+                recipient_name="Abdul Shaik",
+            )
+
+        self.assertEqual(draft_id, "r-new")
+        create_body = gmail.users.return_value.drafts.return_value.create.call_args.kwargs["body"]
+        raw_message = base64.urlsafe_b64decode(create_body["message"]["raw"])
+        parsed = email.message_from_bytes(raw_message)
+        self.assertIn("Hi Abdul,", parsed.get_payload(decode=True).decode(parsed.get_content_charset()))
+
     def test_looks_like_person_name_accepts_real_names(self):
         self.assertTrue(cli.looks_like_person_name("Dikshith Reddy M"))
         self.assertTrue(cli.looks_like_person_name("Jordan Lee"))

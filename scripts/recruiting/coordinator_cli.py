@@ -2469,6 +2469,13 @@ def apply_email_greeting(body_text: str, first_name: str) -> str:
     return f"Hi {first_name},\n\n{text}"
 
 
+def trusted_candidate_first_name(candidate_name: str) -> str:
+    cleaned = clean_candidate_name(candidate_name)
+    if not cleaned or cleaned.lower() == "unknown" or not looks_like_person_name(cleaned):
+        return ""
+    return extract_first_name(cleaned, "")
+
+
 def create_reply_draft(
     gmail_service,
     *,
@@ -2477,11 +2484,14 @@ def create_reply_draft(
     thread_id: str,
     body_text: str,
     subject_override: str | None = None,
+    recipient_name: str = "",
 ) -> str:
     subject, replied_message_id, references = extract_last_thread_message_headers(gmail_service, thread_id)
     reply_subject = subject_override or (subject if subject.lower().startswith("re:") else f"Re: {subject}")
     merged_references = references if replied_message_id in references else f"{references} {replied_message_id}".strip()
-    first_name = resolve_recipient_first_name(gmail_service, thread_id, to_email)
+    first_name = trusted_candidate_first_name(recipient_name) or resolve_recipient_first_name(
+        gmail_service, thread_id, to_email
+    )
     body_with_greeting = apply_email_greeting(body_text, first_name)
 
     message = EmailMessage()
@@ -2818,7 +2828,7 @@ def build_rejection_first_name_evidence(
     linkedin_slug_first_name = first_name_from_linkedin_url(linkedin_url)
     if linkedin_slug_first_name:
         evidence["linkedin_slug"].append(linkedin_slug_first_name)
-    ats_first_name = extract_first_name(candidate_name, candidate_email)
+    ats_first_name = trusted_candidate_first_name(candidate_name)
     if ats_first_name:
         evidence["ats"].append(ats_first_name)
     return {source: list(dict.fromkeys(values)) for source, values in evidence.items()}
@@ -3027,6 +3037,50 @@ def derive_consensus_first_name(
     return next(iter(preferred.values()))
 
 
+def rejection_draft_issue_marker(issue_key: str, draft_id: str, candidate_email: str) -> str:
+    identity = f"{clean_text(issue_key).lower()}:{draft_id.strip() or normalize_email(candidate_email)}"
+    return f"recruiting_draft_issue_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
+
+
+def slack_message_text(message: dict[str, Any]) -> str:
+    parts = [str(message.get("text", "") or "")]
+    for block in message.get("blocks", []) or []:
+        if not isinstance(block, dict):
+            continue
+        text_payload = block.get("text") or {}
+        if isinstance(text_payload, dict):
+            parts.append(str(text_payload.get("text", "") or ""))
+    return "\n".join(part for part in parts if part)
+
+
+def rejection_draft_issue_already_posted(
+    client: SlackClient,
+    channel_id: str,
+    *,
+    marker: str,
+    draft_id: str,
+    heading: str,
+    candidate_email: str,
+) -> bool:
+    # Slack is the durable notification journal. Rehydrate local dedupe state after
+    # Railway replaces the container and its outputs/ directory.
+    oldest_ts = (datetime.now(timezone.utc) - timedelta(days=365)).timestamp()
+    messages = client.list_channel_messages(channel_id, oldest_ts)
+    legacy_identity = draft_id.strip() or normalize_email(candidate_email)
+    for message in messages:
+        blocks = message.get("blocks", []) or []
+        if any(isinstance(block, dict) and block.get("block_id") == marker for block in blocks):
+            return True
+        message_text = slack_message_text(message)
+        if draft_id.strip():
+            legacy_match = f"*Draft ID:* `{draft_id.strip()}`" in message_text
+        else:
+            legacy_match = normalize_email(candidate_email) in message_text
+        if legacy_identity and legacy_match and heading in message_text:
+            return True
+    return False
+
+
 def call_rejection_name_verifier_consensus(
     config: Config,
     *,
@@ -3103,10 +3157,26 @@ def notify_rejection_draft_issue(
     if notification_key in already_notified or (issue_key == "name_verification_failed" and draft_id in already_notified):
         return False
     try:
-        client = slack_post_client(config)
-        channel_id = client.resolve_channel_id(config.slack_review_channel)
+        post_client = slack_post_client(config)
+        history_client = slack_history_client(config)
+        channel_id = history_client.resolve_channel_id(config.slack_review_channel)
     except Exception:
         return False
+
+    marker = rejection_draft_issue_marker(issue_key, draft_id, candidate_email)
+    try:
+        if rejection_draft_issue_already_posted(
+            history_client,
+            channel_id,
+            marker=marker,
+            draft_id=draft_id,
+            heading=heading,
+            candidate_email=candidate_email,
+        ):
+            save_rejection_name_failure_notified_draft(config.slack_state_file, notification_key)
+            return False
+    except Exception as exc:
+        print(f"Slack rejection-draft issue history lookup failed: {exc.__class__.__name__}")
 
     mention_prefix = f"<@{config.slack_mention_user_id}> " if config.slack_mention_user_id else ""
     lines = [
@@ -3120,10 +3190,10 @@ def notify_rejection_draft_issue(
         lines.append(f"*ATS:* <{notion_url}|Open Notion row>")
     text = "\n".join(lines)
     try:
-        client.post_message(
+        post_client.post_message(
             channel_id,
             f"Rejection draft issue for {candidate_email}: {heading}",
-            [{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
+            [{"type": "section", "block_id": marker, "text": {"type": "mrkdwn", "text": text}}],
         )
     except Exception:
         return False
@@ -4072,6 +4142,10 @@ def slack_post_enabled(config: Config) -> bool:
 
 def slack_post_client(config: Config) -> SlackClient:
     return SlackClient(config.slack_post_token or config.slack_token)
+
+
+def slack_history_client(config: Config) -> SlackClient:
+    return SlackClient(config.slack_token or config.slack_post_token)
 
 
 def load_slack_state(path: Path) -> dict[str, Any]:
@@ -6942,6 +7016,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     to_email=candidate_email,
                     thread_id=reply_thread_id,
                     body_text=config.reject_template,
+                    recipient_name=candidate_name,
                 )
                 reject_drafts += 1
                 if prop.reject_draft_id in properties_schema:

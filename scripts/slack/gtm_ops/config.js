@@ -12,7 +12,7 @@ const MQL_STAGE = process.env.MQL_STAGE_ID || "1307720553";
 const DEMO_FORM_TOKEN = process.env.DEMO_FORM_TOKEN || "Book Demo Form";
 
 // Round-robin AE roster for ownerless non-booker leads (symptom #1).
-// Confirmed by Mercedes 2026-06-17. Owner IDs in HubSpot.
+// Roster narrowed to Sarah, Xavier, and Andrew per the September 2026 routing decision.
 // NOTE: this is intentionally NOT the same set as the Calendly host->owner map in
 // calendly_hubspot.js. That map = who *hosts* a booked demo (owns the booked deal).
 // This roster = which AEs get *new ownerless* leads round-robined. The two legitimately differ.
@@ -22,8 +22,6 @@ const AE_ROSTER = (process.env.AE_ROSTER_JSON
       { id: "84547076", name: "Sarah Elix" },
       { id: "89305622", name: "Xavier Marco" },
       { id: "93961770", name: "Andrew Moyer" },
-      { id: "93961773", name: "Ari Nachman" },
-      { id: "559564379", name: "Alex Lee" },
     ]);
 
 // Don't round-robin internal/test submissions (own domain).

@@ -7,7 +7,7 @@ const assert = require('node:assert');
 process.env.HUBSPOT_PRIVATE_TOKEN = process.env.HUBSPOT_PRIVATE_TOKEN || 'test-token';
 
 const cfg = require('../gtm_ops/config');
-const { pickAE, latestMeetingHost, latestMeetingHostDetails, isBookedDemoContact, bookedContactOwnerUpdates, reconcileDealOwners } = require('../gtm_ops/reconciler');
+const { pickAE, latestMeetingHost, latestMeetingHostDetails, isBookedDemoContact, bookedContactOwnerUpdates, reconcileDealOwners, reassignRemovedRoundRobinOwners } = require('../gtm_ops/reconciler');
 const { CONFIG } = require('../calendly_hubspot');
 
 test('DRY_RUN defaults to true (read-only unless explicitly disabled)', () => {
@@ -227,6 +227,43 @@ test('ownerless deal still gets the meeting host', async () => {
     path: '/crm/v3/objects/deals/deal-1',
     body: { properties: { hubspot_owner_id: 'owner-renato' } },
   }]);
+});
+
+test('removed round-robin owners on open deals and demo contacts move to the current roster', async () => {
+  const writes = [];
+  const rosterIds = new Set(cfg.AE_ROSTER.map((ae) => ae.id));
+  const api = {
+    searchAll: async (objectType) => {
+      if (objectType === 'deals') return [
+        { id: 'deal-alex', properties: { dealname: 'Alex deal', hubspot_owner_id: '559564379', dealstage: '1307720553' } },
+        { id: 'deal-closed', properties: { dealname: 'Closed', hubspot_owner_id: '93961773', dealstage: '190380587' } },
+      ];
+      if (objectType === 'contacts') return [
+        { id: 'contact-ari', properties: { email: 'buyer@example.com', hubspot_owner_id: '93961773' } },
+        { id: 'contact-internal', properties: { email: 'alex@trytruewind.com', hubspot_owner_id: '559564379' } },
+      ];
+      throw new Error(`Unexpected search ${objectType}`);
+    },
+    hub: async (method, path, body) => {
+      if (method === 'GET' && path.includes('/deals/')) return { properties: { hubspot_owner_id: '559564379', dealstage: '1307720553' } };
+      if (method === 'GET' && path.includes('/contacts/')) return { properties: { hubspot_owner_id: '93961773' } };
+      if (method === 'PATCH') writes.push({ path, body });
+      return {};
+    },
+    sleep: async () => {},
+  };
+  const owners = new Map(cfg.AE_ROSTER.map((ae) => [ae.id, { name: ae.name }]));
+  owners.set('559564379', { name: 'Alex Lee' });
+  owners.set('93961773', { name: 'Ari Nachman' });
+
+  const result = await reassignRemovedRoundRobinOwners(owners, { api, dryRun: false });
+  assert.strictEqual(result.reassigned, 2);
+  assert.strictEqual(writes.length, 2);
+  for (const write of writes) {
+    const ownerId = write.body.properties.hubspot_owner_id;
+    assert.ok(rosterIds.has(ownerId), ownerId);
+    assert.ok(!cfg.REMOVED_ROUND_ROBIN_OWNER_IDS.includes(ownerId));
+  }
 });
 
 test('latestMeetingHost returns null when the latest meeting has no owner', () => {

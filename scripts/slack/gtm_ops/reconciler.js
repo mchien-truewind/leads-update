@@ -1,5 +1,6 @@
 // Inbound deal-flow reconciler (backstop to the leads-update Calendly webhook).
-//   Symptom #2: for Active Pipeline deals with a booked meeting, set deal owner = meeting host.
+//   Symptom #2: for ownerless Active Pipeline deals with a booked meeting, set deal owner = meeting host.
+//   An existing deal/contact owner is never replaced, except by an explicit Slack deal-owner override.
 //   Symptom #1: round-robin ownerless, non-booker demo-form contacts to the AE roster.
 // Idempotent + guarded: re-reads each record immediately before writing; only writes when needed.
 // DRY_RUN (default true) logs intended changes without writing.
@@ -57,9 +58,8 @@ function bookedContactOwnerUpdates(dealIds, dealToHost, dealToContacts, contactP
       seen.add(key);
       const props = contactProps.get(String(contactId)) || {};
       if (!isBookedDemoContact(props)) continue;
-      const ownerId = props.hubspot_owner_id ? String(props.hubspot_owner_id) : null;
-      if (ownerId === host) continue;
-      updates.push({ contactId: String(contactId), from: ownerId, to: host, email: props.email || "", dealId: String(dealId) });
+      if (props.hubspot_owner_id) continue;
+      updates.push({ contactId: String(contactId), from: null, to: host, email: props.email || "", dealId: String(dealId) });
     }
   }
   return updates;
@@ -109,6 +109,7 @@ async function reconcileDealOwners(owners, { overrideStore = null, api = null, d
     }
 
     const override = ownerOverrides.get(String(dealId));
+    if (!override && ownerId) continue;
     const desiredOwnerId = override?.ownerId || host;
     if (!owners.has(desiredOwnerId)) {
       const source = override ? "manual override" : "meeting host";
@@ -153,11 +154,11 @@ async function reconcileDealOwners(owners, { overrideStore = null, api = null, d
   let contactFixed = 0;
   for (const update of contactUpdates) {
     if (!owners.has(update.to)) { log(`symptom#2: skip contact ${update.contactId} (${update.email}) host ${update.to} inactive/unknown`); continue; }
-    log(`symptom#2: contact ${update.contactId} (${update.email}) owner ${update.from ? owners.get(update.from)?.name || update.from : "(none)"} -> ${owners.get(update.to).name}`);
+    log(`symptom#2: contact ${update.contactId} (${update.email}) owner (none) -> ${owners.get(update.to).name}`);
     if (!dryRun) {
       const cur = await crm.hub("GET", `/crm/v3/objects/contacts/${update.contactId}?properties=hubspot_owner_id,recent_conversion_event_name,calendly_meeting_booked`);
       if (!isBookedDemoContact(cur.properties || {})) continue;
-      if (String(cur.properties.hubspot_owner_id || "") === update.to) continue;
+      if (cur.properties.hubspot_owner_id) continue;
       await crm.hub("PATCH", `/crm/v3/objects/contacts/${update.contactId}`, { properties: { hubspot_owner_id: update.to } });
       await crm.sleep(150);
     }

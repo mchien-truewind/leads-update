@@ -631,7 +631,7 @@ async function findContactByEmail(email) {
   const result = await searchObjects(
     'contacts',
     [{ propertyName: 'email', operator: 'EQ', value: clean(email) }],
-    ['email', 'firstname', 'lastname'],
+    ['email', 'firstname', 'lastname', 'hubspot_owner_id'],
     1,
   );
   return (result.results || [])[0] || null;
@@ -682,6 +682,10 @@ async function ensureCompany({ payload }) {
   if (byName) return byName;
 
   return createCompany(identity);
+}
+
+function hasOwner(record) {
+  return Boolean(clean(record?.properties?.hubspot_owner_id));
 }
 
 function buildCalendlyContactProperties({ name, email, markMeetingBooked = false, ownerId = '' }) {
@@ -857,7 +861,8 @@ async function ensureContact({ payload, ownerId = '' }) {
   if (!email) throw new Error('Calendly invitee payload missing email');
   const existing = await findContactByEmail(email);
   if (existing) {
-    await markContactCalendlyMeetingBooked(existing.id, ownerId);
+    const keepExistingOwner = hasOwner(existing);
+    await markContactCalendlyMeetingBooked(existing.id, keepExistingOwner ? '' : ownerId);
     return existing;
   }
   return createContact({ name: payload.name, email, markMeetingBooked: true, ownerId });
@@ -888,8 +893,8 @@ async function handleInviteeCreated(payload, scheduledEvent, filter, options = {
       calendly_event_uuid: lastUriPart(eventUri),
       calendly_event_type_uri: filter.eventTypeUri,
       calendly_host_user_uri: filter.hostUserUri,
-      hubspot_owner_id: filter.ownerId,
     };
+    if (!hasOwner(deal) && clean(filter.ownerId)) properties.hubspot_owner_id = filter.ownerId;
     if (foundByOldInvitee) properties.dealstage = CONFIG.newDealStageId;
     await hubspotRequest(`/crm/v3/objects/deals/${deal.id}`, {
       method: 'PATCH',
@@ -1113,6 +1118,7 @@ module.exports = {
   getEventTypeUri,
   getOrganizerName,
   handleCalendlyHubSpotWebhook,
+  hasOwner,
   hubspotDateMs,
   inferCompanyNameFromDomain,
   idempotencyRoot,

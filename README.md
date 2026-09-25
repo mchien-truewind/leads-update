@@ -90,6 +90,46 @@ HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS=C12345678
 
 The workflow first tries to match the Slack tagger's Slack email to a HubSpot owner. That requires Slack `users:read.email` scope; if unavailable, it checks the optional Slack user mapping. HubSpot writes are authorized when the tagger maps to a HubSpot owner or the Slack user/channel is allowlisted. If no owner can be mapped for an authorized request, it defaults to Xavier Marco (`89305622`). Firecrawl is used to find and scrape LinkedIn profiles before contact creation; without `FIRECRAWL_API_KEY`, the workflow falls back to email/company parsing.
 
+## RB2B website visit notes
+
+The worker exposes `POST /webhooks/rb2b` for RB2B's generic webhook integration. Each accepted person-level visit creates one HubSpot contact note dated in Pacific time, for example `07/27/2026 visited main website`. A stable HubSpot `hs_unique_id` makes delivery retries idempotent while distinct `Seen At` events remain separate notes. Contacts and associated companies are assigned to Nicole Shen only when their exact HubSpot creation source is RB2B (`rb2b_source=true`, integration ID `4209312`, source detail `RB2B for CRM`); existing records merely enriched by RB2B keep their owners.
+
+Configure Railway with:
+
+```text
+RB2B_WEBHOOK_SECRET=<high-entropy secret>
+RB2B_HUBSPOT_OWNER_ID=94834941
+RB2B_HUBSPOT_INTEGRATION_ID=4209312
+RB2B_ALLOWED_HOSTS=truewind.ai,www.truewind.ai
+RB2B_VISIT_TIME_ZONE=America/Los_Angeles
+```
+
+In RB2B, connect the generic Webhook integration to:
+
+```text
+https://leads-update-production.up.railway.app/webhooks/rb2b?secret=<same secret>
+```
+
+Enable **Send repeat visitor data**. The endpoint accepts RB2B's test payload without creating HubSpot data, rejects non-Truewind captured URLs, matches contacts by exact email with LinkedIn conflict detection (then exact LinkedIn URL as fallback), and fails closed if the HubSpot contact is still unavailable after the retry window.
+
+Generate the historical pre-write preview with a project-scoped HubSpot token:
+
+```bash
+HUBSPOT_PRIVATE_TOKEN=... node scripts/rb2b_hubspot_backfill.js \
+  --timeline-events outputs/rb2b/rb2b-seven-day-timeline-events.json \
+  --output outputs/rb2b/rb2b-visit-notes-owner-preview.json
+```
+
+The timeline artifact must come from an authenticated HubSpot timeline audit covering no more than the last seven days. The preview contains only HubSpot record and event IDs plus proposed changes, binds the exact live scope by hash, validates Nicole Shen's active owner ID, verifies `rb2b_source=true` against integration ID `4209312`, preserves every distinct RB2B page-view event, and explicitly reports contacts that RB2B enriched but did not create. The first event uses the same idempotency key as the live webhook so backfill/webhook overlap cannot duplicate it. After review, apply only that exact artifact:
+
+```bash
+HUBSPOT_PRIVATE_TOKEN=... node scripts/rb2b_hubspot_backfill.js \
+  --apply \
+  --preview outputs/rb2b/rb2b-visit-notes-owner-preview.json
+```
+
+The apply command fails closed if HubSpot changed after preview and writes a readback artifact confirming every target owner and note.
+
 ## Daily Lead Progress Slack Post (Railway)
 
 The Railway Slack bot can post the report to `#gtm-general` at 6:07 PM Pacific on Sunday and Monday-Friday. The report is disabled by default and only runs when `LEAD_REPORT_ENABLED=true` (or `1`). Counts come from HubSpot deals created from Monday 00:00 Pacific through the report run time in the active pipeline. Obvious test/internal deals are skipped, and duplicate normalized deal names are counted once before grouping by the configured deal source property. When duplicate normalized deal names exist, the report keeps the most complete deal for reporting fields, preferring records with populated `deal_source`, owner, amount, close date, and stage; created date is only the tie-breaker.

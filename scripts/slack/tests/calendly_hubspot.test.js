@@ -16,6 +16,7 @@ const {
   getEmailDomain,
   getEventTypeUri,
   getOrganizerName,
+  hasOwner,
   hubspotDateMs,
   inferCompanyNameFromDomain,
   idempotencyRoot,
@@ -328,6 +329,13 @@ function testOrganizerName() {
   );
 }
 
+function testHasOwner() {
+  assert.strictEqual(hasOwner({ properties: { hubspot_owner_id: '84547076' } }), true);
+  assert.strictEqual(hasOwner({ properties: { hubspot_owner_id: '' } }), false);
+  assert.strictEqual(hasOwner({ properties: {} }), false);
+  assert.strictEqual(hasOwner(null), false);
+}
+
 function testConfigHasExpectedCloseLostStage() {
   assert.strictEqual(CONFIG.pipelineId, '105321581');
   assert.strictEqual(CONFIG.newDealStageId, '1307720553');
@@ -349,6 +357,7 @@ async function run() {
   testBookedDemoSlackMessageTagsMeetingHost();
   await testBookedDemoSlackAlertRetriesTransientFailures();
   testOrganizerName();
+  testHasOwner();
   testConfigHasExpectedCloseLostStage();
 }
 

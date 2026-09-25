@@ -24,6 +24,11 @@ const AE_ROSTER = (process.env.AE_ROSTER_JSON
       { id: "93961770", name: "Andrew Moyer" },
     ]);
 
+// Former round-robin members. Open deals and demo contacts they still own are
+// reassigned onto AE_ROSTER. Other existing owners are left alone.
+const REMOVED_ROUND_ROBIN_OWNER_IDS = ["93961773", "559564379"];
+const CLOSED_DEAL_STAGE_IDS = ["1166230571", "190380587"];
+
 // Don't round-robin internal/test submissions (own domain).
 const INTERNAL_EMAIL_RE = /@trytruewind\.com$/i;
 
@@ -39,6 +44,8 @@ module.exports = {
   MQL_STAGE,
   DEMO_FORM_TOKEN,
   AE_ROSTER,
+  REMOVED_ROUND_ROBIN_OWNER_IDS,
+  CLOSED_DEAL_STAGE_IDS,
   INTERNAL_EMAIL_RE,
   MEETING_LOOKBACK_MIN,
   CONTACT_MIN_AGE_MIN,

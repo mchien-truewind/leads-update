@@ -7,7 +7,7 @@ const assert = require('node:assert');
 process.env.HUBSPOT_PRIVATE_TOKEN = process.env.HUBSPOT_PRIVATE_TOKEN || 'test-token';
 
 const cfg = require('../gtm_ops/config');
-const { pickAE, latestMeetingHost, latestMeetingHostDetails, isBookedDemoContact, bookedContactOwnerUpdates, reconcileDealOwners } = require('../gtm_ops/reconciler');
+const { pickAE, latestMeetingHost, latestMeetingHostDetails, isBookedDemoContact, bookedContactOwnerUpdates, reconcileDealOwners, reassignRemovedRoundRobinOwners } = require('../gtm_ops/reconciler');
 const { CONFIG } = require('../calendly_hubspot');
 
 test('DRY_RUN defaults to true (read-only unless explicitly disabled)', () => {
@@ -154,13 +154,13 @@ test('concurrent DB override prevents stale meeting-host PATCH', async () => {
       throw new Error(`Unexpected association ${fromType}->${toType}`);
     },
     batchRead: async (objectType) => {
-      if (objectType === 'deals') return new Map([['deal-1', { dealname: 'WECU', hubspot_owner_id: 'owner-sarah', pipeline: cfg.ACTIVE_PIPELINE }]]);
+      if (objectType === 'deals') return new Map([['deal-1', { dealname: 'WECU', hubspot_owner_id: '', pipeline: cfg.ACTIVE_PIPELINE }]]);
       if (objectType === 'meetings') return new Map([['meeting-1', { hubspot_owner_id: 'owner-alex', hs_meeting_start_time: '2026-08-13T22:00:00.000Z' }]]);
       if (objectType === 'contacts') return new Map();
       throw new Error(`Unexpected batch read ${objectType}`);
     },
     hub: async (method, path, body) => {
-      if (method === 'GET') return { properties: { hubspot_owner_id: 'owner-sarah' } };
+      if (method === 'GET') return { properties: { hubspot_owner_id: '' } };
       if (method === 'PATCH') writes.push({ path, body });
       return {};
     },
@@ -177,6 +177,95 @@ test('concurrent DB override prevents stale meeting-host PATCH', async () => {
   assert.deepStrictEqual(writes, []);
 });
 
+function singleDealApi({ dealOwnerId, meetingHostId, writes }) {
+  return {
+    searchAll: async () => [{ id: 'meeting-1' }],
+    associations: async (fromType, ids, toType) => {
+      if (fromType === 'meetings' && toType === 'deals') return new Map([['meeting-1', ['deal-1']]]);
+      if (fromType === 'deals' && toType === 'meetings') return new Map([['deal-1', ['meeting-1']]]);
+      if (fromType === 'meetings' && toType === 'contacts') return new Map([['meeting-1', []]]);
+      throw new Error(`Unexpected association ${fromType}->${toType}`);
+    },
+    batchRead: async (objectType) => {
+      if (objectType === 'deals') return new Map([['deal-1', { dealname: 'WECU', hubspot_owner_id: dealOwnerId, pipeline: cfg.ACTIVE_PIPELINE }]]);
+      if (objectType === 'meetings') return new Map([['meeting-1', { hubspot_owner_id: meetingHostId, hs_meeting_start_time: '2026-08-13T22:00:00.000Z' }]]);
+      if (objectType === 'contacts') return new Map();
+      throw new Error(`Unexpected batch read ${objectType}`);
+    },
+    hub: async (method, path, body) => {
+      if (method === 'GET') return { properties: { hubspot_owner_id: dealOwnerId } };
+      if (method === 'PATCH') writes.push({ path, body });
+      return {};
+    },
+    sleep: async () => {},
+  };
+}
+
+test('existing deal owner is kept when a different host books the meeting', async () => {
+  const writes = [];
+  const owners = new Map([
+    ['owner-liz', { name: 'Liz' }],
+    ['owner-renato', { name: 'Renato' }],
+  ]);
+  const overrideStore = { getDealOwnerOverrides: async () => new Map() };
+  const api = singleDealApi({ dealOwnerId: 'owner-liz', meetingHostId: 'owner-renato', writes });
+
+  const result = await reconcileDealOwners(owners, { overrideStore, api, dryRun: false });
+  assert.strictEqual(result.fixed, 0);
+  assert.deepStrictEqual(writes, []);
+});
+
+test('ownerless deal still gets the meeting host', async () => {
+  const writes = [];
+  const owners = new Map([['owner-renato', { name: 'Renato' }]]);
+  const overrideStore = { getDealOwnerOverrides: async () => new Map() };
+  const api = singleDealApi({ dealOwnerId: '', meetingHostId: 'owner-renato', writes });
+
+  const result = await reconcileDealOwners(owners, { overrideStore, api, dryRun: false });
+  assert.strictEqual(result.fixed, 1);
+  assert.deepStrictEqual(writes, [{
+    path: '/crm/v3/objects/deals/deal-1',
+    body: { properties: { hubspot_owner_id: 'owner-renato' } },
+  }]);
+});
+
+test('removed round-robin owners on open deals and demo contacts move to the current roster', async () => {
+  const writes = [];
+  const rosterIds = new Set(cfg.AE_ROSTER.map((ae) => ae.id));
+  const api = {
+    searchAll: async (objectType) => {
+      if (objectType === 'deals') return [
+        { id: 'deal-alex', properties: { dealname: 'Alex deal', hubspot_owner_id: '559564379', dealstage: '1307720553' } },
+        { id: 'deal-closed', properties: { dealname: 'Closed', hubspot_owner_id: '93961773', dealstage: '190380587' } },
+      ];
+      if (objectType === 'contacts') return [
+        { id: 'contact-ari', properties: { email: 'buyer@example.com', hubspot_owner_id: '93961773' } },
+        { id: 'contact-internal', properties: { email: 'alex@trytruewind.com', hubspot_owner_id: '559564379' } },
+      ];
+      throw new Error(`Unexpected search ${objectType}`);
+    },
+    hub: async (method, path, body) => {
+      if (method === 'GET' && path.includes('/deals/')) return { properties: { hubspot_owner_id: '559564379', dealstage: '1307720553' } };
+      if (method === 'GET' && path.includes('/contacts/')) return { properties: { hubspot_owner_id: '93961773' } };
+      if (method === 'PATCH') writes.push({ path, body });
+      return {};
+    },
+    sleep: async () => {},
+  };
+  const owners = new Map(cfg.AE_ROSTER.map((ae) => [ae.id, { name: ae.name }]));
+  owners.set('559564379', { name: 'Alex Lee' });
+  owners.set('93961773', { name: 'Ari Nachman' });
+
+  const result = await reassignRemovedRoundRobinOwners(owners, { api, dryRun: false });
+  assert.strictEqual(result.reassigned, 2);
+  assert.strictEqual(writes.length, 2);
+  for (const write of writes) {
+    const ownerId = write.body.properties.hubspot_owner_id;
+    assert.ok(rosterIds.has(ownerId), ownerId);
+    assert.ok(!cfg.REMOVED_ROUND_ROBIN_OWNER_IDS.includes(ownerId));
+  }
+});
+
 test('latestMeetingHost returns null when the latest meeting has no owner', () => {
   const props = new Map([['m1', { hs_meeting_start_time: '5000' }]]);
   assert.strictEqual(latestMeetingHost(['m1'], props), null);
@@ -189,7 +278,7 @@ test('isBookedDemoContact accepts booked Calendly contacts and demo form contact
   assert.strictEqual(isBookedDemoContact({ recent_conversion_event_name: 'Newsletter signup' }), false);
 });
 
-test('bookedContactOwnerUpdates syncs only selected meeting contacts to the meeting host', () => {
+test('bookedContactOwnerUpdates assigns only ownerless booked contacts to the meeting host', () => {
   const updates = bookedContactOwnerUpdates(
     ['deal-1', 'deal-2'],
     new Map([
@@ -197,12 +286,16 @@ test('bookedContactOwnerUpdates syncs only selected meeting contacts to the meet
       ['deal-2', 'host-xavier'],
     ]),
     new Map([
-      ['deal-1', ['contact-stale', 'contact-already-host', 'contact-not-demo']],
-      ['deal-2', ['contact-stale']],
+      ['deal-1', ['contact-ownerless', 'contact-owned', 'contact-already-host', 'contact-not-demo']],
+      ['deal-2', ['contact-ownerless']],
     ]),
     new Map([
-      ['contact-stale', {
+      ['contact-ownerless', {
         email: 'buyer@example.com',
+        calendly_meeting_booked: 'true',
+      }],
+      ['contact-owned', {
+        email: 'owned-by-other@example.com',
         hubspot_owner_id: 'old-owner',
         calendly_meeting_booked: 'true',
       }],
@@ -220,7 +313,7 @@ test('bookedContactOwnerUpdates syncs only selected meeting contacts to the meet
   );
 
   assert.deepStrictEqual(updates, [
-    { contactId: 'contact-stale', from: 'old-owner', to: 'host-amy', email: 'buyer@example.com', dealId: 'deal-1' },
+    { contactId: 'contact-ownerless', from: null, to: 'host-amy', email: 'buyer@example.com', dealId: 'deal-1' },
   ]);
 });
 

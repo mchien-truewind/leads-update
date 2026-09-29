@@ -35,10 +35,6 @@ const { App: SlackBoltApp } = require('@slack/bolt');
 const Anthropic = require('@anthropic-ai/sdk').default;
 const { google } = require('googleapis');
 const {
-  DEFAULT_CHANNEL: INSTANTLY_POSITIVE_REPLY_DEFAULT_CHANNEL,
-  handleInstantlyPositiveReplyWebhook,
-} = require('./instantly_positive_reply_alert');
-const {
   handleCalendlyHubSpotWebhook,
 } = require('./calendly_hubspot');
 const {
@@ -3825,17 +3821,6 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
 // ============================================================
 const app = createSlackApp();
 
-const INSTANTLY_POSITIVE_REPLY_CHANNEL = (
-  process.env.INSTANTLY_POSITIVE_REPLY_SLACK_CHANNEL
-  || INSTANTLY_POSITIVE_REPLY_DEFAULT_CHANNEL
-);
-const INSTANTLY_POSITIVE_REPLY_MENTION_USER_ID = (
-  process.env.INSTANTLY_POSITIVE_REPLY_SLACK_MENTION_USER_ID
-  || process.env.SLACK_USER_ID
-  || ''
-).trim();
-const INSTANTLY_WEBHOOK_SECRET = (process.env.INSTANTLY_WEBHOOK_SECRET || '').trim();
-
 // maxRetries: 0 makes withRetry() below the single source of truth for retries
 // (otherwise the SDK's built-in retries nest inside ours and compound the backoff).
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, maxRetries: 0 });
@@ -6312,23 +6297,6 @@ function startHttpServer() {
           });
         });
       });
-      return;
-    }
-    if (req.url.split('?')[0] === '/webhooks/instantly/positive-reply') {
-      try {
-        await handleInstantlyPositiveReplyWebhook(req, res, {
-          slackClient: app.client,
-          slackToken: process.env.SLACK_BOT_TOKEN,
-          channel: INSTANTLY_POSITIVE_REPLY_CHANNEL,
-          mentionUserId: INSTANTLY_POSITIVE_REPLY_MENTION_USER_ID,
-          webhookSecret: INSTANTLY_WEBHOOK_SECRET,
-          logger: console,
-        });
-      } catch (err) {
-        console.error('Instantly positive reply webhook failed:', err.message);
-        res.writeHead(500);
-        res.end('webhook_failed');
-      }
       return;
     }
     if (req.method === 'POST' && req.url.split('?')[0] === '/webhooks/calendly') {

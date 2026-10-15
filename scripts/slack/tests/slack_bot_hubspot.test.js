@@ -1127,6 +1127,17 @@ async function testSlackHttpEventsRouteVerifiesUrlChallenge() {
   });
 }
 
+async function testHubSpotDemoRouteDoesNotFallThroughToHealthCheck() {
+  await withEphemeralSlackHttpServer(async (port) => {
+    const response = await getHttpRoute(port, '/api/webhooks/hubspot');
+    assert.strictEqual(response.statusCode, 405);
+    assert.strictEqual(JSON.parse(response.body).error, 'method_not_allowed');
+    const health = await getHttpRoute(port, '/');
+    assert.strictEqual(health.statusCode, 200);
+    assert.strictEqual(health.body, 'ok');
+  });
+}
+
 async function testSlackHttpEventsRouteRejectsInvalidSignature() {
   await withEphemeralSlackHttpServer(async (port) => {
     const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'challenge-token' });
@@ -2134,6 +2145,7 @@ async function run() {
   await testSupportedSlackHttpInteractionRunsSharedHandlerInHttpMode();
   await testDurableSlackInteractionCompletesOrRequeues();
   await testSlackHttpEventsRouteVerifiesUrlChallenge();
+  await testHubSpotDemoRouteDoesNotFallThroughToHealthCheck();
   await testSlackHttpEventsRouteRejectsInvalidSignature();
   await testSlackHttpEventsRouteRejectsMalformedJson();
   await testSlackHttpEventsRouteAcksEventCallbacks();

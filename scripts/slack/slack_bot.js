@@ -43,6 +43,7 @@ const {
 const {
   createPostgresSlackStateStore,
 } = require('./slack_state_store');
+const { DemoNotificationStore, handleHubSpotDemoWebhook } = require('./hubspot_demo');
 const {
   buildMqlDiscoveryReport,
   formatMqlDiscoveryReport,
@@ -249,6 +250,7 @@ const slackHttpInteractionSeen = new Map();
 let slackStateStore = createPostgresSlackStateStore({
   connectionString: process.env.DEAL_OWNER_OVERRIDE_DATABASE_URL || process.env.SLACK_STATE_DATABASE_URL,
 });
+let demoNotificationStore = null;
 let slackBotUserIdPromise = null;
 
 function resolveSlackEventTransport(value = process.env.SLACK_EVENT_TRANSPORT) {
@@ -6164,6 +6166,12 @@ function startHttpServer() {
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = Number(process.env.PORT || 3000);
   const server = http.createServer(async (req, res) => {
+    if (req.url.split('?')[0] === '/api/webhooks/hubspot') {
+      await handleHubSpotDemoWebhook(req, res, {
+        env: process.env, store: demoNotificationStore, hubspotRequest, logger: console,
+      });
+      return;
+    }
     if (req.method === 'POST' && req.url.split('?')[0] === '/slack/interactions') {
       let rawBody = '';
       try {
@@ -6506,6 +6514,15 @@ async function startSlackBot() {
     await slackStateStore.initialize();
     startSlackInteractionRecoveryLoop();
     console.log('Slack durable interaction state: ready');
+  }
+
+  if (process.env.HUBSPOT_DEMO_SLACK_ENABLED === 'true') {
+    if (!slackStateStore?.pool || !HUBSPOT_TOKEN || !process.env.HUBSPOT_CLIENT_SECRET || !process.env.SLACK_BOT_TOKEN) {
+      throw new Error('Demo webhooks require the Slack state database, HubSpot token and app secret, and Slack bot token');
+    }
+    demoNotificationStore = new DemoNotificationStore(slackStateStore.pool);
+    await demoNotificationStore.initialize();
+    console.log('HubSpot demo webhook ready: #slack-testing');
   }
 
   // HTTP server (health check + webhook routes) runs in every role. Webhook routes

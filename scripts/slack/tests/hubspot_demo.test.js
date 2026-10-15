@@ -8,7 +8,7 @@ const { DemoNotificationStore, isDemoEvent, eventKey, buildMessage, processEvent
 const event = {
   appId: 31714623, eventId: 100, subscriptionId: 8149441, portalId: 43974586,
   occurredAt: 1792018273594, subscriptionType: 'contact.propertyChange', attemptNumber: 0,
-  objectId: 123, propertyName: 'demo_form_submission', propertyValue: '1791936000000',
+  objectId: 123, propertyName: 'demo_form_submission_datetime', propertyValue: '1792018273594',
 };
 const env = {
   HUBSPOT_DEMO_SLACK_ENABLED: 'true', HUBSPOT_CLIENT_SECRET: 'test-secret',
@@ -87,14 +87,14 @@ test('signed demo webhook sends the exact message, mention, channel, and HubSpot
   assert.equal(row.slack_ts, '1792018273.000100');
 });
 
-test('retries and duplicate subscriptions do not resend, while later submissions notify', async () => {
+test('retries do not resend, while distinct datetime submissions on the same day both notify', async () => {
   const deps = dependencies();
   await webhook([event], deps);
   const retry = { ...event, attemptNumber: 9, subscriptionId: 2, eventId: 888 };
   assert.equal(eventKey(event), eventKey(retry));
   assert.equal((await webhook([retry], deps)).body.duplicates, 1);
   assert.equal(deps.messages.length, 1);
-  assert.equal((await webhook([{ ...event, occurredAt: event.occurredAt + 86400000, propertyValue: '1792022400000' }], deps)).body.sent, 1);
+  assert.equal((await webhook([{ ...event, occurredAt: event.occurredAt + 60000, propertyValue: String(Number(event.propertyValue) + 60000) }], deps)).body.sent, 1);
   assert.equal(deps.messages.length, 2);
 });
 
@@ -102,6 +102,7 @@ test('unsupported events, clears, and sample payloads are ignored', async () => 
   const values = [
     { ...event, propertyValue: 'sample-value' }, { ...event, propertyValue: '' },
     { ...event, propertyName: 'lastname' }, { ...event, subscriptionType: 'contact.creation' },
+    { ...event, propertyName: 'demo_form_submission' },
     { ...event, portalId: 1 }, { ...event, appId: 2 }, { ...event, objectId: 0 },
   ];
   const deps = dependencies();

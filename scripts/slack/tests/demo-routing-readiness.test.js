@@ -7,14 +7,15 @@ function fixture() {
   const row = { ownerId: '40', slackUserId: 'UOWNER', calendlyUrl: 'https://calendly.com/owner/intro',
     hostUris: ['https://api.calendly.com/users/host'], eventTypeUris: ['https://api.calendly.com/event_types/intro'] };
   const state = { email: 'owner@example.com', calendarEmail: 'owner@example.com', slackEmail: 'owner@example.com',
-    schedulingUrl: row.calendlyUrl, active: true, poolingType: null };
+    schedulingUrl: row.calendlyUrl, active: true, poolingType: null, hosts: row.hostUris };
   const options = { registry: new Map([['40', row]]),
     async hubspotRequest() { return { id: '40', email: state.email, archived: false }; },
     async calendlyRequest(url) {
+      if (url.includes('/event_type_memberships?')) return { collection: state.hosts.map(uri => ({ member: { uri } })) };
       if (url.includes('/event_types?')) return { collection: [{ uri: row.eventTypeUris[0], active: state.active, scheduling_url: state.schedulingUrl, pooling_type: state.poolingType }] };
       return { resource: { email: state.calendarEmail, current_organization: 'org' } };
     },
-    slackClient: { users: { async info() { return { ok: true, user: { deleted: false, profile: { email: state.slackEmail } } }; } } },
+    slackClient: { users: { async info() { return { ok: true, user: { id: row.slackUserId, deleted: false, profile: { email: state.slackEmail } } }; } } },
   };
   return { options, state };
 }
@@ -29,6 +30,10 @@ test('registry readiness verifies owner, Calendly, personal event, and Slack ide
   await assert.rejects(verifyOwnerRegistry(inactive.options), /unverified/);
   const pooled = fixture(); pooled.state.poolingType = 'round_robin';
   await assert.rejects(verifyOwnerRegistry(pooled.options), /unverified/);
+  const shared = fixture(); shared.state.hosts = [...shared.state.hosts, 'https://api.calendly.com/users/another-owner'];
+  await assert.rejects(verifyOwnerRegistry(shared.options), /host_mismatch/);
+  const wrongHost = fixture(); wrongHost.state.hosts = ['https://api.calendly.com/users/another-owner'];
+  await assert.rejects(verifyOwnerRegistry(wrongHost.options), /host_mismatch/);
 });
 
 test('calendar access failures prevent enabling the feature', async () => {
@@ -48,4 +53,14 @@ test('booking lock uses one pool client for lock, guarded work, and unlock', asy
   assert.ok(calls[1].startsWith('SELECT * FROM demo_booking_links'));
   assert.ok(calls[2].includes('pg_advisory_unlock'));
   assert.equal(calls[3], 'release');
+});
+
+
+test('missing Slack email scope permits only an existing trusted owner-to-user mapping', async () => {
+  const f = fixture(); f.state.slackEmail = undefined;
+  await assert.rejects(verifyOwnerRegistry(f.options), /slack_identity_mismatch/);
+  await verifyOwnerRegistry({ ...f.options, trustedSlackOwnerMap: { 40: 'UOWNER' } });
+  await assert.rejects(verifyOwnerRegistry({ ...f.options, trustedSlackOwnerMap: { 40: 'UOTHER' } }), /slack_identity_mismatch/);
+  f.state.slackEmail = 'another-person@example.com';
+  await assert.rejects(verifyOwnerRegistry({ ...f.options, trustedSlackOwnerMap: { 40: 'UOWNER' } }), /slack_identity_mismatch/);
 });

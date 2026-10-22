@@ -1,5 +1,5 @@
 // All checks are read-only. This is also run at service startup before enabling mutations.
-async function verifyOwnerRegistry({ registry, hubspotRequest, calendlyRequest, slackClient }) {
+async function verifyOwnerRegistry({ registry, hubspotRequest, calendlyRequest, slackClient, trustedSlackOwnerMap = {} }) {
   const me = await calendlyRequest('https://api.calendly.com/users/me');
   const organization = me.resource?.current_organization;
   if (!organization) throw new Error('calendar_organization_unverified');
@@ -25,8 +25,32 @@ async function verifyOwnerRegistry({ registry, hubspotRequest, calendlyRequest, 
     if (row.eventTypeUris.some(uri => !activeEvents.has(uri))
       || !row.eventTypeUris.some(uri => activeEvents.get(uri)?.pooling_type == null
         && activeEvents.get(uri)?.scheduling_url?.replace(/\/$/, '') === row.calendlyUrl.replace(/\/$/, ''))) throw new Error('registry_personal_calendar_unverified');
+    // A user's event list can include shared events. Verify actual hosts rather
+    // than assuming every event returned by ?user= belongs exclusively to them.
+    for (const eventUri of row.eventTypeUris) {
+      const hosts = new Set();
+      let url = `https://api.calendly.com/event_type_memberships?event_type=${encodeURIComponent(eventUri)}&count=100`;
+      const visited = new Set();
+      while (url) {
+        if (visited.has(url) || !url.startsWith('https://api.calendly.com/')) throw new Error('invalid_calendar_pagination');
+        visited.add(url);
+        const page = await calendlyRequest(url);
+        if (!Array.isArray(page.collection)) throw new Error('calendar_hosts_unavailable');
+        for (const membership of page.collection) {
+          const uri = membership.member?.uri;
+          if (!uri) throw new Error('calendar_host_unverified');
+          hosts.add(uri);
+        }
+        url = page.pagination?.next_page || '';
+      }
+      if (hosts.size !== 1 || !row.hostUris.includes([...hosts][0])) throw new Error('registry_calendar_host_mismatch');
+    }
     const slack = await slackClient.users.info({ user: row.slackUserId });
-    if (slack.ok !== true || slack.user?.deleted !== false || String(slack.user?.profile?.email || '').trim().toLowerCase() !== email) throw new Error('registry_slack_identity_mismatch');
+    if (slack.ok !== true || slack.user?.deleted !== false || slack.user?.id !== row.slackUserId) throw new Error('registry_slack_identity_mismatch');
+    const slackEmail = String(slack.user?.profile?.email || '').trim().toLowerCase();
+    // Email is optional without users:read.email. Accept only the exact existing
+    // owner-to-Slack-ID mapping in that case; never infer identity from a name.
+    if (slackEmail ? slackEmail !== email : trustedSlackOwnerMap[ownerId] !== row.slackUserId) throw new Error('registry_slack_identity_mismatch');
   }
 }
 

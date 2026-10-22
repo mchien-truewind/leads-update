@@ -2,6 +2,7 @@
 // Read-only rollout/shadow check. Inject credentials with the project's approved runtime.
 const { createDemoRouter } = require('./slack/demo-routing');
 const { verifyOwnerRegistry } = require('./slack/demo-routing-readiness');
+const { getOwnerSlackMap } = require('./slack/slack-owner-map');
 
 async function main() {
   const hubspotToken = process.env.HUBSPOT_PRIVATE_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
@@ -9,7 +10,7 @@ async function main() {
   async function json(url, token, options = {}) {
     if (!token) throw new Error('missing_provider_credential');
     const response = await fetch(url, { method: options.method || 'GET',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'user-agent': 'Truewind-Routing/1.0' },
       body: options.body ? JSON.stringify(options.body) : undefined, signal: AbortSignal.timeout(10000) });
     if (!response.ok) throw new Error(`${new URL(url).hostname}_http_${response.status}`);
     return response.json();
@@ -28,7 +29,7 @@ async function main() {
   // Enable validation in this process only; this CLI never starts a worker or writes CRM.
   const checks = createDemoRouter({ request, env: { ...process.env, DEMO_ROUTING_ENABLED: 'true' } });
   await checks.validateCoverage();
-  await verifyOwnerRegistry({ registry: checks.registry, hubspotRequest: request,
+  await verifyOwnerRegistry({ registry: checks.registry, hubspotRequest: request, trustedSlackOwnerMap: getOwnerSlackMap(),
     calendlyRequest: url => json(url, calendlyToken),
     slackClient: { users: { info: ({ user }) => json(`https://slack.com/api/users.info?user=${encodeURIComponent(user)}`, process.env.SLACK_BOT_TOKEN) } } });
   console.log('demo_routing_readiness_passed');

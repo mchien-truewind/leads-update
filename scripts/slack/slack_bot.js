@@ -178,17 +178,7 @@ const TRUEWIND_HUBSPOT = {
   },
 };
 
-const DEFAULT_SLACK_TO_HUBSPOT_OWNER = {
-  U0ATZSNCE5T: { id: '91143842', name: 'Jenilee Chen' },
-  U0AURH4KMRN: { id: '91143844', name: 'Brendan Moody' },
-  U0AKMHVCJMA: { id: '89305622', name: 'Xavier Marco' },
-  U09QC3B292R: { id: '84547076', name: 'Sarah Elix' },
-  U04BPMPR29G: { id: '559564379', name: 'Alex Lee' },
-  U0B4MRN83FE: { id: '92555980', name: 'Amy Vetter' },
-  U0BAMU9DYR4: { id: '93961770', name: 'Andrew Moyer' },
-  U0BARRLR6Q1: { id: '93961773', name: 'Ari Nachman' },
-  U0ABULY5TEK: { id: '91143842', name: 'Jenilee Chen' },
-};
+const { DEFAULT_SLACK_TO_HUBSPOT_OWNER } = require('./slack-owner-map');
 
 function parseSlackOwnerMap() {
   const raw = process.env.SLACK_TO_HUBSPOT_OWNER_JSON || process.env.SLACK_USER_TO_HUBSPOT_OWNER_JSON || '';
@@ -6546,7 +6536,8 @@ async function startSlackBot() {
     demoRouter = createDemoRouter({ request: hubspotRequestFromFetchOptions });
     await demoRouter.validateCoverage();
     if (routingEnabled(process.env)) await verifyOwnerRegistry({ registry: demoRouter.registry,
-      hubspotRequest: hubspotRequestFromFetchOptions, calendlyRequest, slackClient: app.client });
+      hubspotRequest: hubspotRequestFromFetchOptions, calendlyRequest, slackClient: app.client,
+      trustedSlackOwnerMap: HUBSPOT_OWNER_TO_SLACK_USER });
     demoBookingStore = new DemoBookingStore(slackStateStore.pool);
     await demoBookingStore.initialize();
     if (routingEnabled(process.env)) startDemoRoutingRecovery({ env: process.env, store: demoNotificationStore,

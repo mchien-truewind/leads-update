@@ -164,6 +164,7 @@ async function calendlyRequest(uri) {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: 'application/json',
+      'User-Agent': 'Truewind-Routing/1.0',
     },
   });
 }

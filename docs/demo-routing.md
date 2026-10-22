@@ -62,11 +62,22 @@ Also verify the account-level company-to-contact owner inheritance setting does 
    Monitor `demo_routing_unresolved`, `demo_routing_calendar_fallback`, owner corrections, recovery errors,
    and notification review events. Configure internal error alerts for these events before activation.
 
-At implementation time the Truewind production service had a Calendly credential, but its
-`GET /users/me` request returned HTTP 403. Calendar enumeration and verified registry population could
-not be completed. This is an access blocker, not evidence that the team lacks personal calendars.
-The new resolver's read-only Bessemer check selected company 28322157189, deal 60188647969, and owner
-559564379; calendar/Slack values were left empty because the new registry was not configured.
+Calendar access was verified on 2026-10-22 as the Truewind account `mercedes@trytruewind.com`.
+The earlier HTTP 403 was reproduced with the validation client's default headers; explicitly identified
+requests succeeded with both the previous production credential and the newly supplied key. The HTTP
+clients now identify themselves consistently. The new key was saved to the production service's
+configuration with deployment skipped.
+
+The current open-deal owner coverage is Alex, Sarah, and Xavier. Their active personal event links,
+single-host memberships, HubSpot owner identities, and existing active Truewind Slack-ID mappings were
+verified. The registry is staged on `leads-update` and `gtm-ops`, with routing explicitly disabled and
+no deployment triggered. Re-run coverage before activation because ownership can change.
+
+The Slack app lacks `users:read.email`. When email is exposed, validation requires an exact owner-email
+match. When it is hidden, validation accepts only the exact existing configured owner-to-Slack-ID mapping
+and checks that the returned user ID is active. It never infers identity from a display name. Calendar
+validation checks the event's actual hosts, because listing a user's events can include shared events.
+The workflow verification flag remains unset; this calendar validation does not clear that rollout gate.
 
 ## Failure handling and rollback
 

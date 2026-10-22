@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const https = require('https');
 const path = require('path');
+const { routeBooking } = require('./demo-routing-bookings');
 
 const DEFAULT_HTTP_TIMEOUT_MS = Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 30000);
 const inFlightWebhookKeys = new Set();
@@ -163,6 +164,7 @@ async function calendlyRequest(uri) {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: 'application/json',
+      'User-Agent': 'Truewind-Routing/1.0',
     },
   });
 }
@@ -457,6 +459,8 @@ function buildBookedDemoSlackMessage({
   companyName = '',
   ownerName = '',
   ownerSlackUserId = '',
+  meetingHostName = ownerName,
+  dealId = '',
   portalId = CONFIG.hubSpotPortalId,
 }) {
   const name = clean(payload?.name || payload?.invitee?.name || `${payload?.first_name || ''} ${payload?.last_name || ''}`);
@@ -482,7 +486,8 @@ function buildBookedDemoSlackMessage({
     email,
     clean(companyName) ? `- Company: ${clean(companyName)}` : null,
     ownerLabel || ownerName ? `- Owner: ${ownerLabel || ownerName}` : null,
-    clean(ownerName) ? `- Meeting Host: ${clean(ownerName)}` : null,
+    clean(meetingHostName) ? `- Meeting Host: ${clean(meetingHostName)}` : null,
+    dealId ? `- Existing deal: <https://app.hubspot.com/contacts/${portalId}/record/0-3/${dealId}|View opportunity>` : null,
     start ? `- Meeting Time: ${start}` : null,
     clean(event.name) ? `- Event: ${clean(event.name)}` : null,
     erp ? `- ERP: ${erp}` : null,
@@ -505,6 +510,9 @@ async function postBookedDemoSlackAlert({
   companyName = '',
   ownerId = '',
   ownerName = '',
+  meetingHostName = ownerName,
+  dealId = '',
+  alertAttempts,
 }) {
   const channel = clean(slackChannel) || clean(process.env.CALENDLY_DEMO_SLACK_CHANNEL_ID)
     || clean(process.env.CALENDLY_DEMO_SLACK_CHANNEL)
@@ -520,10 +528,10 @@ async function postBookedDemoSlackAlert({
     contactId,
     companyName,
     ownerName,
-    ownerSlackUserId,
+    ownerSlackUserId, meetingHostName, dealId,
   });
   if (!text) return null;
-  const attempts = Math.max(1, Number(process.env.CALENDLY_DEMO_SLACK_ALERT_ATTEMPTS || 3) || 1);
+  const attempts = Math.max(1, Number(alertAttempts || process.env.CALENDLY_DEMO_SLACK_ALERT_ATTEMPTS || 3) || 1);
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
@@ -631,7 +639,7 @@ async function findContactByEmail(email) {
   const result = await searchObjects(
     'contacts',
     [{ propertyName: 'email', operator: 'EQ', value: clean(email) }],
-    ['email', 'firstname', 'lastname', 'hubspot_owner_id'],
+    ['email', 'firstname', 'lastname', 'hubspot_owner_id', 'demo_form_submission_datetime'],
     1,
   );
   return (result.results || [])[0] || null;
@@ -1023,12 +1031,17 @@ async function handleInviteeCanceled(payload, scheduledEvent, filter) {
 }
 
 async function processCalendlyWebhook(body, options = {}) {
+  if (options.demoBookingStore && !options.bookingLocked) {
+    const inviteeUri = getInviteeUri(body.payload || {});
+    if (!inviteeUri) throw new Error('missing_invitee_uri');
+    return options.demoBookingStore.withLock(inviteeUri, lockedStore => processCalendlyWebhook(body, { ...options, demoBookingStore: lockedStore, bookingLocked: true }));
+  }
   const processingKey = webhookProcessingKey(body);
   if (processingKey && inFlightWebhookKeys.has(processingKey)) return { action: 'ignored_in_flight_duplicate' };
   if (processingKey) inFlightWebhookKeys.add(processingKey);
   let durableRecord;
   try {
-    durableRecord = acquireDurableProcessingRecord(processingKey);
+    durableRecord = options.demoBookingStore ? { skipped: false } : acquireDurableProcessingRecord(processingKey);
     if (durableRecord.skipped) return { action: `ignored_${durableRecord.status}_duplicate` };
     const eventName = clean(body.event);
     const payload = body.payload || {};
@@ -1038,8 +1051,17 @@ async function processCalendlyWebhook(body, options = {}) {
 
     const scheduledEvent = await calendlyRequest(eventUri);
     await ensureCalendlyOwnerMap(); // resolve any team member as host, not just the seeded few
+    // The same registry supplies both website calendars and accepted booking hosts/types.
+    if (options.demoRouter) {
+      for (const [ownerId, row] of options.demoRouter.registry) {
+        for (const uri of row.hostUris) CONFIG.ownerByCalendlyUserUri.set(uri, ownerId);
+        for (const uri of row.eventTypeUris) CONFIG.allowedEventTypeUris.add(uri);
+      }
+    }
     const filter = shouldProcessScheduledEvent(scheduledEvent);
-    if (!filter.ok) {
+    const storedBooking = options.demoBookingStore ? await options.demoBookingStore.get(getInviteeUri(payload)) : null;
+    const protectedCancellation = eventName === 'invitee.canceled' && storedBooking?.reused_existing_deal && storedBooking.event_uri === eventUri;
+    if (!filter.ok && !protectedCancellation) {
       return {
         action: 'ignored_not_allowlisted',
         eventTypeAllowed: CONFIG.allowedEventTypeUris.has(filter.eventTypeUri),
@@ -1047,10 +1069,27 @@ async function processCalendlyWebhook(body, options = {}) {
       };
     }
 
+    const priorLink = options.demoBookingStore ? await options.demoBookingStore.get(getInviteeUri(payload)) : null;
+    if (eventName === 'invitee.created' && priorLink && !priorLink.reused_existing_deal && priorLink.notification_state === 'sent') return { action: 'ignored_succeeded_duplicate' };
+    const routed = await routeBooking({ eventName, payload, scheduledEvent, filter,
+      options: { ...options, eventCreatedAt: body.created_at },
+      api: { getInviteeUri, getScheduledEventUri, getOldInviteeUri, isRescheduled,
+        request: hubspotRequest, getOrganizerName, findContactByEmail, ensureContact, findMeetingByCalendlyIdentifiers,
+        createMeeting, associate, postBookedDemoSlackAlert } });
+    if (routed) return routed;
+    if (options.demoBookingStore) {
+      durableRecord = acquireDurableProcessingRecord(processingKey);
+      if (durableRecord.skipped) return { action: `ignored_${durableRecord.status}_duplicate` };
+    }
     let result;
     if (eventName === 'invitee.created') result = await handleInviteeCreated(payload, scheduledEvent, filter, options);
     else if (eventName === 'invitee.canceled') result = await handleInviteeCanceled(payload, scheduledEvent, filter);
     else result = { action: 'ignored_event_type' };
+    if (options.demoBookingStore && eventName === 'invitee.created' && result?.dealId) {
+      await options.demoBookingStore.put({ inviteeUri: getInviteeUri(payload), eventUri,
+        contactId: String(result.contactId), dealId: String(result.dealId), meetingId: String(result.meetingId), reusedExistingDeal: false });
+      await options.demoBookingStore.finishNotification(getInviteeUri(payload));
+    }
     markDurableProcessingSucceeded(durableRecord, result);
     return result;
   } catch (err) {
@@ -1103,6 +1142,7 @@ async function handleCalendlyHubSpotWebhook(req, res, { logger = console, ...opt
 }
 
 module.exports = {
+  calendlyRequest,
   CONFIG,
   CONTACT_CALENDLY_MEETING_BOOKED_PROPERTY,
   ensureCalendlyOwnerMap,

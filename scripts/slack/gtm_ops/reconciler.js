@@ -10,6 +10,14 @@
 
 const { hub, getOwners, searchAll, associations, batchRead, sleep } = require("./hubspot");
 const cfg = require("./config");
+const { createDemoRouter, routingEnabled, SUBMISSION_PROPERTY } = require('../demo-routing');
+const { protectContact, protectDeal, reconcileRoutedSubmissions } = require('../demo-routing-assignment');
+let sharedRouter;
+function getDemoRouter() {
+  if (!routingEnabled()) return null;
+  if (!sharedRouter) sharedRouter = createDemoRouter({ request: (path, options = {}) => hub(options.method || 'GET', path, options.body) });
+  return sharedRouter;
+}
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 
@@ -66,7 +74,7 @@ function bookedContactOwnerUpdates(dealIds, dealToHost, dealToContacts, contactP
 }
 
 // ---------- Symptom #2: deal owner = meeting host ----------
-async function reconcileDealOwners(owners, { overrideStore = null, api = null, dryRun = cfg.DRY_RUN } = {}) {
+async function reconcileDealOwners(owners, { overrideStore = null, api = null, dryRun = cfg.DRY_RUN, demoRouter = getDemoRouter() } = {}) {
   const crm = api || { hub, searchAll, associations, batchRead, sleep };
   const cutoff = Date.now() - cfg.MEETING_LOOKBACK_MIN * 60000;
   const recentMeetings = await crm.searchAll("meetings", {
@@ -98,6 +106,7 @@ async function reconcileDealOwners(owners, { overrideStore = null, api = null, d
   const dealToHost = new Map();
   const dealToLatestMeeting = new Map();
   for (const dealId of activeDealIds) {
+    if (await protectDeal(dealId, demoRouter, crm)) continue;
     const p = dealProps.get(dealId) || {};
     const ownerId = p.hubspot_owner_id ? String(p.hubspot_owner_id) : null;
     const latest = latestMeetingHostDetails(dToMeetings.get(dealId) || [], meetingProps);
@@ -149,10 +158,11 @@ async function reconcileDealOwners(owners, { overrideStore = null, api = null, d
     latestMeetingToContacts.get(dealToLatestMeeting.get(String(dealId))) || [],
   ]));
   const contactIds = [...new Set([...dToContacts.values()].flat())];
-  const contactProps = await crm.batchRead("contacts", contactIds, ["email", "hubspot_owner_id", "recent_conversion_event_name", "calendly_meeting_booked"]);
+  const contactProps = await crm.batchRead("contacts", contactIds, ["email", "hubspot_owner_id", "recent_conversion_event_name", "calendly_meeting_booked", SUBMISSION_PROPERTY]);
   const contactUpdates = bookedContactOwnerUpdates(activeDealIds, dealToHost, dToContacts, contactProps);
   let contactFixed = 0;
   for (const update of contactUpdates) {
+    if (await protectContact({ id: update.contactId, properties: contactProps.get(update.contactId) }, demoRouter, { dryRun })) continue;
     if (!owners.has(update.to)) { log(`symptom#2: skip contact ${update.contactId} (${update.email}) host ${update.to} inactive/unknown`); continue; }
     log(`symptom#2: contact ${update.contactId} (${update.email}) owner (none) -> ${owners.get(update.to).name}`);
     if (!dryRun) {
@@ -174,8 +184,8 @@ function isRemovedRoundRobinOwner(ownerId) {
 
 // Existing deals and demo contacts still owned by someone removed from the roster
 // are moved onto the current roster. Every other existing owner stays put.
-async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cfg.DRY_RUN } = {}) {
-  const crm = api || { hub, searchAll, sleep };
+async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cfg.DRY_RUN, demoRouter = getDemoRouter() } = {}) {
+  const crm = api || { hub, searchAll, sleep, batchRead };
   const removed = cfg.REMOVED_ROUND_ROBIN_OWNER_IDS;
   if (!removed.length) return { checked: 0, reassigned: 0 };
 
@@ -192,12 +202,13 @@ async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cf
       { propertyName: "recent_conversion_event_name", operator: "CONTAINS_TOKEN", value: cfg.DEMO_FORM_TOKEN },
       { propertyName: "hubspot_owner_id", operator: "EQ", value: id },
     ] })),
-    properties: ["email", "hubspot_owner_id"],
+    properties: ["email", "hubspot_owner_id", SUBMISSION_PROPERTY],
     limit: 100,
   });
 
   let reassigned = 0;
   for (const deal of deals) {
+    if (await protectDeal(deal.id, demoRouter, crm)) continue;
     const from = String(deal.properties.hubspot_owner_id || "");
     if (!isRemovedRoundRobinOwner(from)) continue;
     if (cfg.CLOSED_DEAL_STAGE_IDS.includes(String(deal.properties.dealstage || ""))) continue;
@@ -218,6 +229,7 @@ async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cf
   }
 
   for (const contact of contacts) {
+    if (await protectContact(contact, demoRouter, { dryRun })) continue;
     const from = String(contact.properties.hubspot_owner_id || "");
     const email = contact.properties.email || "";
     if (!isRemovedRoundRobinOwner(from)) continue;
@@ -241,7 +253,7 @@ async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cf
 }
 
 // ---------- Symptom #1: round-robin ownerless non-booker demo contacts ----------
-async function roundRobinNonBookers(owners) {
+async function roundRobinNonBookers(owners, { demoRouter = getDemoRouter() } = {}) {
   const now = Date.now();
   const minCreate = now - cfg.CONTACT_MAX_AGE_DAYS * 86400000;
   const maxCreate = now - cfg.CONTACT_MIN_AGE_MIN * 60000; // grace period to allow a booking to land first
@@ -253,7 +265,7 @@ async function roundRobinNonBookers(owners) {
       { propertyName: "hubspot_owner_id", operator: "NOT_HAS_PROPERTY" },
     ] }],
     sorts: [{ propertyName: "createdate", direction: "ASCENDING" }],
-    properties: ["email", "createdate", "hubspot_owner_id"],
+    properties: ["email", "createdate", "hubspot_owner_id", SUBMISSION_PROPERTY],
     limit: 100,
   });
   if (!contacts.length) { log("symptom#1: no ownerless demo contacts in window"); return { checked: 0, assigned: 0 }; }
@@ -263,6 +275,7 @@ async function roundRobinNonBookers(owners) {
 
   let assigned = 0;
   for (const c of contacts) {
+    if (await protectContact(c, demoRouter, { dryRun: cfg.DRY_RUN })) continue;
     const id = String(c.id);
     const email = c.properties.email || "";
     if (cfg.INTERNAL_EMAIL_RE.test(email)) { log(`symptom#1: skip internal ${email}`); continue; }
@@ -284,10 +297,12 @@ async function roundRobinNonBookers(owners) {
 async function runCycle(overrideStore = null) {
   log(`reconciler start | DRY_RUN=${cfg.DRY_RUN} | pipeline=${cfg.ACTIVE_PIPELINE}`);
   const owners = await getOwners();
-  const s2 = await reconcileDealOwners(owners, { overrideStore });
+  const router = getDemoRouter();
+  const routed = await reconcileRoutedSubmissions(router, { searchAll }, { dryRun: cfg.DRY_RUN });
+  const s2 = await reconcileDealOwners(owners, { overrideStore, demoRouter: router });
   const s1 = await roundRobinNonBookers(owners);
   const removed = await reassignRemovedRoundRobinOwners(owners);
-  log(`reconciler done | symptom#2 checked=${s2.checked} fixed=${s2.fixed} contactChecked=${s2.contactChecked || 0} contactFixed=${s2.contactFixed || 0} | symptom#1 checked=${s1.checked} assigned=${s1.assigned} | removed-owner checked=${removed.checked} reassigned=${removed.reassigned}`);
+  log(`reconciler done | routed checked=${routed.checked} protected=${routed.protected} | symptom#2 checked=${s2.checked} fixed=${s2.fixed} contactChecked=${s2.contactChecked || 0} contactFixed=${s2.contactFixed || 0} | symptom#1 checked=${s1.checked} assigned=${s1.assigned} | removed-owner checked=${removed.checked} reassigned=${removed.reassigned}`);
   return { s1, s2, removed };
 }
 

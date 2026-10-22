@@ -36,6 +36,7 @@ const Anthropic = require('@anthropic-ai/sdk').default;
 const { google } = require('googleapis');
 const {
   handleCalendlyHubSpotWebhook,
+  calendlyRequest,
 } = require('./calendly_hubspot');
 const {
   runLeadStatusSync,
@@ -44,6 +45,11 @@ const {
   createPostgresSlackStateStore,
 } = require('./slack_state_store');
 const { DemoNotificationStore, handleHubSpotDemoWebhook } = require('./hubspot_demo');
+const { createDemoRouter, routingEnabled } = require('./demo-routing');
+const { handleDemoRoutingRequest } = require('./demo-routing-http');
+const { DemoBookingStore } = require('./demo-booking-store');
+const { startDemoRoutingRecovery } = require('./demo-routing-recovery');
+const { verifyOwnerRegistry } = require('./demo-routing-readiness');
 const {
   buildMqlDiscoveryReport,
   formatMqlDiscoveryReport,
@@ -172,17 +178,7 @@ const TRUEWIND_HUBSPOT = {
   },
 };
 
-const DEFAULT_SLACK_TO_HUBSPOT_OWNER = {
-  U0ATZSNCE5T: { id: '91143842', name: 'Jenilee Chen' },
-  U0AURH4KMRN: { id: '91143844', name: 'Brendan Moody' },
-  U0AKMHVCJMA: { id: '89305622', name: 'Xavier Marco' },
-  U09QC3B292R: { id: '84547076', name: 'Sarah Elix' },
-  U04BPMPR29G: { id: '559564379', name: 'Alex Lee' },
-  U0B4MRN83FE: { id: '92555980', name: 'Amy Vetter' },
-  U0BAMU9DYR4: { id: '93961770', name: 'Andrew Moyer' },
-  U0BARRLR6Q1: { id: '93961773', name: 'Ari Nachman' },
-  U0ABULY5TEK: { id: '91143842', name: 'Jenilee Chen' },
-};
+const { DEFAULT_SLACK_TO_HUBSPOT_OWNER } = require('./slack-owner-map');
 
 function parseSlackOwnerMap() {
   const raw = process.env.SLACK_TO_HUBSPOT_OWNER_JSON || process.env.SLACK_USER_TO_HUBSPOT_OWNER_JSON || '';
@@ -251,6 +247,8 @@ let slackStateStore = createPostgresSlackStateStore({
   connectionString: process.env.DEAL_OWNER_OVERRIDE_DATABASE_URL || process.env.SLACK_STATE_DATABASE_URL,
 });
 let demoNotificationStore = null;
+let demoRouter = null;
+let demoBookingStore = null;
 let slackBotUserIdPromise = null;
 
 function resolveSlackEventTransport(value = process.env.SLACK_EVENT_TRANSPORT) {
@@ -6166,9 +6164,13 @@ function startHttpServer() {
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = Number(process.env.PORT || 3000);
   const server = http.createServer(async (req, res) => {
+    if (req.url.split('?')[0] === '/internal/demo-routing/resolve') {
+      await handleDemoRoutingRequest(req, res, { router: demoRouter });
+      return;
+    }
     if (req.url.split('?')[0] === '/api/webhooks/hubspot') {
       await handleHubSpotDemoWebhook(req, res, {
-        env: process.env, store: demoNotificationStore, hubspotRequest, logger: console,
+        env: process.env, store: demoNotificationStore, hubspotRequest, logger: console, demoRouter,
       });
       return;
     }
@@ -6311,6 +6313,7 @@ function startHttpServer() {
       try {
         await handleCalendlyHubSpotWebhook(req, res, {
           logger: console,
+          demoRouter, demoBookingStore,
           slackClient: app.client,
           slackToken: process.env.SLACK_BOT_TOKEN,
           slackChannel: process.env.CALENDLY_DEMO_SLACK_CHANNEL_ID || process.env.CALENDLY_DEMO_SLACK_CHANNEL,
@@ -6523,6 +6526,22 @@ async function startSlackBot() {
     demoNotificationStore = new DemoNotificationStore(slackStateStore.pool);
     await demoNotificationStore.initialize();
     console.log('HubSpot demo webhook ready: #slack-testing');
+  }
+
+  if (process.env.DEMO_ROUTING_ENABLED === 'true' || process.env.DEMO_ROUTING_ACTIVATED_AT) {
+    if (!slackStateStore?.pool) throw new Error('Demo routing requires the Slack state database');
+    if (process.env.DEMO_ROUTING_ENABLED === 'true' && (!routingEnabled(process.env) || !demoNotificationStore)) {
+      throw new Error('Demo routing requires a valid activation timestamp and enabled demo webhook');
+    }
+    demoRouter = createDemoRouter({ request: hubspotRequestFromFetchOptions });
+    await demoRouter.validateCoverage();
+    if (routingEnabled(process.env)) await verifyOwnerRegistry({ registry: demoRouter.registry,
+      hubspotRequest: hubspotRequestFromFetchOptions, calendlyRequest, slackClient: app.client,
+      trustedSlackOwnerMap: HUBSPOT_OWNER_TO_SLACK_USER });
+    demoBookingStore = new DemoBookingStore(slackStateStore.pool);
+    await demoBookingStore.initialize();
+    if (routingEnabled(process.env)) startDemoRoutingRecovery({ env: process.env, store: demoNotificationStore,
+      hubspotRequest, demoRouter, logger: console });
   }
 
   // HTTP server (health check + webhook routes) runs in every role. Webhook routes

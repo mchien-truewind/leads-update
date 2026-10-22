@@ -26,6 +26,7 @@ if (fs.existsSync(envPath)) {
 const cfg = require('./gtm_ops/config');
 const { runCycle } = require('./gtm_ops/reconciler');
 const { CONFIG } = require('./calendly_hubspot');
+const { createDemoRouter, routingEnabled } = require('./demo-routing');
 const { createPostgresSlackStateStore } = require('./slack_state_store');
 
 const overrideStore = createPostgresSlackStateStore({
@@ -112,6 +113,11 @@ async function main() {
     await overrideStore.initialize();
     overrideStoreReady = true;
     log('deal owner override database: ready');
+  }
+  if (process.env.DEMO_ROUTING_ENABLED === 'true') {
+    if (!routingEnabled()) throw new Error('Invalid demo routing activation timestamp');
+    const { hub } = require('./gtm_ops/hubspot');
+    await createDemoRouter({ request: (path, options = {}) => hub(options.method || 'GET', path, options.body) }).validateCoverage();
   }
   log(`worker start | DRY_RUN=${cfg.DRY_RUN} | every ${INTERVAL_MIN}min | pipeline=${cfg.ACTIVE_PIPELINE}`);
   log(`HubSpot: ${process.env.HUBSPOT_PRIVATE_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);

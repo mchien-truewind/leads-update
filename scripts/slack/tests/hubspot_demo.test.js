@@ -4,6 +4,7 @@ const { Readable } = require('node:stream');
 const { before, beforeEach, after, test } = require('node:test');
 const { PGlite } = require('@electric-sql/pglite');
 const { DemoNotificationStore, isDemoEvent, eventKey, buildMessage, processEvent, handleHubSpotDemoWebhook } = require('../hubspot_demo');
+const { recoverDemoNotifications } = require('../demo-routing-recovery');
 
 const event = {
   appId: 31714623, eventId: 100, subscriptionId: 8149441, portalId: 43974586,
@@ -179,4 +180,63 @@ test('user text cannot inject mentions, blank dates stay blank, and dates use Ea
   assert.ok(message.text.endsWith('- Date Created: 10/13/26'));
   assert.ok(buildMessage({ ...contact, properties: { ...contact.properties, createdate: null } }).text.endsWith('- Date Created: '));
   assert.throws(() => buildMessage({ ...contact, id: '123/other' }), /invalid_contact_id/);
+});
+
+test('future submissions notify the deal owner after reconciliation and persist routing context', async () => {
+  const routing = { status: 'existing_deal', contactId: '123', companyId: '20', dealId: '30',
+    ownerId: '40', ownerName: 'Deal Owner', slackUserId: 'UOWNER', calendlyUrl: 'https://calendly.com/owner/intro' };
+  let alignments = 0;
+  const deps = dependencies({
+    env: { ...env, DEMO_ROUTING_ENABLED: 'true', DEMO_ROUTING_ACTIVATED_AT: '2026-10-13T00:00:00Z' },
+    demoRouter: { async alignContact(input) {
+      assert.equal(input.contactId, '123'); alignments++; return routing;
+    } },
+  });
+  assert.equal((await webhook([event], deps)).body.sent, 1);
+  assert.equal(alignments, 2);
+  assert.ok(deps.messages[0].text.startsWith('<@UOWNER>\nDEMO Submission — existing opportunity'));
+  assert.ok(deps.messages[0].text.includes('/record/0-3/30'));
+  assert.ok(!deps.messages[0].text.includes('<@U0ABULY5TEK>'));
+  assert.deepEqual((await store.get(eventKey(event))).routing, routing);
+  assert.equal((await webhook([event], deps)).body.duplicates, 1);
+});
+
+test('historical submissions bypass ownership correction even when routing is enabled', async () => {
+  const deps = dependencies({ env: { ...env, DEMO_ROUTING_ENABLED: 'true', DEMO_ROUTING_ACTIVATED_AT: '2026-10-22T00:00:00Z' },
+    demoRouter: { async alignContact() { throw new Error('must not modify historical contacts'); } } });
+  assert.equal((await webhook([event], deps)).body.sent, 1);
+  assert.ok(deps.messages[0].text.startsWith('<@U0ABULY5TEK>'));
+});
+
+test('matched submission without an owner Slack mapping retries instead of using the fixed recipient', async () => {
+  const route = { status: 'existing_deal', contactId: '123', dealId: '30', ownerId: '40', slackUserId: null };
+  const deps = dependencies({ env: { ...env, DEMO_ROUTING_ENABLED: 'true', DEMO_ROUTING_ACTIVATED_AT: '2026-10-13T00:00:00Z' },
+    demoRouter: { async alignContact() { return route; } } });
+  assert.equal((await webhook([event], deps)).status, 503);
+  assert.equal(deps.messages.length, 0);
+  assert.equal((await store.get(eventKey(event))).status, 'pending');
+  route.slackUserId = 'UOWNER';
+  assert.equal((await webhook([event], deps)).body.sent, 1);
+  assert.ok(deps.messages[0].text.startsWith('<@UOWNER>'));
+});
+
+test('routing failure retries before notifying instead of distributing a new lead', async () => {
+  const deps = dependencies({ env: { ...env, DEMO_ROUTING_ENABLED: 'true', DEMO_ROUTING_ACTIVATED_AT: '2026-10-13T00:00:00Z' },
+    demoRouter: { async alignContact() { return { status: 'unresolved', reason: 'hubspot_lookup_failed' }; } } });
+  assert.equal((await webhook([event], deps)).status, 503);
+  assert.equal(deps.messages.length, 0);
+  assert.equal((await store.get(eventKey(event))).status, 'pending');
+});
+
+test('pending routing notifications recover after provider retries stop, without historical replay', async () => {
+  const deps = dependencies({ env: { ...env, DEMO_ROUTING_ENABLED: 'true', DEMO_ROUTING_ACTIVATED_AT: '2026-10-13T00:00:00Z' },
+    demoRouter: { async alignContact() { return { status: 'no_open_deal' }; } } });
+  await store.record(event);
+  const historical = { ...event, occurredAt: 1, propertyValue: '1' };
+  await store.record(historical);
+  await db.exec("UPDATE hubspot_demo_notifications SET updated_at = NOW() - INTERVAL '1 minute'");
+  await recoverDemoNotifications(deps);
+  assert.equal(deps.messages.length, 1);
+  assert.equal((await store.get(eventKey(event))).status, 'completed');
+  assert.equal((await store.get(eventKey(historical))).status, 'pending');
 });

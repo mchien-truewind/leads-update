@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { appliesToSubmission } = require('./demo-routing');
 
 const PORTAL_ID = 43974586;
 const APP_ID = 31714623;
@@ -39,16 +40,19 @@ function formatCreatedDate(value) {
   }).format(date);
 }
 
-function buildMessage(contact) {
+function buildMessage(contact, routing = null) {
   if (!/^\d+$/.test(String(contact.id))) throw new Error('invalid_contact_id');
+  if (routing?.status === 'existing_deal' && !routing.slackUserId) throw new Error('demo_owner_notification_mapping_missing');
   const p = contact.properties || {};
   const text = [
-    `<@${MENTION_ID}>`, 'New DEMO Submission',
+    `<@${routing?.slackUserId || MENTION_ID}>`, routing?.status === 'existing_deal' ? 'DEMO Submission — existing opportunity' : 'New DEMO Submission',
     escapeSlack([p.firstname, p.lastname].filter(Boolean).join(' ')), escapeSlack(p.email),
     `- ERP: ${escapeSlack(p.erp)}`, `- Job Title: ${escapeSlack(p.jobtitle)}`,
     `- How did you hear about us? ${escapeSlack(p.how_did_you_hear_about_us)}`,
     `- Finance team size: ${escapeSlack(p.finance_team_size)}`, `- Phone: ${escapeSlack(p.phone)}`,
     `- Date Created: ${formatCreatedDate(p.createdate)}`,
+    ...(routing?.status === 'existing_deal' ? [`- Existing deal: <https://app.hubspot.com/contacts/${PORTAL_ID}/record/0-3/${routing.dealId}|View opportunity>`, `- Deal owner: ${escapeSlack(routing.ownerName || routing.ownerId)}`] : []),
+    ...(routing && !routing.calendlyUrl && routing.status === 'existing_deal' ? ['- Routing needs attention: personal calendar mapping unavailable; general calendar fallback.'] : []),
   ].join('\n');
   if (text.length > 3000) throw new Error('demo_message_too_long');
   return {
@@ -79,6 +83,8 @@ class DemoNotificationStore {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
+    await this.pool.query('ALTER TABLE hubspot_demo_notifications ADD COLUMN IF NOT EXISTS routing JSONB');
+    await this.pool.query("CREATE INDEX IF NOT EXISTS hubspot_demo_notifications_recovery_idx ON hubspot_demo_notifications (updated_at) WHERE status IN ('pending', 'processing')");
   }
 
   async record(event) {
@@ -113,6 +119,21 @@ class DemoNotificationStore {
     if (result.rowCount !== 1) throw new Error('demo_claim_lost');
   }
 
+  async saveRouting(claim, routing) {
+    const result = await this.pool.query(`UPDATE hubspot_demo_notifications SET routing = $3::jsonb, updated_at = NOW()
+      WHERE event_key = $1 AND claim_token = $2 AND status = 'processing' RETURNING event_key`,
+    [claim.event_key, claim.claim_token, JSON.stringify(routing)]);
+    if (result.rowCount !== 1) throw new Error('demo_claim_lost');
+  }
+
+  async retryableEvents(activatedAt) {
+    return (await this.pool.query(`SELECT event_key, event FROM hubspot_demo_notifications
+      WHERE (event->>'occurredAt')::bigint >= $1 AND (
+        (status = 'pending' AND updated_at < NOW() - INTERVAL '30 seconds')
+        OR (status = 'processing' AND updated_at < NOW() - INTERVAL '2 minutes')
+      ) ORDER BY updated_at LIMIT 25`, [activatedAt])).rows;
+  }
+
   async quarantineStaleSend(key) {
     const result = await this.pool.query(`UPDATE hubspot_demo_notifications
       SET status = 'needs_review', last_error = 'slack_delivery_unknown', updated_at = NOW()
@@ -128,7 +149,7 @@ function retryError(code) {
   return error;
 }
 
-async function processEvent(event, { store, hubspotRequest, env, fetchImpl = fetch, logger = console }) {
+async function processEvent(event, { store, hubspotRequest, env, fetchImpl = fetch, logger = console, demoRouter = null }) {
   const key = await store.record(event);
   const claim = await store.claim(key);
   if (!claim) {
@@ -147,7 +168,19 @@ async function processEvent(event, { store, hubspotRequest, env, fetchImpl = fet
   try {
     const contact = await hubspotRequest(`/crm/v3/objects/contacts/${event.objectId}?properties=${CONTACT_PROPERTIES.join(',')}`);
     if (String(contact.id) !== String(event.objectId)) throw new Error('contact_id_mismatch');
-    const message = buildMessage(contact);
+    let routing = null;
+    if (demoRouter && appliesToSubmission(event.propertyValue, env)) {
+      routing = await demoRouter.alignContact({ email: contact.properties.email, contactId: String(contact.id) });
+      await store.saveRouting(claim, routing);
+      if (routing.status === 'unresolved') throw retryError('demo_routing_unresolved');
+      if (routing.status === 'existing_deal') {
+        // Do not notify from a routing snapshot captured before contact reconciliation.
+        routing = await demoRouter.alignContact({ email: contact.properties.email, contactId: String(contact.id) });
+        await store.saveRouting(claim, routing);
+        if (routing.status !== 'existing_deal') throw retryError('demo_routing_changed');
+      }
+    }
+    const message = buildMessage(contact, routing);
     // Commit intent before the external write. A crashed/ambiguous send is
     // quarantined, never automatically replayed into a duplicate Slack post.
     await store.save(claim, { status: 'processing', phase: 'sending' });

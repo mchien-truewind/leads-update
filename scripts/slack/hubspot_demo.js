@@ -42,6 +42,7 @@ function formatCreatedDate(value) {
 
 function buildMessage(contact, routing = null) {
   if (!/^\d+$/.test(String(contact.id))) throw new Error('invalid_contact_id');
+  if (routing?.status === 'existing_deal' && !routing.slackUserId) throw new Error('demo_owner_notification_mapping_missing');
   const p = contact.properties || {};
   const text = [
     `<@${routing?.slackUserId || MENTION_ID}>`, routing?.status === 'existing_deal' ? 'DEMO Submission — existing opportunity' : 'New DEMO Submission',

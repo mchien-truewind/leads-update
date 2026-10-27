@@ -33,6 +33,7 @@ function fixture({ status = 'existing_deal', ownerId = '40' } = {}) {
     getOrganizerName: () => 'Actual Host',
     async findContactByEmail() { return { id: '10' }; },
     async ensureContact(input) { writes.push({ kind: 'contact', ...input }); return { id: '10' }; },
+    async findDealByCalendlyIdentifiers() { return null; },
     async findMeetingByCalendlyIdentifiers({ inviteeUri }) { return meetings.get(inviteeUri); },
     async createMeeting(input) {
       writes.push({ kind: 'meeting', ...input });
@@ -141,4 +142,33 @@ test('booking identity cannot be overwritten by a later selection', async () => 
   await routeBooking(f.input);
   await assert.rejects(store.put({ inviteeUri: f.input.payload.uri, eventUri: f.input.payload.event,
     contactId: '10', dealId: '31', reusedExistingDeal: true }), /booking_link_conflict/);
+});
+
+test('provider deal identifiers win before account resolution when local linkage is absent', async () => {
+  for (const rescheduled of [false, true]) {
+    const f = fixture();
+    if (rescheduled) f.input.payload.old_invitee = 'https://api.calendly.com/scheduled_events/old/invitees/old';
+    f.input.api.findDealByCalendlyIdentifiers = async input => {
+      assert.equal(input.inviteeUri, rescheduled ? f.input.payload.old_invitee : f.input.payload.uri);
+      return { id: '31' };
+    };
+    f.router.resolve = async () => { throw new Error('must preserve identifier match'); };
+    for (const eventName of ['invitee.created', 'invitee.canceled']) {
+      assert.equal(await routeBooking({ ...f.input, eventName }), null);
+      assert.equal(await store.get(f.input.payload.uri), null);
+    }
+    assert.equal(f.writes.length, 0);
+  }
+});
+
+test('missing owner notification mapping stays pending and never sends to another recipient', async () => {
+  const f = fixture();
+  f.route.slackUserId = null;
+  await assert.rejects(routeBooking(f.input), /notification_mapping_missing/);
+  assert.equal(f.alerts.length, 0);
+  assert.equal((await store.get(f.input.payload.uri)).notification_state, 'pending');
+  f.route.slackUserId = 'UOWNER';
+  await routeBooking(f.input);
+  assert.equal(f.meetings.size, 1);
+  assert.equal(f.alerts.length, 1);
 });

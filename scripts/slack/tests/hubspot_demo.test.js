@@ -208,6 +208,18 @@ test('historical submissions bypass ownership correction even when routing is en
   assert.ok(deps.messages[0].text.startsWith('<@U0ABULY5TEK>'));
 });
 
+test('matched submission without an owner Slack mapping retries instead of using the fixed recipient', async () => {
+  const route = { status: 'existing_deal', contactId: '123', dealId: '30', ownerId: '40', slackUserId: null };
+  const deps = dependencies({ env: { ...env, DEMO_ROUTING_ENABLED: 'true', DEMO_ROUTING_ACTIVATED_AT: '2026-10-13T00:00:00Z' },
+    demoRouter: { async alignContact() { return route; } } });
+  assert.equal((await webhook([event], deps)).status, 503);
+  assert.equal(deps.messages.length, 0);
+  assert.equal((await store.get(eventKey(event))).status, 'pending');
+  route.slackUserId = 'UOWNER';
+  assert.equal((await webhook([event], deps)).body.sent, 1);
+  assert.ok(deps.messages[0].text.startsWith('<@UOWNER>'));
+});
+
 test('routing failure retries before notifying instead of distributing a new lead', async () => {
   const deps = dependencies({ env: { ...env, DEMO_ROUTING_ENABLED: 'true', DEMO_ROUTING_ACTIVATED_AT: '2026-10-13T00:00:00Z' },
     demoRouter: { async alignContact() { return { status: 'unresolved', reason: 'hubspot_lookup_failed' }; } } });

@@ -1074,7 +1074,7 @@ async function processCalendlyWebhook(body, options = {}) {
     const routed = await routeBooking({ eventName, payload, scheduledEvent, filter,
       options: { ...options, eventCreatedAt: body.created_at },
       api: { getInviteeUri, getScheduledEventUri, getOldInviteeUri, isRescheduled,
-        request: hubspotRequest, getOrganizerName, findContactByEmail, ensureContact, findMeetingByCalendlyIdentifiers,
+        request: hubspotRequest, getOrganizerName, findContactByEmail, ensureContact, findDealByCalendlyIdentifiers, findMeetingByCalendlyIdentifiers,
         createMeeting, associate, postBookedDemoSlackAlert } });
     if (routed) return routed;
     if (options.demoBookingStore) {

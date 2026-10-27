@@ -19,6 +19,15 @@ async function routeBooking({ eventName, payload, scheduledEvent, filter, option
   // Persisted links stay protected even if the feature is subsequently disabled.
   if (!prior?.reused_existing_deal && !appliesToSubmission(submissionTime, router.env)) return null;
 
+  // Provider identifiers take precedence over account matching. A prior legacy
+  // booking may have created its deal before persisting its local linkage.
+  // Reclassifying that deal on retry would change its cancellation semantics.
+  if (!prior) {
+    const identifiedDeal = (oldInviteeUri && await api.findDealByCalendlyIdentifiers({ inviteeUri: oldInviteeUri, eventUri: '' }))
+      || await api.findDealByCalendlyIdentifiers({ inviteeUri, eventUri });
+    if (identifiedDeal) return null;
+  }
+
   if (eventName === 'invitee.canceled') {
     if (!link?.reused_existing_deal) {
       // A cancel can precede creation. Never run the legacy close-lost mutation
@@ -71,6 +80,7 @@ async function routeBooking({ eventName, payload, scheduledEvent, filter, option
   // Check the owner again immediately before the external notification.
   route = await router.alignContact({ email: payload.email, contactId: String(contact.id), dealId: link.deal_id });
   if (route.status !== 'existing_deal') throw new Error('booking_owner_reconciliation_failed');
+  if (!api.isRescheduled(payload) && !route.slackUserId) throw new Error('booking_owner_notification_mapping_missing');
   if (!api.isRescheduled(payload) && await store.claimNotification(inviteeUri)) {
     // Ambiguous sends remain 'sending' for review, never automatically reposted.
     try {

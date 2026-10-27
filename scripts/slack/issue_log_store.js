@@ -11,9 +11,11 @@ class IssueLogStore {
       status TEXT NOT NULL CHECK (status IN ('clarifying', 'reserved', 'completed')),
       sheet_row INTEGER UNIQUE CHECK (sheet_row > 1),
       cells JSONB,
+      issue_rows JSONB,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (channel_id, thread_ts)
     )`);
+    await this.pool.query('ALTER TABLE slack_issue_log_requests ADD COLUMN IF NOT EXISTS issue_rows JSONB');
   }
 
   async withLock(fn) {
@@ -29,13 +31,15 @@ class IssueLogStore {
         },
         clarify: async (channel, thread, requester) => {
           await client.query(`INSERT INTO slack_issue_log_requests (channel_id,thread_ts,requester_id,status)
-            VALUES ($1,$2,$3,'clarifying') ON CONFLICT (channel_id,thread_ts) DO NOTHING`, [channel, thread, requester]);
+            VALUES ($1,$2,$3,'clarifying') ON CONFLICT (channel_id,thread_ts) DO UPDATE SET
+              requester_id=EXCLUDED.requester_id,status='clarifying',sheet_row=NULL,cells=NULL,issue_rows=NULL,updated_at=NOW()
+              WHERE slack_issue_log_requests.status='completed'`, [channel, thread, requester]);
         },
-        reserve: async (channel, thread, requester, nextRow, cells) => {
-          const r = await client.query(`INSERT INTO slack_issue_log_requests (channel_id,thread_ts,requester_id,status,sheet_row,cells)
-            VALUES ($1,$2,$3,'reserved',GREATEST($4,(SELECT COALESCE(MAX(sheet_row),1)+1 FROM slack_issue_log_requests)),$5::jsonb)
-            ON CONFLICT (channel_id,thread_ts) DO UPDATE SET status='reserved',sheet_row=EXCLUDED.sheet_row,cells=EXCLUDED.cells,updated_at=NOW()
-            RETURNING *`, [channel, thread, requester, nextRow, JSON.stringify(cells)]);
+        reserve: async (channel, thread, requester, nextRow, rows) => {
+          const r = await client.query(`INSERT INTO slack_issue_log_requests (channel_id,thread_ts,requester_id,status,sheet_row,cells,issue_rows)
+            VALUES ($1,$2,$3,'reserved',GREATEST($4,(SELECT COALESCE(MAX(sheet_row+COALESCE(jsonb_array_length(issue_rows),1)-1),1)+1 FROM slack_issue_log_requests)),$5::jsonb,$6::jsonb)
+            ON CONFLICT (channel_id,thread_ts) DO UPDATE SET requester_id=EXCLUDED.requester_id,status='reserved',sheet_row=EXCLUDED.sheet_row,cells=EXCLUDED.cells,issue_rows=EXCLUDED.issue_rows,updated_at=NOW()
+            RETURNING *`, [channel, thread, requester, nextRow, JSON.stringify(rows[0]), JSON.stringify(rows)]);
           return r.rows[0];
         },
         complete: async (channel, thread) => {

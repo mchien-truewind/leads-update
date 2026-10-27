@@ -90,6 +90,26 @@ test('closed or archived deals do not block new-lead behavior', async () => {
   }
 });
 
+test('durably linked bookings retain closed or moved deals without changing stage or deal owner', async () => {
+  for (const movedPipeline of [false, true]) {
+    const f = fixture();
+    f.state.deals[0].properties.dealstage = 'won';
+    if (movedPipeline) f.state.deals[0].properties.pipeline = 'another-pipeline';
+    f.state.associations['companies/20/deals'] = [];
+    assert.equal((await f.router.resolve({ email: f.state.contact.properties.email })).status, 'no_open_deal');
+    const result = await f.router.alignContact({ email: f.state.contact.properties.email, contactId: '10', dealId: '30' });
+    assert.equal(result.status, 'existing_deal');
+    assert.equal(result.reason, 'linked_booking_deal');
+    assert.equal(result.dealId, '30');
+    assert.equal(result.ownerId, '40');
+    assert.equal(f.state.contact.properties.hubspot_owner_id, '40');
+    assert.equal(f.state.deals[0].properties.dealstage, 'won');
+    assert.ok(f.state.writes.every(w => !w.path.startsWith('/crm/v3/objects/deals')));
+    f.state.deals[0].archived = true;
+    assert.equal((await f.router.resolve({ email: f.state.contact.properties.email, dealId: '30' })).status, 'no_open_deal');
+  }
+});
+
 test('duplicate contacts and ambiguous company domains fail closed', async () => {
   const duplicate = fixture({ duplicateContacts: true });
   assert.equal((await duplicate.router.resolve({ email: 'person@bessemer.com' })).reason, 'ambiguous_contacts');

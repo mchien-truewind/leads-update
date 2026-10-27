@@ -3,6 +3,7 @@ const { test, before, after, beforeEach } = require('node:test');
 const { PGlite } = require('@electric-sql/pglite');
 const { DemoBookingStore } = require('../demo-booking-store');
 const { routeBooking } = require('../demo-routing-bookings');
+const { createDemoRouter } = require('../demo-routing');
 
 let db;
 let store;
@@ -171,4 +172,47 @@ test('missing owner notification mapping stays pending and never sends to anothe
   await routeBooking(f.input);
   assert.equal(f.meetings.size, 1);
   assert.equal(f.alerts.length, 1);
+});
+
+test('rescheduling a closed linked opportunity records one replacement meeting and preserves the deal', async () => {
+  const f = fixture();
+  const deal = { id: '30', archived: false, properties: { pipeline: '105321581', dealstage: 'open',
+    hubspot_owner_id: '40', hs_lastmodifieddate: '2026-10-23T00:00:00Z' } };
+  const contact = { id: '10', properties: { email: f.input.payload.email, hubspot_owner_id: '40' } };
+  const crmWrites = [];
+  f.input.options.demoRouter = createDemoRouter({
+    env: { ...f.router.env, DEMO_ROUTING_OWNERS_JSON: JSON.stringify([{ ownerId: '40', slackUserId: 'UOWNER',
+      calendlyUrl: 'https://calendly.com/deal-owner/intro', hostUris: ['https://api.calendly.com/users/owner'],
+      eventTypeUris: ['https://api.calendly.com/event_types/intro'] }]) },
+    request: async (path, options = {}) => {
+      if (options.method === 'PUT' || options.method === 'PATCH') { crmWrites.push({ path, ...options }); return {}; }
+      if (path.endsWith('/contacts/search')) return { results: [contact] };
+      if (path.includes('/contacts/10/associations/companies')) return { results: [{ toObjectId: '20' }] };
+      if (path.includes('/associations/deals')) return { results: [{ toObjectId: '30' }] };
+      if (path.includes('/pipelines/')) return { stages: [{ id: 'open', metadata: { isClosed: false } }, { id: 'won', metadata: { isClosed: true } }] };
+      if (path.endsWith('/deals/batch/read')) return { results: [structuredClone(deal)] };
+      if (path.includes('/objects/deals/30?')) return structuredClone(deal);
+      if (path.includes('/objects/contacts/10?')) return contact;
+      if (path.includes('/owners/40')) return { id: '40', archived: false, firstName: 'Deal', lastName: 'Owner' };
+      throw new Error('unexpected CRM request');
+    },
+  });
+  const first = await routeBooking(f.input);
+  deal.properties.dealstage = 'won';
+  deal.properties.pipeline = 'closed-pipeline';
+  const payload = { ...f.input.payload, uri: `${f.input.payload.uri}-rescheduled`,
+    old_invitee: f.input.payload.uri, rescheduled: true };
+  const second = await routeBooking({ ...f.input, payload });
+  const replay = await routeBooking({ ...f.input, payload });
+  assert.equal(second.dealId, first.dealId);
+  assert.notEqual(second.meetingId, first.meetingId);
+  assert.equal(replay.meetingId, second.meetingId);
+  assert.equal(f.meetings.size, 2);
+  assert.equal(f.alerts.length, 1);
+  assert.equal(deal.properties.dealstage, 'won');
+  assert.equal(deal.properties.pipeline, 'closed-pipeline');
+  assert.equal(deal.properties.hubspot_owner_id, '40');
+  assert.ok(crmWrites.every(w => !w.path.startsWith('/crm/v3/objects/deals')));
+  assert.ok(f.writes.some(w => w.path === `/crm/v3/objects/meetings/${first.meetingId}` && w.body.properties.hs_meeting_outcome === 'RESCHEDULED'));
+  assert.equal((await store.get(payload.uri)).deal_id, '30');
 });

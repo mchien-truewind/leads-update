@@ -111,7 +111,8 @@ function createDemoRouter({ request, env = process.env, logger = console, now = 
     let context = {};
     try {
       const normalized = String(email || '').trim().toLowerCase();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized) || (contactId && !/^\d+$/.test(String(contactId)))) throw new Error('invalid_routing_input');
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized) || (contactId && !/^\d+$/.test(String(contactId)))
+        || (dealId && !/^\d+$/.test(String(dealId)))) throw new Error('invalid_routing_input');
       // Always search by email, even when given an ID, to detect duplicate matches.
       let contact = await search('contacts', 'email', normalized);
       if (contactId && contact && String(contact.id) !== String(contactId)) throw new Error('contact_identity_mismatch');
@@ -136,8 +137,13 @@ function createDemoRouter({ request, env = process.env, logger = console, now = 
           if (!dealCompanies.has(id)) dealCompanies.set(id, companyId);
         }
       }
-      const stages = await openStages();
-      const deals = (await readDeals([...ids])).filter(d => !d.archived && d.properties?.pipeline === PIPELINE_ID && stages.has(d.properties.dealstage));
+      // dealId is supplied only by the internal booking handler from its durable
+      // linkage, never by the HTTP endpoint. Lifecycle events must keep that
+      // opportunity even after sales closes it or moves it to another pipeline.
+      if (dealId) ids.add(String(dealId));
+      const stages = dealId ? null : await openStages();
+      const deals = (await readDeals(dealId ? [String(dealId)] : [...ids])).filter(d => !d.archived
+        && (dealId ? String(d.id) === String(dealId) : d.properties?.pipeline === PIPELINE_ID && stages.has(d.properties.dealstage)));
       for (const deal of deals) {
         if (!/^\d+$/.test(String(deal.id)) || !Number.isFinite(timestamp(deal.properties.hs_lastmodifieddate))) throw new Error('invalid_deal_metadata');
       }
@@ -154,7 +160,7 @@ function createDemoRouter({ request, env = process.env, logger = console, now = 
       const route = registry.get(ownerId);
       return { status: 'existing_deal', ...context, calendlyUrl: route?.calendlyUrl || null,
         slackUserId: route?.slackUserId || null, ownerName: `${owner.firstName || ''} ${owner.lastName || ''}`.trim(),
-        reason: route ? 'latest_modified_open_deal' : 'missing_owner_mapping' };
+        reason: route ? (dealId ? 'linked_booking_deal' : 'latest_modified_open_deal') : 'missing_owner_mapping' };
     } catch (error) {
       // Only expose known categorical reasons. Provider error messages can contain CRM data.
       const reason = /^(ambiguous_|invalid_|inactive_|missing_|contact_identity|incomplete_)/.test(error.message) ? error.message : 'hubspot_lookup_failed';
@@ -169,7 +175,8 @@ function createDemoRouter({ request, env = process.env, logger = console, now = 
       const route = await resolve(input);
       if (route.status !== 'existing_deal' || !route.contactId) return route;
       const current = await request(`/crm/v3/objects/deals/${route.dealId}?properties=hubspot_owner_id,dealstage,pipeline`);
-      if (current.properties?.hubspot_owner_id !== route.ownerId || current.properties?.pipeline !== PIPELINE_ID || !(await openStages()).has(current.properties?.dealstage)) continue;
+      if (current.archived || current.properties?.hubspot_owner_id !== route.ownerId) continue;
+      if (!input.dealId && (current.properties?.pipeline !== PIPELINE_ID || !(await openStages()).has(current.properties?.dealstage))) continue;
       if (route.companyId) await request(`/crm/v4/objects/contacts/${route.contactId}/associations/default/companies/${route.companyId}`, { method: 'PUT' });
       await request(`/crm/v4/objects/contacts/${route.contactId}/associations/default/deals/${route.dealId}`, { method: 'PUT' });
       const contact = await request(`/crm/v3/objects/contacts/${route.contactId}?properties=hubspot_owner_id`);

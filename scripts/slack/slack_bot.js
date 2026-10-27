@@ -3,6 +3,8 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
+const { IssueLogStore } = require('./issue_log_store');
+const { ISSUE_SHEET, createIssueLogger, readIssueThread, analyzeIssue } = require('./issue_logger');
 
 // Load .env.local if it exists (local dev), otherwise use environment variables (Railway)
 const envPath = path.resolve(__dirname, '../../.env.local');
@@ -91,6 +93,16 @@ oauth2Client.setCredentials({
   refresh_token: tokenData.refresh_token,
 });
 const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+// Keep the issue sheet's service account separate from existing Google OAuth tools.
+const issueLogCredentials = process.env.GOOGLE_ISSUE_LOG_SERVICE_ACCOUNT_JSON;
+const issueLogSheets = issueLogCredentials ? google.sheets({
+  version: 'v4',
+  auth: new google.auth.GoogleAuth({
+    credentials: JSON.parse(issueLogCredentials),
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  }),
+}) : null;
+let issueLogHandler;
 
 // ============================================================
 // HubSpot setup
@@ -3550,6 +3562,9 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
     }
 
     // --- Google Sheets ---
+    if (['append_rows', 'update_cells'].includes(name) && input.spreadsheet_id === ISSUE_SHEET) {
+      return 'Issue sheet writes must use the dedicated #leads issue logger, which checks clarification and retry safety.';
+    }
     if (name === 'read_spreadsheet') {
       const res = await sheets.spreadsheets.values.get({
         spreadsheetId: input.spreadsheet_id,
@@ -4514,6 +4529,19 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
     text_chars: cleanText.length,
     has_slack_user: Boolean(slackUserId),
   });
+
+  if (issueLogSheets && slackStateStore) {
+    if (!issueLogHandler) {
+      issueLogHandler = createIssueLogger({
+        store: new IssueLogStore(slackStateStore.pool),
+        sheets: issueLogSheets,
+        readThread: (channelId, ts) => readIssueThread(app.client,
+          [process.env.SLACK_USER_TOKEN, process.env.SLACK_BOT_TOKEN], channelId, ts),
+        analyze: input => analyzeIssue({ messages: { create: args => withRetry(() => anthropic.messages.create(args)) } }, CLAUDE_DEFAULT_MODEL, input),
+      });
+    }
+    if (await issueLogHandler({ channel, threadTs, userId: slackUserId, text: cleanText, say })) return;
+  }
 
   const structuredDeal = parseStructuredDealRequest(cleanText);
   if (structuredDeal) {
@@ -6512,6 +6540,10 @@ async function startSlackBot() {
   }
   if (slackStateStore) {
     await slackStateStore.initialize();
+    if (issueLogSheets) {
+      await new IssueLogStore(slackStateStore.pool).initialize();
+      console.log('Leads issue logger ready: channel=C05MF0R662J');
+    }
     startSlackInteractionRecoveryLoop();
     console.log('Slack durable interaction state: ready');
   }

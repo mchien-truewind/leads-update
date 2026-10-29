@@ -171,6 +171,7 @@ class Broker:
 def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time, worker=None):
     store.configure_registration(registration_id, deadline, clock())
     setup_diagnostics=set()
+    ingress_diagnostics=set()
     @asynccontextmanager
     async def lifespan(app):
         task=asyncio.create_task(worker.run()) if worker else None
@@ -200,9 +201,12 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
     @app.post('/api/sdr/webhooks/nooks')
     async def webhook(request: Request):
         raw = await body(request)
+        stage = 'signature_header'
         try:
             signature = header(request, 'x-webhook-signature', 200)
+            stage = 'private_verification'
             result = await broker.call('/v1/nooks/verify', raw, signature)
+            stage = 'durable_capture'
             outcome = await asyncio.to_thread(store.capture, result['event'], clock())
             return {'status': outcome}  # Only after SQLite commit succeeds.
         except Exception:
@@ -219,6 +223,9 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
                         setup_diagnostics.add(reason)
                         # Fixed reason codes only: no request values, headers or errors.
                         print(json.dumps({'event':'nooks_setup_rejected','reason':reason}),flush=True)
+                elif stage not in ingress_diagnostics:
+                    ingress_diagnostics.add(stage)
+                    print(json.dumps({'event': 'nooks_ingress_rejected', 'stage': stage}), flush=True)
             except Exception:
                 pass
             raise HTTPException(503, 'Event unavailable or rejected.') from None

@@ -113,7 +113,6 @@ class Store:
         fields = {'workspace_id', 'prospect_id', 'call_id', 'rep_id', 'disposition_id', 'disposition_name', 'started_at', 'finalized_at'}
         if (not isinstance(event, dict) or set(event) != fields
                 or event['workspace_id'] != self.scope['workspace_id'] or event['prospect_id'] != self.scope['prospect_id']
-                or (self.accepted_call_id is not None and event['call_id'] != self.accepted_call_id)
                 or any(not isinstance(event[k], str) or not 1 <= len(event[k]) <= 200 for k in fields-{'started_at','finalized_at'})
                 or any(type(event[k]) not in (int, float) for k in ('started_at','finalized_at'))
                 or not self.scope['not_before'] <= event['started_at'] <= event['finalized_at'] <= now+300
@@ -146,22 +145,27 @@ class Store:
 
 
 class Broker:
-    def __init__(self, url, key, *, transport=None, clock=time.time):
+    def __init__(self, url, key, *, transport=None, clock=time.time, contact_id=None):
         u = urlsplit(url)
         if (u.scheme != 'http' or not u.hostname or not re.fullmatch(r'[a-z0-9-]+\.railway\.internal', u.hostname)
                 or u.port != 8080 or u.path not in ('','/') or u.query or u.fragment or u.username or u.password):
             raise ValueError('fixed private broker URL required')
+        if contact_id is not None and (not isinstance(contact_id,str) or not re.fullmatch(r'[1-9][0-9]{0,24}',contact_id)):
+            raise ValueError('invalid private contact route')
+        self.prefix = '/contacts/'+contact_id if contact_id is not None else ''
         self.url, self.key, self.transport, self.clock = url.rstrip('/'), key, transport, clock
 
     async def call(self, path, raw=b'', nooks_signature=''):
         if path not in ('/v1/ready', '/v1/nooks/verify', '/v1/lemlist/inspect', '/v1/lemlist/complete'):
             raise ValueError('unknown broker operation')
+        is_completion = path.startswith('/v1/lemlist/')
+        path = self.prefix+path
         stamp, nonce = str(int(self.clock())), secrets.token_hex(16)
         signature = self.key.sign(envelope(path, stamp, nonce, raw, nooks_signature))
         headers = {'x-app-time': stamp, 'x-app-nonce': nonce, 'x-app-signature': base64.b64encode(signature).decode()}
         if nooks_signature: headers['x-webhook-signature'] = nooks_signature
         async def exchange():
-            async with httpx.AsyncClient(transport=self.transport, timeout=55 if path.startswith('/v1/lemlist/') else 5, follow_redirects=False, trust_env=False) as client:
+            async with httpx.AsyncClient(transport=self.transport, timeout=55 if is_completion else 5, follow_redirects=False, trust_env=False) as client:
                 async with client.stream('POST', self.url+path, content=raw, headers=headers) as response:
                     if response.status_code != 200:
                         raise ValueError('broker unavailable or rejected')
@@ -170,20 +174,21 @@ class Broker:
                         result.extend(chunk)
                         if len(result) > 4096: raise ValueError('oversize broker result')
             return json.loads(result)
-        return await asyncio.wait_for(exchange(), 60 if path.startswith('/v1/lemlist/') else 6)
+        return await asyncio.wait_for(exchange(), 60 if is_completion else 6)
 
 
-def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time, worker=None):
+def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time, worker=None, secondary=None):
     store.configure_registration(registration_id, deadline, clock())
     setup_diagnostics=set()
     ingress_diagnostics=set()
+    workers=[w for w in (worker, secondary[2] if secondary else None) if w is not None]
     @asynccontextmanager
     async def lifespan(app):
-        task=asyncio.create_task(worker.run()) if worker else None
+        tasks=[asyncio.create_task(w.run()) for w in workers]
         try: yield
         finally:
-            if task:
-                task.cancel()
+            for task in tasks: task.cancel()
+            for task in tasks:
                 with suppress(asyncio.CancelledError): await task
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
@@ -199,7 +204,14 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
     async def ready():
         try: verified = (await broker.call('/v1/ready')).get('ready') is True
         except Exception: verified = False
-        return {'verifier_ready': verified, 'registration_open': store.registration(registration_id, clock()),
+        extra={}
+        if secondary:
+            child_store, child_broker, child_worker = secondary
+            try: child_ready = (await child_broker.call('/v1/ready')).get('ready') is True
+            except Exception: child_ready = False
+            extra['secondary']={'verifier_ready':child_ready,**child_store.summary(),
+                'completion_state':child_worker.core.status()['state'], 'capture_only':child_worker.approval is None}
+        return {**extra, 'verifier_ready': verified, 'registration_open': store.registration(registration_id, clock()),
                 'capture_only': worker is None or worker.approval is None, **store.summary(),
                 'completion_state': worker.core.status()['state'] if worker else 'disabled'}
 
@@ -207,12 +219,18 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
     async def webhook(request: Request):
         raw = await body(request)
         stage = 'signature_header'
+        selected_store, selected_broker = store, broker
         try:
+            if secondary:
+                from .common import unique
+                candidate=json.loads(raw,object_pairs_hook=unique)
+                if candidate.get('callData',{}).get('prospectData',{}).get('prospectId') == secondary[0].scope['prospect_id']:
+                    selected_store, selected_broker = secondary[:2]
             signature = header(request, 'x-webhook-signature', 200)
             stage = 'private_verification'
-            result = await broker.call('/v1/nooks/verify', raw, signature)
+            result = await selected_broker.call('/v1/nooks/verify', raw, signature)
             stage = 'durable_capture'
-            outcome = await asyncio.to_thread(store.capture, result['event'], clock())
+            outcome = await asyncio.to_thread(selected_store.capture, result['event'], clock())
             return {'status': outcome}  # Only after SQLite commit succeeds.
         except Exception:
             # Nooks' initial probe is signed and can be call-shaped before the
@@ -220,7 +238,7 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
             # consume setup; a selected or ambiguous call must be retried.
             try:
                 if store.registration(registration_id,clock()):
-                    reason=registration_reason(raw,store.scope)
+                    reason=registration_reason(raw,selected_store.scope)
                     if reason in ('empty_probe','outside_scope') and store.registration(registration_id,clock(),consume=True):
                         print(json.dumps({'event':'nooks_setup_accepted'}),flush=True)
                         return Response(status_code=204)
@@ -304,7 +322,16 @@ def from_environment():
             worker=Worker(store,selected,broker,approval=approval,policy=configured(selected,os.environ))
         elif os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY') or os.environ.get('TEST_RETARGET'):
             raise ValueError('approval or retarget without scoped worker')
-        app = create_app(store, broker, worker=worker, registration_id=os.environ.get('REGISTRATION_ID', ''),
+        from .secondary import configured as secondary_configured, open_secondary, settings
+        secondary_scope = secondary_configured(os.environ, plan, selected if worker else None)
+        secondary = None
+        if secondary_scope is not None:
+            child_store = open_secondary(store, secondary_scope, 'receiver')
+            child_broker = Broker(os.environ['VERIFIER_URL'], store.identity(), contact_id=secondary_scope['hubspot_contact_id'])
+            child_approval, child_policy = settings(secondary_scope, os.environ)
+            child_worker = Worker(child_store, secondary_scope, child_broker, approval=child_approval, policy=child_policy)
+            secondary = (child_store, child_broker, child_worker)
+        app = create_app(store, broker, worker=worker, secondary=secondary, registration_id=os.environ.get('REGISTRATION_ID', ''),
             deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')))
         app.state.owner_lock = lock  # Single owner for the lifetime of this process.
         return app

@@ -20,7 +20,6 @@ _REJECTION_REASONS = {
     'direction mismatch': 'direction_mismatch',
     'workspace mismatch': 'workspace_mismatch',
     'prospect mismatch': 'prospect_mismatch',
-    'call mismatch': 'call_mismatch',
     'invalid call time': 'invalid_call_time',
     'timezone missing': 'invalid_call_time',
     'invalid event correlation': 'invalid_event_correlation',
@@ -59,8 +58,7 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
             raise HTTPException(403, 'Request rejected.') from None
         await authenticated(request, raw, signature)
         try:
-            return {'event': verify_nooks(raw, signature, signing_key, scope, clock(),
-                call_id=private_claim.accepted_call_id if private_claim is not None else None)}
+            return {'event': verify_nooks(raw, signature, signing_key, scope, clock())}
         except Exception as exc:
             # Authenticate the private caller first; never log raw exceptions,
             # signatures, request fields or provider keys. Each fixed reason is
@@ -147,6 +145,19 @@ def configured(scope):
 def from_environment():
     scope=load_scope(os.environ['CAPTURE_SCOPE'])
     provider,approval,claim,policy=configured(scope)
-    return create_app(signing_key=os.environ.get('NOOKS_SIGNING_KEY', ''),
+    app = create_app(signing_key=os.environ.get('NOOKS_SIGNING_KEY', ''),
         public_key=os.environ.get('RECEIVER_PUBLIC_KEY', ''), scope=scope,
         lemlist_provider=provider,approval=approval,private_claim=claim,disposition_policy=policy)
+    from .secondary import configured as secondary_configured, open_secondary, settings
+    from .retarget import configured as retarget_configured, capture_scope
+    secondary = secondary_configured(os.environ, retarget_configured(os.environ), provider.scope if provider else None)
+    if secondary is not None:
+        from .lemlist_provider import Provider
+        child_claim = open_secondary(claim, secondary, 'verifier')
+        child_approval, child_policy = settings(secondary, os.environ)
+        child_provider = Provider(os.environ.get('LEMLIST_API', ''), secondary, allow_write=child_approval is not None)
+        app.mount('/contacts/'+secondary['hubspot_contact_id'], create_app(
+            signing_key=os.environ.get('NOOKS_SIGNING_KEY', ''), public_key=os.environ.get('RECEIVER_PUBLIC_KEY', ''),
+            scope=capture_scope(secondary), lemlist_provider=child_provider, approval=child_approval,
+            private_claim=child_claim, disposition_policy=child_policy))
+    return app

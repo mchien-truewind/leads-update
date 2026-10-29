@@ -33,7 +33,7 @@ class Worker:
             # Retry reads only. A completion failure has already persisted its
             # claim; neither this loop nor a redeploy resets that claim.
             pass
-        result={'event':'sdr_test_status',**self.core.status()}
+        result={'event':'sdr_test_status','test_contact_id':self.core.scope['hubspot_contact_id'],**self.core.status()}
         if action: result['disposition_action']=action
         if result['state']=='armed' and self.approval is None:
             with self.store.db() as db:

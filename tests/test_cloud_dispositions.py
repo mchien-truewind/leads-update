@@ -320,6 +320,29 @@ class RetargetTests(unittest.TestCase):
         self.assertEqual(json.loads(old['write_claim']['scope']),self.old)
         self.assertIsNone(old['write_claim']['claimed_at'])
 
+    def test_new_call_after_arm_can_complete_retargeted_task_once(self):
+        self.migrate()
+        worker=Worker(self.store,self.scope,self.bridge(),clock=lambda:self.now,
+            policy=self.policy,report=lambda _:None)
+        self.assertEqual(worker.tick()['state'],'armed')
+        self.now+=40
+        iso=lambda n:datetime.datetime.fromtimestamp(n,datetime.timezone.utc).isoformat()
+        self.webhook['callData']['callId']='new-call-after-arm'
+        self.webhook['callData']['startedAt']=iso(self.now-30)
+        self.webhook['occurredAt']=iso(self.now)
+        self.assertEqual(self.post().json(),{'status':'captured'})
+        self.assertEqual(self.writes,[])
+        approval=self.approval()
+        worker=Worker(self.store,self.scope,self.bridge(approval),clock=lambda:self.now,
+            policy=self.policy,approval=approval,report=lambda _:None)
+        self.assertEqual(worker.tick()['state'],'verified')
+        self.assertEqual(self.post().json(),{'status':'duplicate'})
+        self.migrate()
+        worker=Worker(self.store,self.scope,self.bridge(approval),clock=lambda:self.now,
+            policy=self.policy,approval=approval,report=lambda _:None)
+        self.assertEqual(worker.tick()['state'],'verified')
+        self.assertEqual(self.writes,[{'id':'opp_new','done':True}])
+
     def test_new_plan_cannot_reset_or_remove_existing_retarget(self):
         self.migrate()
         bad=dict(self.plan,call_id='different-call')
@@ -372,16 +395,24 @@ class RetargetTests(unittest.TestCase):
             self.assertEqual(json.loads(db.execute('SELECT value FROM scope').fetchone()[0]),self.capture_scope(self.old))
             self.assertEqual(db.execute('SELECT state FROM completion').fetchone()[0],'armed')
 
-    def test_invalid_signature_or_different_call_never_capture_or_claim(self):
+    def test_invalid_signature_and_unapproved_prior_call_never_complete(self):
+        import asyncio
         self.migrate()
+        worker=Worker(self.store,self.scope,self.bridge(),clock=lambda:self.now,policy=self.policy,report=lambda _:None)
+        self.assertEqual(worker.tick()['state'],'armed')
         self.assertEqual(self.post(tamper=True).status_code,503)
-        event=copy.deepcopy(self.webhook);event['callData']['callId']='not-approved'
-        self.assertEqual(self.post(event).status_code,503)
         self.assertEqual(self.store.summary()['event_count'],0)
-        approval=dict(call_id='not-approved',event_digest='a'*64,policy_digest=self.policy.digest,
-            rep_id='nooksrep',disposition_id='disp_connected',confirmed_contact=True,
-            confirmed_non_suppressing_disposition=True)
-        with self.assertRaises(ValueError):self.private.claim(approval)
+        event=copy.deepcopy(self.webhook);event['callData']['callId']='unapproved-prior-call'
+        self.assertEqual(self.post(event).status_code,200)
+        approval=self.approval()
+        worker=Worker(self.store,self.scope,self.bridge(approval),clock=lambda:self.now,
+            policy=self.policy,approval=approval,report=lambda _:None)
+        self.assertEqual(worker.tick()['state'],'armed')
+        with self.private.db() as db:self.assertIsNone(db.execute('SELECT claimed_at FROM write_claim').fetchone()[0])
+        # A different exact approval cannot reach the private write claim.
+        wrong=dict(approval,call_id='another-call')
+        with self.assertRaises(ValueError):
+            asyncio.run(self.bridge(approval).call('/v1/lemlist/complete',json.dumps(wrong).encode()))
         self.assertEqual(self.writes,[])
 
     def test_changed_provider_state_prevents_arming_even_with_signed_existing_call(self):

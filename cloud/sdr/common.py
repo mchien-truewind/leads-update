@@ -95,7 +95,7 @@ def timestamp(value):
     return dt.timestamp()
 
 
-def verify_nooks(raw, signature, key, scope, now, *, call_id=None):
+def verify_nooks(raw, signature, key, scope, now):
     if not key or not scope['not_before'] <= now < scope['expires_at']:
         raise ValueError('capture not enabled')
     parts = {}
@@ -123,8 +123,6 @@ def verify_nooks(raw, signature, key, scope, now, *, call_id=None):
             (call['prospectData']['prospectId'], scope['prospect_id'], 'prospect mismatch')):
         if actual != expected:
             raise ValueError(reason)
-    if call_id is not None and call['callId'] != call_id:
-        raise ValueError('call mismatch')
     result = {'workspace_id': call['workspaceId'], 'prospect_id': call['prospectData']['prospectId'],
         'call_id': call['callId'], 'rep_id': call['userData']['userId'],
         'disposition_id': call['disposition']['id'], 'disposition_name': call['disposition']['name'],

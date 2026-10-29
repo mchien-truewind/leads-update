@@ -284,7 +284,7 @@ class HostedBoundaryTests(unittest.TestCase):
         logs=[]
         worker=Worker(self.store,self.scope,self.boundary(None),clock=lambda:self.now,report=logs.append)
         result=worker.tick()
-        self.assertEqual(set(result),{'event','state','write_receipt','event_digest','call_id','rep_id','disposition_id','policy_digest','disposition_action'})
+        self.assertEqual(set(result),{'event','test_contact_id','state','write_receipt','event_digest','call_id','rep_id','disposition_id','policy_digest','disposition_action'})
         self.assertEqual(result['event'],'sdr_test_awaiting_confirmation')
         worker.tick()
         self.assertEqual(len(logs),1)

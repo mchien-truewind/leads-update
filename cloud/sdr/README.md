@@ -262,16 +262,54 @@ calls or rearm the old scope.
 
 Deploy the private service's reviewed source, plan and matching new scopes first,
 then deploy the receiver with the identical plan/scopes. Keep completion approval
-and disposition policy absent until a real signed redelivery of the pinned call
+and disposition policy absent until a real signed event for the selected contact
 has been verified. An activity visible in HubSpot is not a signed webhook receipt.
 The new task is inspected and armed with its actual current timestamp. Only this
 explicitly pinned prior call may predate that new arming; the original time window,
 signature freshness, disposition policy, exact-event confirmation and private
 claim remain required. Delivery may precede the new worker's initial inspection;
 only the single pinned event is eligible and a failed provider preflight prevents
-arming. Other call IDs are rejected at both ingress and claim boundaries.
+arming. New calls on the same contact follow the normal post-arm timestamp rule. The
+prior-call ID grants only an exception for that earlier call; it does not exclude
+new calls. An exact signed event digest, reviewed disposition and caller mapping,
+and identical exact-call approval on both services remain required before a write.
 
 Preserve both volumes and the exact plan on restarts. If either rollout fails,
 keep completion disabled and finish or repair that same migration. Do not restore
 old scopes over an archived test, invent callback evidence, or repeat a provider
 write. After a successful or uncertain completion, all recovery is readback only.
+
+
+## Two existing Test Campaign contacts
+
+Set identical non-secret `SECONDARY_TEST_SCOPE` on both services to the complete
+`from_scope` in the existing immutable `TEST_RETARGET` plan. The primary remains
+its `to_scope`. No other contact, task, campaign, owner or time window is accepted.
+The archive must prove the original test was untouched and unclaimed.
+
+On first startup, each service creates a separate `secondary-<contact ID>`
+journal under its existing private `/data/state` directory. The receiver copies
+only the archived original completion row, preserving its actual arm time and
+initial evidence. The private service creates an unclaimed row only from the
+proven unclaimed archive. An origin digest binds each journal once; subsequent
+starts never overwrite its event history, hold, policy or write claim. The
+original archive and the primary journal remain intact. No new credential or
+volume is needed. Private service deployment must complete before the receiver.
+
+The public URL stays the same. An untrusted prospect ID selects a candidate
+private route; that route must independently verify the raw Nooks signature,
+workspace, contact, direction and finalized status before capture. The receiver's
+identity signature also binds the private route. Separate workers and provider
+scopes permit each exact task at most once. Unknown contacts are rejected, and
+unknown, conflicting, suppressed or unapproved calls cannot complete a task.
+Duplicate delivery does not repeat a write. A hold for one contact leaves the
+other worker independent. There is no general campaign-wide completion grant.
+
+The second contact has separate `SECONDARY_NOOKS_DISPOSITION_POLICY` and
+`SECONDARY_COMPLETION_APPROVAL` variables with the same contracts as the primary
+variables. Leave them absent until a signed event and the actual account mapping
+are confirmed. Deploy any matching approval private-first. Both original expiry
+boundaries remain unchanged. `/ready` includes a `secondary` status object;
+bounded worker diagnostics include `test_contact_id` to distinguish the two.
+The same suite (`test_cloud_*.py`) exercises both signed HTTP paths through
+independent mocked task completion, continuation, duplicate delivery and restart.

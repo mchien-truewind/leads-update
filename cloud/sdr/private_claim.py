@@ -62,8 +62,6 @@ class PrivateClaim:
 
     def claim(self, approval):
         validate_approval(approval)
-        if self.accepted_call_id is not None and approval['call_id'] != self.accepted_call_id:
-            raise ValueError('approval differs from the retargeted call')
         encoded = json.dumps(approval, sort_keys=True)
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')

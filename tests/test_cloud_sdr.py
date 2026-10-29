@@ -73,10 +73,11 @@ class CloudTests(unittest.TestCase):
         with patch('builtins.print') as output:
             self.assertEqual(self.post(sample,client=client).status_code,503)
             self.assertEqual(self.post(sample,client=client).status_code,503)
-            self.assertEqual(output.call_count,1)
-            record=json.loads(output.call_args.args[0])
-        self.assertEqual(record,{'event':'nooks_setup_rejected','reason':'missing_explicit_identity'})
-        self.assertNotIn('private-marker',json.dumps(record))
+            records=[json.loads(call.args[0]) for call in output.call_args_list]
+        self.assertEqual(records,[
+            {'event':'nooks_verification_rejected','reason':'malformed_event_or_signature'},
+            {'event':'nooks_setup_rejected','reason':'missing_explicit_identity'}])
+        self.assertNotIn('private-marker',json.dumps(records))
         self.assertTrue(client.get('/ready').json()['registration_open'])
 
     def test_signed_provider_call_crosses_authenticated_broker_and_durable_capture(self):
@@ -124,6 +125,51 @@ class CloudTests(unittest.TestCase):
         raw, headers = self.signed(stamp=(self.now-301)*1000)
         self.assertEqual(self.client.post('/api/sdr/webhooks/nooks',content=raw,headers=headers).status_code,503)
         self.assertEqual(self.store.summary()['event_count'],0)
+
+    def test_rejection_diagnostics_are_fixed_bounded_and_keep_ingress_closed(self):
+        cases = []
+        for field, value, reason in (
+                ('workspaceId', 'private-workspace', 'workspace_mismatch'),
+                ('status', 'private-status', 'not_finalized'),
+                ('callDirection', 'private-direction', 'direction_mismatch')):
+            event = copy.deepcopy(self.event)
+            event['callData'][field] = value
+            cases.append((event, reason))
+        event = copy.deepcopy(self.event)
+        event['callData']['prospectData']['prospectId'] = 'private-prospect'
+        cases.append((event, 'prospect_mismatch'))
+        event = copy.deepcopy(self.event)
+        del event['callData']['disposition']
+        cases.append((event, 'malformed_event_or_signature'))
+        with patch('builtins.print') as output:
+            for event, reason in cases:
+                for _ in range(2):
+                    response = self.post(event)
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(response.json(), {'detail': 'Event unavailable or rejected.'})
+            raw, headers = self.signed()
+            for _ in range(2):
+                self.assertEqual(self.client.post('/api/sdr/webhooks/nooks', content=raw+b' ', headers=headers).status_code, 503)
+            records = [json.loads(call.args[0]) for call in output.call_args_list]
+        private = [x for x in records if x['event'] == 'nooks_verification_rejected']
+        self.assertEqual(private, [{'event': 'nooks_verification_rejected', 'reason': reason}
+                                  for reason in [r for _, r in cases]+['signature_mismatch']])
+        self.assertEqual([x for x in records if x['event'] == 'nooks_ingress_rejected'],
+                         [{'event': 'nooks_ingress_rejected', 'stage': 'private_verification'}])
+        for marker in ('private-workspace', 'private-status', 'private-direction', 'private-prospect',
+                       'private notes', 'dummy-nooks-key', headers['x-webhook-signature']):
+            self.assertNotIn(marker, json.dumps(records))
+        self.assertEqual(self.store.summary(), {'event_count': 0, 'held': False})
+        self.assertEqual(self.post().json(), {'status': 'captured'})
+
+    def test_missing_signature_diagnostic_does_not_expose_body(self):
+        with patch('builtins.print') as output:
+            for _ in range(3):
+                self.assertEqual(self.client.post('/api/sdr/webhooks/nooks', content=b'private-body-marker').status_code, 503)
+        self.assertEqual(output.call_count, 1)
+        self.assertEqual(json.loads(output.call_args.args[0]),
+                         {'event': 'nooks_ingress_rejected', 'stage': 'signature_header'})
+        self.assertEqual(self.store.summary()['event_count'], 0)
 
     def test_unknown_app_identity_and_missing_provider_key_hold(self):
         for key, signing in ((Ed25519PrivateKey.generate(), 'dummy-nooks-key'),(self.key,'')):

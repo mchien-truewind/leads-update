@@ -8,9 +8,28 @@ from fastapi import FastAPI, HTTPException, Request
 from .common import Authenticate, body, header, load_scope, verify_nooks
 
 
+# Values, rather than exception text, are the only data allowed into diagnostics.
+_REJECTION_REASONS = {
+    'capture not enabled': 'capture_disabled',
+    'invalid signature': 'signature_format',
+    'invalid timestamp': 'signature_timestamp_format',
+    'stale event': 'stale_signature',
+    'signature mismatch': 'signature_mismatch',
+    'unsupported event': 'unsupported_event',
+    'call not finalized': 'not_finalized',
+    'direction mismatch': 'direction_mismatch',
+    'workspace mismatch': 'workspace_mismatch',
+    'prospect mismatch': 'prospect_mismatch',
+    'invalid call time': 'invalid_call_time',
+    'timezone missing': 'invalid_call_time',
+    'invalid event correlation': 'invalid_event_correlation',
+}
+
+
 def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provider=None, approval=None, private_claim=None, disposition_policy=None):
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     auth = Authenticate(public_key, clock)
+    reported_rejections = set()
 
     @app.get('/healthz')
     async def health():
@@ -40,7 +59,14 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
         await authenticated(request, raw, signature)
         try:
             return {'event': verify_nooks(raw, signature, signing_key, scope, clock())}
-        except Exception:
+        except Exception as exc:
+            # Authenticate the private caller first; never log raw exceptions,
+            # signatures, request fields or provider keys. Each fixed reason is
+            # reported at most once per process, including during retry storms.
+            reason = _REJECTION_REASONS.get(str(exc), 'malformed_event_or_signature')
+            if reason not in reported_rejections:
+                reported_rejections.add(reason)
+                print(json.dumps({'event': 'nooks_verification_rejected', 'reason': reason}), flush=True)
             raise HTTPException(403, 'Event rejected.') from None
 
     completion_lock=threading.Lock()

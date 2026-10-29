@@ -22,7 +22,7 @@ from .common import body, envelope, header, load_scope
 
 
 class Store:
-    def __init__(self, directory, scope):
+    def __init__(self, directory, scope, *, retarget_plan=None, clock=time.time):
         self.directory, self.scope = Path(directory), scope
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.directory.lstat()
@@ -43,6 +43,8 @@ class Store:
                 CREATE TABLE IF NOT EXISTS registration (id TEXT PRIMARY KEY, deadline INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
             ''')
             db.execute('BEGIN IMMEDIATE')
+            from .retarget import apply
+            self.accepted_call_id = apply(db, 'receiver', retarget_plan, scope, clock())
             value = json.dumps(scope, sort_keys=True)
             row = db.execute('SELECT value FROM scope WHERE singleton=1').fetchone()
             if row and row[0] != value:
@@ -111,6 +113,7 @@ class Store:
         fields = {'workspace_id', 'prospect_id', 'call_id', 'rep_id', 'disposition_id', 'disposition_name', 'started_at', 'finalized_at'}
         if (not isinstance(event, dict) or set(event) != fields
                 or event['workspace_id'] != self.scope['workspace_id'] or event['prospect_id'] != self.scope['prospect_id']
+                or (self.accepted_call_id is not None and event['call_id'] != self.accepted_call_id)
                 or any(not isinstance(event[k], str) or not 1 <= len(event[k]) <= 200 for k in fields-{'started_at','finalized_at'})
                 or any(type(event[k]) not in (int, float) for k in ('started_at','finalized_at'))
                 or not self.scope['not_before'] <= event['started_at'] <= event['finalized_at'] <= now+300
@@ -120,6 +123,8 @@ class Store:
         digest = hashlib.sha256(raw.encode()).hexdigest()
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
+            if json.loads(db.execute('SELECT value FROM scope WHERE singleton=1').fetchone()[0]) != self.scope:
+                raise ValueError('retired capture instance')
             old = db.execute('SELECT digest FROM events WHERE call_id=?', (event['call_id'],)).fetchone()
             if old:
                 if old[0] == digest: return 'duplicate'
@@ -258,24 +263,51 @@ def registration_probe(raw,scope):
     return registration_reason(raw,scope) in ('empty_probe','outside_scope')
 
 
+def owner_lock(directory):
+    directory = Path(directory)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError('unsafe state directory')
+    lock = os.open(directory/'owner.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(lock)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError('unsafe owner lock')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock
+    except BaseException:
+        os.close(lock)
+        raise
+
+
 def from_environment():
     if os.environ.get('RAILWAY_VOLUME_MOUNT_PATH') != '/data':
         raise ValueError('durable Railway volume required')
-    store = Store('/data/state', load_scope(os.environ['CAPTURE_SCOPE']))
-    lock = os.open(store.directory/'owner.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    broker = Broker(os.environ['VERIFIER_URL'], store.identity())
-    worker=None
-    if os.environ.get('LEMLIST_TEST_SCOPE'):
+    # Take ownership before a configured migration can touch the old journal.
+    lock = owner_lock('/data/state')
+    try:
+        from .retarget import configured as retarget_configured
         from .common import unique
-        from .worker import Worker
-        from .dispositions import configured
-        selected=json.loads(os.environ['LEMLIST_TEST_SCOPE'],object_pairs_hook=unique)
-        approval=json.loads(os.environ['COMPLETION_APPROVAL'],object_pairs_hook=unique) if os.environ.get('COMPLETION_APPROVAL') else None
-        worker=Worker(store,selected,broker,approval=approval,policy=configured(selected,os.environ))
-    elif os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY'):
-        raise ValueError('approval without scoped worker')
-    app = create_app(store, broker, worker=worker, registration_id=os.environ.get('REGISTRATION_ID', ''),
-        deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')))
-    app.state.owner_lock = lock  # Single owner for the lifetime of this process.
-    return app
+        plan = retarget_configured(os.environ)
+        if plan is not None and json.loads(os.environ.get('LEMLIST_TEST_SCOPE', '{}'), object_pairs_hook=unique) != plan['to_scope']:
+            raise ValueError('retarget requires its exact worker scope before migration')
+        store = Store('/data/state', load_scope(os.environ['CAPTURE_SCOPE']), retarget_plan=plan)
+        broker = Broker(os.environ['VERIFIER_URL'], store.identity())
+        worker=None
+        if os.environ.get('LEMLIST_TEST_SCOPE'):
+            from .common import unique
+            from .worker import Worker
+            from .dispositions import configured
+            selected=json.loads(os.environ['LEMLIST_TEST_SCOPE'],object_pairs_hook=unique)
+            approval=json.loads(os.environ['COMPLETION_APPROVAL'],object_pairs_hook=unique) if os.environ.get('COMPLETION_APPROVAL') else None
+            worker=Worker(store,selected,broker,approval=approval,policy=configured(selected,os.environ))
+        elif os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY') or os.environ.get('TEST_RETARGET'):
+            raise ValueError('approval or retarget without scoped worker')
+        app = create_app(store, broker, worker=worker, registration_id=os.environ.get('REGISTRATION_ID', ''),
+            deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')))
+        app.state.owner_lock = lock  # Single owner for the lifetime of this process.
+        return app
+    except BaseException:
+        os.close(lock)
+        raise

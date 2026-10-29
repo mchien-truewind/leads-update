@@ -23,9 +23,9 @@ receiver with a Railway-generated domain; the verifier uses private networking.
 Both services need `SDR_ROLE` (`receiver` or `verifier`) and `CAPTURE_SCOPE`, a
 non-secret JSON object with `workspace_id`, `prospect_id`, `not_before` and
 `expires_at`. Timestamps are integer UTC seconds; the window is at most 48 hours.
-The selected expected prospect is HubSpot `213807637412`, workspace
-`0qzObckuGaOQjpdI`. Capture cannot prove that CRM relationship: independently
-verify the Nooks record's HubSpot link before any later completion is authorized.
+The prospect must be the explicitly selected HubSpot contact in the configured
+Nooks workspace. Capture cannot prove that CRM relationship: independently verify
+the Nooks record's HubSpot link before any later completion is authorized.
 Unknown/mismatched prospect IDs are rejected. Scope changes cannot overwrite an
 existing durable inbox without an explicitly reviewed migration.
 
@@ -120,15 +120,14 @@ pin, private signing-key entry and real Nooks event.
 
 ## Optional supervised lemlist completion
 
-Do not activate this worker merely because the receiver is healthy. The deployed
-capture-only receiver commit remains b9403fd0d05e4e307d118f8d4eec79a811ddd4e5 until the
-complete worker snapshot is independently reviewed and deliberately released.
+Do not activate this worker merely because the receiver is healthy. Deploy only
+an independently reviewed worker revision with explicitly authorized configuration.
 
 Both services require identical non-secret LEMLIST_TEST_SCOPE JSON, pinning
 hubspot_contact_id, campaign_id, sequence_id, call_step_id, continuation_step_id,
 task_id, lead_id, contact_id, assigned_rep_id, workspace_id, starts_at and expires_at.
 The capture scope's workspace/prospect/window must match exactly. Use only the
-original selected test, and preserve its expiry; this is not a grant renewal.
+selected test, and preserve its expiry; this is not a grant renewal.
 When LEMLIST_TEST_SCOPE is configured, the verifier also requires its own dedicated
 /data volume, separate from the receiver. The cloud launcher initializes its
 private state directory as UID503. Missing storage prevents startup. Never replace
@@ -241,3 +240,38 @@ both HTTP apps, persist normalized evidence, complete the exact mocked task and
 independently observe progression. They cover duplicate delivery/restart, forged
 requests, unfinalized calls, unmapped IDs, misleading names, do-not-call, other reps,
 policy changes and missing continuation. Only provider transport is mocked.
+
+
+## Explicit one-time test retarget
+
+A user-authorized contact correction can set identical non-secret `TEST_RETARGET`
+on both services. Its exact fields are `from_scope` (the complete old
+`LEMLIST_TEST_SCOPE`), `to_scope` (the complete replacement scope), `call_id` (the
+single existing Nooks call), and `confirmed_contact: true`. Only the HubSpot
+contact, lemlist contact, lead and task IDs may change. Campaign, sequence, steps,
+rep, workspace and both time boundaries must stay identical; expiry is not renewed.
+Read back the new CRM/task mapping before preparing this plan.
+
+The old receiver must be armed with an empty inbox, no hold, no bound disposition
+policy and no completion attempt. The private ledger must also be unclaimed.
+Each service atomically archives its complete original row in `retarget_history`
+before selecting the new scope. No volume, identity or claim is removed or reset.
+Take the receiver owner lock before migration. A changed plan, removal of a stored
+plan, or a second retarget is rejected. Retired receiver objects cannot append
+calls or rearm the old scope.
+
+Deploy the private service's reviewed source, plan and matching new scopes first,
+then deploy the receiver with the identical plan/scopes. Keep completion approval
+and disposition policy absent until a real signed redelivery of the pinned call
+has been verified. An activity visible in HubSpot is not a signed webhook receipt.
+The new task is inspected and armed with its actual current timestamp. Only this
+explicitly pinned prior call may predate that new arming; the original time window,
+signature freshness, disposition policy, exact-event confirmation and private
+claim remain required. Delivery may precede the new worker's initial inspection;
+only the single pinned event is eligible and a failed provider preflight prevents
+arming. Other call IDs are rejected at both ingress and claim boundaries.
+
+Preserve both volumes and the exact plan on restarts. If either rollout fails,
+keep completion disabled and finish or repair that same migration. Do not restore
+old scopes over an archived test, invent callback evidence, or repeat a provider
+write. After a successful or uncertain completion, all recovery is readback only.

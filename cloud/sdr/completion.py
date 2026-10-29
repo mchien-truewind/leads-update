@@ -70,8 +70,14 @@ class Completion:
         with self.store.db() as db:
             db.execute('BEGIN IMMEDIATE')
             active(self.scope,self.clock())
+            from .retarget import capture_scope
+            if json.loads(db.execute('SELECT value FROM scope WHERE singleton=1').fetchone()[0]) != capture_scope(self.scope):
+                raise ValueError('retired completion instance')
+            events = db.execute('SELECT evidence FROM events').fetchall()
+            accepted_prior = (self.store.accepted_call_id is not None and len(events) == 1
+                              and json.loads(events[0][0]).get('call_id') == self.store.accepted_call_id)
             if (db.execute('SELECT held FROM scope WHERE singleton=1').fetchone()[0]
-                    or db.execute('SELECT COUNT(*) FROM events').fetchone()[0]):
+                    or (events and not accepted_prior)):
                 raise ValueError('arm must precede the controlled call')
             # No reset or renewal. A failed insert preserves any old claim.
             db.execute('INSERT INTO completion(singleton,scope,armed_at,state,before_evidence,policy) VALUES(1,?,?,?,?,?)',
@@ -113,7 +119,10 @@ class Completion:
                     or any(event[k] != approval[k] for k in ('call_id','rep_id','disposition_id'))
                     or event['workspace_id'] != self.scope['workspace_id']
                     or event['prospect_id'] != self.scope['hubspot_contact_id']
-                    or not row[1] <= event['started_at'] <= event['finalized_at'] <= self.clock()+300):
+                    or not (row[1] <= event['started_at'] or
+                            (event['call_id'] == self.store.accepted_call_id and
+                             self.scope['starts_at'] <= event['started_at']))
+                    or not event['started_at'] <= event['finalized_at'] <= self.clock()+300):
                 raise ValueError('call differs from reviewed confirmation')
             active(self.scope,self.clock())
             db.execute("UPDATE completion SET state='claimed',approval=?,claimed_at=? WHERE singleton=1",

@@ -20,6 +20,7 @@ _REJECTION_REASONS = {
     'direction mismatch': 'direction_mismatch',
     'workspace mismatch': 'workspace_mismatch',
     'prospect mismatch': 'prospect_mismatch',
+    'call mismatch': 'call_mismatch',
     'invalid call time': 'invalid_call_time',
     'timezone missing': 'invalid_call_time',
     'invalid event correlation': 'invalid_event_correlation',
@@ -58,7 +59,8 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
             raise HTTPException(403, 'Request rejected.') from None
         await authenticated(request, raw, signature)
         try:
-            return {'event': verify_nooks(raw, signature, signing_key, scope, clock())}
+            return {'event': verify_nooks(raw, signature, signing_key, scope, clock(),
+                call_id=private_claim.accepted_call_id if private_claim is not None else None)}
         except Exception as exc:
             # Authenticate the private caller first; never log raw exceptions,
             # signatures, request fields or provider keys. Each fixed reason is
@@ -123,7 +125,7 @@ def configured(scope):
     from .common import unique
     value=os.environ.get('LEMLIST_TEST_SCOPE','')
     if not value:
-        if os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY'): raise ValueError('approval or mapping without scope')
+        if os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY') or os.environ.get('TEST_RETARGET'): raise ValueError('approval or mapping without scope')
         return None,None,None,None
     selected=json.loads(value,object_pairs_hook=unique)
     expected={'workspace_id':selected['workspace_id'],'prospect_id':selected['hubspot_contact_id'],
@@ -131,7 +133,8 @@ def configured(scope):
     if expected!=scope: raise ValueError('provider and capture scopes differ')
     if os.environ.get('RAILWAY_VOLUME_MOUNT_PATH') != '/data':
         raise ValueError('private completion requires durable Railway volume')
-    claim=PrivateClaim('/data/state',selected)
+    from .retarget import configured as retarget_configured
+    claim=PrivateClaim('/data/state',selected,retarget_plan=retarget_configured(os.environ))
     approval=json.loads(os.environ['COMPLETION_APPROVAL'],object_pairs_hook=unique) if os.environ.get('COMPLETION_APPROVAL') else None
     policy=configured_policy(selected,os.environ)
     if approval is not None:

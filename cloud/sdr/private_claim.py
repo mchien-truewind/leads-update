@@ -16,7 +16,7 @@ from .lemlist_contract import active, validate_scope
 
 
 class PrivateClaim:
-    def __init__(self, directory, scope, *, clock=time.time):
+    def __init__(self, directory, scope, *, clock=time.time, retarget_plan=None):
         validate_scope(scope)
         self.scope, self.clock = dict(scope), clock
         self.directory = Path(directory)
@@ -37,6 +37,8 @@ class PrivateClaim:
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1), scope TEXT NOT NULL,
                 approval TEXT, claimed_at REAL)''')
             db.execute('BEGIN IMMEDIATE')
+            from .retarget import apply
+            self.accepted_call_id = apply(db, 'verifier', retarget_plan, scope, clock())
             encoded = json.dumps(self.scope, sort_keys=True)
             row = db.execute('SELECT scope FROM write_claim WHERE singleton=1').fetchone()
             if row and row[0] != encoded:
@@ -60,6 +62,8 @@ class PrivateClaim:
 
     def claim(self, approval):
         validate_approval(approval)
+        if self.accepted_call_id is not None and approval['call_id'] != self.accepted_call_id:
+            raise ValueError('approval differs from the retargeted call')
         encoded = json.dumps(approval, sort_keys=True)
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')

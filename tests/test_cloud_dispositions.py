@@ -188,3 +188,241 @@ class PolicyValidationTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class RetargetTests(unittest.TestCase):
+    """Explicitly retire an untouched test; recover one already-finalized call."""
+    def setUp(self):
+        import tempfile
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);self.now=1793205000
+        self.old=dict(hubspot_contact_id='123',campaign_id='cam_test',sequence_id='seq_test',
+            call_step_id='stp_call',continuation_step_id='stp_next',task_id='opp_old',lead_id='lea_old',
+            contact_id='ctc_old',assigned_rep_id='usr_test',workspace_id='workspace',
+            starts_at=self.now-500,expires_at=self.now+1000)
+        self.scope=dict(self.old,hubspot_contact_id='456',task_id='opp_new',lead_id='lea_new',contact_id='ctc_new')
+        self.plan=dict(from_scope=self.old,to_scope=self.scope,call_id='existing-call',confirmed_contact=True)
+        self.store=Store(self.root/'public',self.capture_scope(self.old))
+        self.original=Completion(self.store,self.old,clock=lambda:self.now-200)
+        self.original.arm(lambda *_:self.evidence(self.old))
+        self.private=PrivateClaim(self.root/'private',self.old,clock=lambda:self.now)
+        self.policy=DispositionPolicy(dict(workspace_id='workspace',nooks_rep_id='nooksrep',
+            lemlist_rep_id='usr_test',dispositions={'disp_connected':'complete'}),self.scope)
+        self.writes=[];self.done=False;self.paused=False
+        iso=lambda n:datetime.datetime.fromtimestamp(n,datetime.timezone.utc).isoformat()
+        self.webhook={'event':'call.logged','occurredAt':iso(self.now-70),'callData':{
+            'workspaceId':'workspace','callId':'existing-call','status':'completed','callDirection':'outbound',
+            'prospectData':{'prospectId':'456'},'userData':{'userId':'nooksrep'},
+            'disposition':{'id':'disp_connected','name':'Connected'},'startedAt':iso(self.now-100)}}
+
+    @staticmethod
+    def capture_scope(scope):
+        from cloud.sdr.retarget import capture_scope
+        return capture_scope(scope)
+
+    @staticmethod
+    def evidence(scope):
+        return {'scope':scope,'task':{'task_id':scope['task_id'],'status':'due','done':False,
+            'provider_step_id':None,'provider_sequence_id':scope['sequence_id']},
+            'completion_activities':[],'continuation_tasks':[]}
+
+    def migrate(self):
+        self.private=PrivateClaim(self.root/'private',self.scope,clock=lambda:self.now,retarget_plan=self.plan)
+        self.store=Store(self.root/'public',self.capture_scope(self.scope),clock=lambda:self.now,retarget_plan=self.plan)
+
+    def http(self,request):
+        from urllib.parse import parse_qs
+        s=self.scope;p=request.url.path
+        self.assertEqual(request.url.host,'api.lemlist.com')
+        if request.method=='PATCH':
+            value=json.loads(request.content)
+            self.assertEqual(value,{'id':s['task_id'],'done':True})
+            self.writes.append(value);self.done=True
+            return httpx.Response(204)
+        self.assertEqual(request.method,'GET')
+        task={'_id':s['task_id'],'campaignId':s['campaign_id'],'leadId':s['lead_id'],
+            'contactId':s['contact_id'],'type':'manual','title':'M0 Call in Nooks',
+            'status':'done' if self.done else 'due','assignedTo':s['assigned_rep_id'],
+            'campaign':{'id':s['campaign_id'],'sequenceId':s['sequence_id']}}
+        if p=='/api/contacts':
+            value=[{'_id':s['contact_id'],'unsubscribed':False,
+                'crmSync':{'provider':'hubspot','crmRecordId':s['hubspot_contact_id'],'syncDisabled':False},
+                'campaigns':[{'campaignId':s['campaign_id'],'leadId':s['lead_id'],
+                              'campaignState':'running','leadState':'scanned'}]}]
+        elif p=='/api/leads':
+            value={'_id':s['lead_id'],'campaignId':s['campaign_id'],'contactId':s['contact_id'],'isPaused':self.paused}
+        elif p=='/api/campaigns/cam_test/sequences':
+            value={s['sequence_id']:{'_id':s['sequence_id'],'level':0,'steps':[
+                {'_id':s['call_step_id'],'index':0,'type':'manual','sequenceId':s['sequence_id'],'title':'M0 Call in Nooks'},
+                {'_id':s['continuation_step_id'],'index':1,'type':'manual','sequenceId':s['sequence_id'],'title':'M0 Continuation confirmed'}]}}
+        elif p=='/api/v2/tasks':
+            rows=[task]
+            if self.done and 'taskId' not in parse_qs(request.url.query.decode()):
+                rows.append(dict(task,_id='opp_continuation',title='M0 Continuation confirmed',status='due'))
+            value={'total':len(rows),'results':rows}
+        elif p=='/api/activities':
+            value=[] if not self.done else [{'_id':'act_new','type':'manualDone',
+                'campaignId':s['campaign_id'],'leadId':s['lead_id'],'contactId':s['contact_id'],
+                'opportunityId':s['task_id'],'stepId':s['call_step_id'],'sequenceId':s['sequence_id'],
+                'createdAt':datetime.datetime.fromtimestamp(self.now,datetime.timezone.utc).isoformat()}]
+        else:self.fail('unexpected provider path')
+        return httpx.Response(200,json=value)
+
+    def bridge(self,approval=None):
+        from cloud.sdr.lemlist_provider import Provider
+        key=self.store.identity()
+        provider=Provider('dummy',self.scope,allow_write=approval is not None,
+            transport=httpx.MockTransport(self.http),clock=lambda:self.now)
+        claim=PrivateClaim(self.root/'private',self.scope,clock=lambda:self.now,retarget_plan=self.plan)
+        app=private_app(signing_key='dummy-signing',public_key=key.public_key().public_bytes_raw().hex(),
+            scope=self.store.scope,clock=lambda:self.now,lemlist_provider=provider,
+            private_claim=claim,approval=approval,disposition_policy=self.policy)
+        return Broker('http://nooks-verifier.railway.internal:8080',key,
+            transport=httpx.ASGITransport(app=app),clock=lambda:self.now)
+
+    def post(self,event=None,tamper=False):
+        raw=json.dumps(event or self.webhook).encode();stamp=str(self.now*1000)
+        signature=base64.b64encode(hmac.new(b'dummy-signing',stamp.encode()+b'.'+raw,hashlib.sha256).digest()).decode()
+        client=TestClient(create_app(self.store,self.bridge(),clock=lambda:self.now))
+        return client.post('/api/sdr/webhooks/nooks',content=raw+(b' ' if tamper else b''),
+                           headers={'x-webhook-signature':'t='+stamp+',s='+signature})
+
+    def approval(self):
+        with self.store.db() as db:digest,event=db.execute('SELECT digest,evidence FROM events').fetchone()
+        event=json.loads(event)
+        return dict(call_id=event['call_id'],rep_id=event['rep_id'],disposition_id=event['disposition_id'],
+            event_digest=digest,policy_digest=self.policy.digest,confirmed_contact=True,
+            confirmed_non_suppressing_disposition=True)
+
+    def test_signed_existing_call_captured_before_new_arm_completes_only_new_task_once(self):
+        self.migrate()
+        self.assertEqual(self.post().json(),{'status':'captured'})
+        worker=Worker(self.store,self.scope,self.bridge(),clock=lambda:self.now,policy=self.policy,report=lambda _:None)
+        self.assertEqual(worker.tick()['state'],'armed')
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT armed_at FROM completion').fetchone()[0],self.now)
+            archived=json.loads(db.execute('SELECT old_state FROM retarget_history').fetchone()[0])
+        self.assertEqual(json.loads(archived['completion']['scope']),self.old)
+        self.assertEqual(archived['completion']['armed_at'],self.now-200)
+        approval=self.approval()
+        worker=Worker(self.store,self.scope,self.bridge(approval),clock=lambda:self.now,
+            policy=self.policy,approval=approval,report=lambda _:None)
+        self.assertEqual(worker.tick()['state'],'verified')
+        self.assertEqual(self.post().json(),{'status':'duplicate'})
+        self.migrate()  # Same plan on restart must preserve the committed claim.
+        worker=Worker(self.store,self.scope,self.bridge(approval),clock=lambda:self.now,
+            policy=self.policy,approval=approval,report=lambda _:None)
+        self.assertEqual(worker.tick()['state'],'verified')
+        self.assertEqual(self.writes,[{'id':'opp_new','done':True}])
+        with self.private.db() as db:
+            old=json.loads(db.execute('SELECT old_state FROM retarget_history').fetchone()[0])
+            self.assertIsNotNone(db.execute('SELECT claimed_at FROM write_claim').fetchone()[0])
+        self.assertEqual(json.loads(old['write_claim']['scope']),self.old)
+        self.assertIsNone(old['write_claim']['claimed_at'])
+
+    def test_new_plan_cannot_reset_or_remove_existing_retarget(self):
+        self.migrate()
+        bad=dict(self.plan,call_id='different-call')
+        for plan in (bad,None):
+            with self.subTest(plan=plan),self.assertRaises(ValueError):
+                Store(self.root/'public',self.capture_scope(self.scope),clock=lambda:self.now,retarget_plan=plan)
+            with self.assertRaises(ValueError):
+                PrivateClaim(self.root/'private',self.scope,clock=lambda:self.now,retarget_plan=plan)
+
+    def test_retarget_cannot_extend_window_or_change_owner_or_campaign(self):
+        from cloud.sdr.retarget import validate_plan
+        for change in ({'expires_at':self.scope['expires_at']+1},{'starts_at':self.scope['starts_at']+1},
+                       {'campaign_id':'cam_other'},{'assigned_rep_id':'usr_other'},
+                       {'task_id':self.old['task_id']}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                validate_plan(dict(self.plan,to_scope=dict(self.scope,**change)))
+
+    def test_captured_or_claimed_original_test_is_preserved_and_cannot_migrate(self):
+        for field,value in (('state','claimed'),('claimed_at',self.now),('write_receipt',0),
+                            ('approval','{}'),('policy','{}')):
+            with self.subTest(field=field):
+                with self.store.db() as db:db.execute('UPDATE completion SET '+field+'=?',(value,))
+                with self.assertRaises(ValueError):
+                    Store(self.root/'public',self.capture_scope(self.scope),clock=lambda:self.now,retarget_plan=self.plan)
+                with self.store.db() as db:
+                    self.assertEqual(json.loads(db.execute('SELECT value FROM scope').fetchone()[0]),self.capture_scope(self.old))
+                    db.execute('UPDATE completion SET '+field+'=?',('armed' if field=='state' else None,))
+        event=dict(workspace_id='workspace',prospect_id='123',call_id='old-call',rep_id='rep',
+            disposition_id='disp',disposition_name='Connected',started_at=self.now-1,finalized_at=self.now)
+        self.store.capture(event,self.now)
+        with self.assertRaises(ValueError):self.migrate()
+        self.assertEqual(self.store.summary()['event_count'],1)
+
+    def test_private_claim_cannot_be_retargeted_and_remains_committed(self):
+        approval=dict(call_id='old-call',event_digest='a'*64,policy_digest='b'*64,rep_id='rep',
+            disposition_id='disp',confirmed_contact=True,confirmed_non_suppressing_disposition=True)
+        self.assertTrue(self.private.claim(approval))
+        with self.assertRaises(ValueError):self.migrate()
+        self.assertFalse(self.private.claim(approval))
+        with self.private.db() as db:
+            self.assertEqual(json.loads(db.execute('SELECT scope FROM write_claim').fetchone()[0]),self.old)
+
+    def test_archive_and_scope_change_roll_back_together_on_failure(self):
+        with self.store.db() as db:
+            db.execute("CREATE TRIGGER refuse_retirement BEFORE DELETE ON completion BEGIN SELECT RAISE(ABORT,'blocked'); END")
+        with self.assertRaises(Exception):
+            Store(self.root/'public',self.capture_scope(self.scope),clock=lambda:self.now,retarget_plan=self.plan)
+        with self.store.db() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='retarget_history'").fetchone())
+            self.assertEqual(json.loads(db.execute('SELECT value FROM scope').fetchone()[0]),self.capture_scope(self.old))
+            self.assertEqual(db.execute('SELECT state FROM completion').fetchone()[0],'armed')
+
+    def test_invalid_signature_or_different_call_never_capture_or_claim(self):
+        self.migrate()
+        self.assertEqual(self.post(tamper=True).status_code,503)
+        event=copy.deepcopy(self.webhook);event['callData']['callId']='not-approved'
+        self.assertEqual(self.post(event).status_code,503)
+        self.assertEqual(self.store.summary()['event_count'],0)
+        approval=dict(call_id='not-approved',event_digest='a'*64,policy_digest=self.policy.digest,
+            rep_id='nooksrep',disposition_id='disp_connected',confirmed_contact=True,
+            confirmed_non_suppressing_disposition=True)
+        with self.assertRaises(ValueError):self.private.claim(approval)
+        self.assertEqual(self.writes,[])
+
+    def test_changed_provider_state_prevents_arming_even_with_signed_existing_call(self):
+        self.migrate();self.assertEqual(self.post().status_code,200);self.paused=True
+        worker=Worker(self.store,self.scope,self.bridge(),clock=lambda:self.now,report=lambda _:None)
+        self.assertEqual(worker.tick()['state'],'not_armed')
+        self.assertEqual(self.writes,[])
+
+    def test_expired_test_cannot_be_retargeted(self):
+        self.now=self.old['expires_at']+1
+        with self.assertRaises(ValueError):self.migrate()
+        with self.store.db() as db:
+            self.assertEqual(json.loads(db.execute('SELECT value FROM scope').fetchone()[0]),self.capture_scope(self.old))
+
+    def test_retired_receiver_objects_cannot_capture_or_rearm(self):
+        retired=self.store
+        self.migrate()
+        event=dict(workspace_id='workspace',prospect_id='123',call_id='old-call',rep_id='rep',
+            disposition_id='disp',disposition_name='Connected',started_at=self.now-1,finalized_at=self.now)
+        with self.assertRaises(ValueError):retired.capture(event,self.now)
+        with self.assertRaises(ValueError):self.original.arm(lambda *_:self.evidence(self.old))
+        self.assertEqual(self.store.summary()['event_count'],0)
+
+    def test_receiver_lock_is_exclusive_before_journal_migration(self):
+        import os
+        from cloud.sdr.receiver import owner_lock
+        lock=owner_lock(self.root/'public')
+        try:
+            with self.assertRaises(BlockingIOError):owner_lock(self.root/'public')
+            with self.store.db() as db:
+                self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='retarget_history'").fetchone())
+        finally:os.close(lock)
+
+    def test_incoherent_runtime_config_releases_owner_without_migrating(self):
+        import os
+        from unittest.mock import patch
+        from cloud.sdr import receiver
+        lock=os.open(self.root/'test-lock',os.O_RDWR|os.O_CREAT,0o600)
+        env={'RAILWAY_VOLUME_MOUNT_PATH':'/data','TEST_RETARGET':json.dumps(self.plan),
+             'LEMLIST_TEST_SCOPE':json.dumps(self.old),'CAPTURE_SCOPE':json.dumps(self.capture_scope(self.scope))}
+        with patch.dict(os.environ,env,clear=True),patch.object(receiver,'owner_lock',return_value=lock),patch.object(receiver,'Store') as constructor:
+            with self.assertRaises(ValueError):receiver.from_environment()
+            constructor.assert_not_called()
+        with self.assertRaises(OSError):os.fstat(lock)

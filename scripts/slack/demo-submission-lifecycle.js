@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { buildMessage, CHANNEL_ID } = require('./hubspot_demo');
 const { getOwnerSlackMap } = require('./slack-owner-map');
 const { CONFIG, ensureCalendlyOwnerMap, shouldProcessScheduledEvent, getOrganizerName } = require('./calendly_hubspot');
+const { DemoRequestDeals } = require('./demo-request-deals');
 
 const WINDOW_MS = 5 * 60 * 1000;
 const RANDOM_OWNER_IDS = ['84547076', '89305622']; // Sarah Elix, Xavier Marco
@@ -14,6 +15,11 @@ class DemoSubmissionLifecycle {
   constructor({ pool, hubspotRequest, calendlyRequest, fetchImpl = fetch, env = process.env, logger = console, now = Date.now, randomInt = crypto.randomInt, refreshOwners = ensureCalendlyOwnerMap }) {
     Object.assign(this, { pool, hubspotRequest, calendlyRequest, fetchImpl, env, logger, now, randomInt, refreshOwners });
     this.ownerSlackMap = getOwnerSlackMap(env);
+    if (env.DEMO_REQUEST_DEALS_ENABLED === 'true') {
+      this.dealsActivatedAt = ms(env.DEMO_REQUEST_DEALS_ACTIVATED_AT);
+      if (!Number.isFinite(this.dealsActivatedAt) || this.dealsActivatedAt <= 0) throw new Error('demo_request_deals_activation_required');
+      this.requestDeals = new DemoRequestDeals({ request: hubspotRequest });
+    }
   }
 
   async initialize() {
@@ -35,6 +41,10 @@ class DemoSubmissionLifecycle {
     // Existing timestamps belong to slack-testing; new rows explicitly use the current destination.
     await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS channel_id TEXT NOT NULL DEFAULT 'C066P0YFF6Z'");
     await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS parent_update_state TEXT NOT NULL DEFAULT 'pending'");
+    await this.pool.query('ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS deal_id TEXT');
+    await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS deal_state TEXT NOT NULL DEFAULT 'pending'");
+    await this.pool.query('ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS deal_next_check BIGINT NOT NULL DEFAULT 0');
+    await this.pool.query('CREATE INDEX IF NOT EXISTS demo_submission_deal_due ON demo_submission_lifecycle(deal_next_check) WHERE deal_state = \'pending\'');
     await this.pool.query(`CREATE INDEX IF NOT EXISTS demo_submission_due ON demo_submission_lifecycle(next_check)
       WHERE booked_state = 'pending' AND parent_state != 'needs_review'`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_submission_bookings (
@@ -42,6 +52,7 @@ class DemoSubmissionLifecycle {
       owner_id TEXT NOT NULL, details JSONB NOT NULL, canceled BOOLEAN NOT NULL DEFAULT false
     )`);
     await this.pool.query('CREATE INDEX IF NOT EXISTS demo_submission_booking_email ON demo_submission_bookings(email, booked_at)');
+    if (this.requestDeals) await this.requestDeals.initialize();
   }
 
   async enqueue(event) {
@@ -83,7 +94,8 @@ class DemoSubmissionLifecycle {
   }
 
   async withContactLock(contactId, operation) {
-    const client = await this.pool.connect();
+    const client = typeof this.pool.release === 'function' ? this.pool : await this.pool.connect();
+    const borrowed = client !== this.pool;
     const key = `demo-submission:${contactId}`;
     let locked = false;
     try {
@@ -92,7 +104,7 @@ class DemoSubmissionLifecycle {
       return await operation(client);
     } finally {
       try { if (locked) await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [key]); }
-      finally { client.release(); }
+      finally { if (borrowed) client.release(); }
     }
   }
 
@@ -166,12 +178,61 @@ class DemoSubmissionLifecycle {
     return (await this.pool.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 LIMIT 1', [String(contactId)])).rows.length > 0;
   }
 
+  async processDealRow(key) {
+    if (!this.requestDeals) return null;
+    const initial = (await this.pool.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
+    if (!initial || Number(initial.submitted_at) < this.dealsActivatedAt) return null;
+    const result = await this.withContactLock(initial.email, async client => {
+      const row = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
+      const saved = row.deal_id || (await client.query(`SELECT deal_id FROM demo_submission_lifecycle
+        WHERE contact_id = $1 AND deal_id IS NOT NULL ORDER BY submitted_at LIMIT 1`, [row.contact_id])).rows[0]?.deal_id;
+      const deal = await this.requestDeals.ensure({ contactId: row.contact_id, email: row.email, dealId: saved,
+        saveDeal: async id => client.query('UPDATE demo_submission_lifecycle SET deal_id = $2 WHERE submission_key = $1', [key, id]),
+      });
+      let ownerId = row.assigned_owner;
+      if (!ownerId && row.parent_state === 'sent') {
+        const contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}?properties=hubspot_owner_id`);
+        ownerId = contact.properties?.hubspot_owner_id;
+      }
+      if (ownerId) await this.requestDeals.syncOwner(deal.id, row.contact_id, ownerId);
+      await client.query("UPDATE demo_submission_lifecycle SET deal_state = 'ready' WHERE submission_key = $1", [key]);
+      return ownerId ? this.requestDeals.readDeal(deal.id) : deal;
+    });
+    if (!result) throw new Error('demo_request_deal_busy');
+    return result;
+  }
+
+  async ensureDealForBooking(contactId) {
+    if (!this.requestDeals) return null;
+    const row = (await this.pool.query(`SELECT submission_key FROM demo_submission_lifecycle
+      WHERE contact_id = $1 AND submitted_at >= $2 ORDER BY submitted_at DESC LIMIT 1`, [String(contactId), this.dealsActivatedAt])).rows[0];
+    return row ? this.processDealRow(row.submission_key) : null;
+  }
+
+  async hasRequestDeal(dealId) {
+    return (await this.pool.query('SELECT 1 FROM demo_submission_lifecycle WHERE deal_id = $1 LIMIT 1', [String(dealId)])).rows.length > 0;
+  }
+
+  async syncDealOwner(client, contactId, ownerId) {
+    if (!this.requestDeals) return;
+    const row = (await client.query('SELECT deal_id FROM demo_submission_lifecycle WHERE contact_id = $1 AND deal_id IS NOT NULL ORDER BY submitted_at DESC LIMIT 1', [String(contactId)])).rows[0];
+    if (row) {
+      try { await this.requestDeals.syncOwner(row.deal_id, contactId, ownerId); }
+      catch {
+        await client.query(`UPDATE demo_submission_lifecycle SET deal_state = 'pending', deal_next_check = $2
+          WHERE contact_id = $1 AND deal_id = $3`, [String(contactId), this.now() + 30000, row.deal_id]);
+        this.logger.error('demo_request_deal_owner_retry_pending', { contactId: String(contactId) });
+      }
+    }
+  }
+
   async reconcileBooking(booking) {
     if (!booking || booking.threadRootKey || booking.bookedAt > booking.submittedAt + WINDOW_MS) return;
     await this.withContactLock(booking.email, async client => {
       const newer = (await client.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 AND submitted_at > $2 LIMIT 1', [booking.contactId, booking.bookedAt])).rows.length;
       if (newer) return;
       await this.assignOwner(booking.contactId, booking.ownerId);
+      await this.syncDealOwner(client, booking.contactId, booking.ownerId);
     });
   }
 
@@ -331,6 +392,7 @@ class DemoSubmissionLifecycle {
       } else {
         contact = await this.assignOwner(row.contact_id, ownerId);
       }
+      await this.syncDealOwner(client, row.contact_id, ownerId);
       const mention = `<@${this.ownerSlackMap[ownerId]}>`;
       let parentTs = row.parent_ts;
       if (row.parent_state === 'pending' || (early && row.parent_ts)) {
@@ -369,6 +431,20 @@ class DemoSubmissionLifecycle {
   }
 
   async tick() {
+    if (this.requestDeals) {
+      // Deal retries are independent of the notification deadline and continue
+      // even after a booking notification has already completed.
+      const due = (await this.pool.query(`SELECT submission_key FROM demo_submission_lifecycle
+        WHERE submitted_at >= $1 AND deal_state = 'pending' AND deal_next_check <= $2
+        ORDER BY submitted_at LIMIT 25`, [this.dealsActivatedAt, this.now()])).rows;
+      for (const row of due) {
+        try { await this.processDealRow(row.submission_key); }
+        catch {
+          await this.pool.query('UPDATE demo_submission_lifecycle SET deal_next_check = $2 WHERE submission_key = $1', [row.submission_key, this.now() + 30000]);
+          this.logger.error('demo_request_deal_retry_pending', { submissionKey: row.submission_key });
+        }
+      }
+    }
     const rows = (await this.pool.query(`SELECT submission_key FROM demo_submission_lifecycle
       WHERE next_check <= $1 AND booked_state = 'pending' AND parent_state != 'needs_review'
       ORDER BY next_check LIMIT 25`, [this.now()])).rows;

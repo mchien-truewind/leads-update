@@ -513,7 +513,9 @@ async function postBookedDemoSlackAlert({
   meetingHostName = ownerName,
   dealId = '',
   alertAttempts,
+  suppressSubmissionAlert = false,
 }) {
+  if (suppressSubmissionAlert) return null;
   const channel = clean(slackChannel) || clean(process.env.CALENDLY_DEMO_SLACK_CHANNEL_ID)
     || clean(process.env.CALENDLY_DEMO_SLACK_CHANNEL)
     || DEFAULT_DEMO_SLACK_CHANNEL_ID;
@@ -971,7 +973,7 @@ async function handleInviteeCreated(payload, scheduledEvent, filter, options = {
 
   const ownerName = getOrganizerName(filter.hostUserUri, scheduledEvent);
   let slackAlert = null;
-  const shouldPostBookedDemoAlert = !isRescheduled(payload);
+  const shouldPostBookedDemoAlert = !isRescheduled(payload) && !options.suppressSubmissionAlert;
   if (shouldPostBookedDemoAlert) {
     slackAlert = await postBookedDemoSlackAlert({
       slackClient: options.slackClient,
@@ -1034,12 +1036,27 @@ async function processCalendlyWebhook(body, options = {}) {
   if (options.demoBookingStore && !options.bookingLocked) {
     const inviteeUri = getInviteeUri(body.payload || {});
     if (!inviteeUri) throw new Error('missing_invitee_uri');
-    return options.demoBookingStore.withLock(inviteeUri, lockedStore => processCalendlyWebhook(body, { ...options, demoBookingStore: lockedStore, bookingLocked: true }));
+    let submissionBooking;
+    try {
+      return await options.demoBookingStore.withLock(inviteeUri, lockedStore => {
+        const scopedLifecycle = options.demoLifecycle ? Object.create(options.demoLifecycle) : null;
+        if (scopedLifecycle) {
+          scopedLifecycle.pool = lockedStore.pool;
+          scopedLifecycle.reconcileBooking = async booking => { submissionBooking = booking; };
+        }
+        return processCalendlyWebhook(body, { ...options, demoLifecycle: scopedLifecycle, demoBookingStore: lockedStore, bookingLocked: true });
+      });
+    } finally {
+      // Release the booking connection before obtaining the contact lock: avoid
+      // exhausting the pool when several Calendly deliveries arrive together.
+      if (submissionBooking) await options.demoLifecycle.reconcileBooking(submissionBooking);
+    }
   }
   const processingKey = webhookProcessingKey(body);
   if (processingKey && inFlightWebhookKeys.has(processingKey)) return { action: 'ignored_in_flight_duplicate' };
   if (processingKey) inFlightWebhookKeys.add(processingKey);
   let durableRecord;
+  let submissionBooking;
   try {
     durableRecord = options.demoBookingStore ? { skipped: false } : acquireDurableProcessingRecord(processingKey);
     if (durableRecord.skipped) return { action: `ignored_${durableRecord.status}_duplicate` };
@@ -1069,6 +1086,10 @@ async function processCalendlyWebhook(body, options = {}) {
       };
     }
 
+    if (options.demoLifecycle) {
+      submissionBooking = await options.demoLifecycle.observeBooking(eventName, payload, scheduledEvent, filter);
+      options = { ...options, suppressSubmissionAlert: Boolean(submissionBooking) };
+    }
     const priorLink = options.demoBookingStore ? await options.demoBookingStore.get(getInviteeUri(payload)) : null;
     if (eventName === 'invitee.created' && priorLink && !priorLink.reused_existing_deal && priorLink.notification_state === 'sent') return { action: 'ignored_succeeded_duplicate' };
     const routed = await routeBooking({ eventName, payload, scheduledEvent, filter,
@@ -1097,6 +1118,7 @@ async function processCalendlyWebhook(body, options = {}) {
     throw err;
   } finally {
     if (processingKey) inFlightWebhookKeys.delete(processingKey);
+    if (submissionBooking) await options.demoLifecycle.reconcileBooking(submissionBooking);
   }
 }
 

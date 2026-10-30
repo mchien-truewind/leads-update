@@ -50,6 +50,7 @@ const { DemoNotificationStore, handleHubSpotDemoWebhook } = require('./hubspot_d
 const { createDemoRouter, routingEnabled } = require('./demo-routing');
 const { handleDemoRoutingRequest } = require('./demo-routing-http');
 const { DemoBookingStore } = require('./demo-booking-store');
+const { DemoSubmissionLifecycle } = require('./demo-submission-lifecycle');
 const { startDemoRoutingRecovery } = require('./demo-routing-recovery');
 const { verifyOwnerRegistry } = require('./demo-routing-readiness');
 const {
@@ -259,6 +260,7 @@ let slackStateStore = createPostgresSlackStateStore({
   connectionString: process.env.DEAL_OWNER_OVERRIDE_DATABASE_URL || process.env.SLACK_STATE_DATABASE_URL,
 });
 let demoNotificationStore = null;
+let demoLifecycle = null;
 let demoRouter = null;
 let demoBookingStore = null;
 let slackBotUserIdPromise = null;
@@ -6198,7 +6200,7 @@ function startHttpServer() {
     }
     if (req.url.split('?')[0] === '/api/webhooks/hubspot') {
       await handleHubSpotDemoWebhook(req, res, {
-        env: process.env, store: demoNotificationStore, hubspotRequest, logger: console, demoRouter,
+        env: process.env, store: demoNotificationStore, hubspotRequest, logger: console, demoRouter, demoLifecycle,
       });
       return;
     }
@@ -6341,7 +6343,7 @@ function startHttpServer() {
       try {
         await handleCalendlyHubSpotWebhook(req, res, {
           logger: console,
-          demoRouter, demoBookingStore,
+          demoRouter, demoBookingStore, demoLifecycle,
           slackClient: app.client,
           slackToken: process.env.SLACK_BOT_TOKEN,
           slackChannel: process.env.CALENDLY_DEMO_SLACK_CHANNEL_ID || process.env.CALENDLY_DEMO_SLACK_CHANNEL,
@@ -6557,7 +6559,11 @@ async function startSlackBot() {
     }
     demoNotificationStore = new DemoNotificationStore(slackStateStore.pool);
     await demoNotificationStore.initialize();
-    console.log('HubSpot demo webhook ready: #slack-testing');
+    if (!(process.env.CALENDLY_API || process.env.CALENDLY_API_KEY)) throw new Error('Demo submission notifications require the Calendly API token');
+    demoLifecycle = new DemoSubmissionLifecycle({ pool: slackStateStore.pool,
+      hubspotRequest: hubspotRequestFromFetchOptions, calendlyRequest });
+    await demoLifecycle.initialize();
+    console.log('HubSpot demo webhook ready: #slack-testing (five-minute booking window)');
   }
 
   if (process.env.DEMO_ROUTING_ENABLED === 'true' || process.env.DEMO_ROUTING_ACTIVATED_AT) {
@@ -6573,8 +6579,10 @@ async function startSlackBot() {
     demoBookingStore = new DemoBookingStore(slackStateStore.pool);
     await demoBookingStore.initialize();
     if (routingEnabled(process.env)) startDemoRoutingRecovery({ env: process.env, store: demoNotificationStore,
-      hubspotRequest, demoRouter, logger: console });
+      hubspotRequest, demoRouter, demoLifecycle, logger: console });
   }
+
+  if (demoLifecycle) demoLifecycle.start();
 
   // HTTP server (health check + webhook routes) runs in every role. Webhook routes
   // only receive traffic on the service the public domain points at (the worker).

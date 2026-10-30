@@ -149,7 +149,12 @@ function retryError(code) {
   return error;
 }
 
-async function processEvent(event, { store, hubspotRequest, env, fetchImpl = fetch, logger = console, demoRouter = null }) {
+async function processEvent(event, { store, hubspotRequest, env, fetchImpl = fetch, logger = console, demoRouter = null, demoLifecycle = null }) {
+  if (demoLifecycle) {
+    const previous = await store.get(eventKey(event));
+    if (previous?.status === 'completed') return 'duplicate';
+    return demoLifecycle.enqueue(event);
+  }
   const key = await store.record(event);
   const claim = await store.claim(key);
   if (!claim) {
@@ -250,6 +255,7 @@ async function handleHubSpotDemoWebhook(req, res, options) {
     const results = [];
     for (const event of events.filter(isDemoEvent)) results.push(await processEvent(event, { ...options, env, store, hubspotRequest, logger }));
     return reply(200, {
+      queued: results.filter(value => value === 'queued').length,
       received: events.length, sent: results.filter(value => value === 'sent').length,
       duplicates: results.filter(value => value === 'duplicate').length,
       needsReview: results.filter(value => value === 'needs_review').length,

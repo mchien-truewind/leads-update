@@ -68,12 +68,13 @@ before(async () => {
   await lifecycle.initialize();
 });
 beforeEach(async () => {
-  await db.exec('TRUNCATE demo_submission_lifecycle, demo_submission_bookings');
+  await db.exec('TRUNCATE demo_submission_lifecycle, demo_submission_bookings, demo_company_enrichment');
   time = submittedAt;
   posts = []; updates = []; assignments = []; bookings = []; discoverCalls = [];
   contactOwner = '91143842'; failDiscovery = false; failPost = false;
   delete lifecycle.requestDeals;
   delete lifecycle.dealsActivatedAt;
+  delete lifecycle.apolloEnricher;
   // The lookup behavior is tested independently below; avoid real requests in lifecycle tests.
   lifecycle.discoverBookings = async function (row) {
     discoverCalls.push(row.email);
@@ -679,4 +680,84 @@ test('deal owner sync failure retries independently without delaying Slack notif
   await lifecycle.tick();
   assert.equal((await row()).deal_state, 'ready');
   assert.equal(posts.length, 2);
+});
+
+
+test('booking company name is persisted before company work so background retries retain it', async () => {
+  const f = enableDealFixture({ fail: true });
+  await lifecycle.enqueue(formEvent);
+  await assert.rejects(lifecycle.ensureDealForBooking('123', 'Booking Company'), /CRM unavailable/);
+  assert.equal((await row()).company_name, 'Booking Company');
+  f.recover();
+  await lifecycle.tick();
+  assert.equal(f.ensured.at(-1).companyName, 'Booking Company');
+  assert.equal((await row()).deal_state, 'ready');
+});
+
+
+test('company enrichment cache survives write failures and avoids repeated lookups for 30 days', async () => {
+  let calls = 0, fail = true;
+  const cached = { properties: { website: 'https://example.business' }, source: { domain: 'example.business', name: 'Example' } };
+  lifecycle.apolloEnricher = { async enrich(id, previous, save) {
+    calls++;
+    if (!previous) await save(cached); else assert.deepEqual(previous, cached);
+    if (fail) throw new Error('HubSpot unavailable');
+    return 'enriched';
+  } };
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await lifecycle.tickCompanyEnrichment();
+  let job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(job.state, 'pending');
+  assert.deepEqual(job.cached_properties, cached);
+  assert.equal(calls, 1);
+  fail = false; time += 60000;
+  await lifecycle.tickCompanyEnrichment();
+  job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(job.state, 'ready');
+  assert.equal(calls, 2);
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await lifecycle.tickCompanyEnrichment();
+  assert.equal(calls, 2);
+  time += 30 * 86400000 + 1;
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(job.state, 'pending');
+  assert.equal(job.cached_properties, null);
+});
+
+test('Apollo rate limits do not delay deal creation or five-minute Slack notifications', async () => {
+  enableDealFixture();
+  lifecycle.apolloEnricher = { async enrich() { throw Object.assign(new Error('apollo_company_http_429'), { retryAfterMs: 120000 }); } };
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await lifecycle.tickCompanyEnrichment();
+  const job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(Number(job.next_check), submittedAt + 120000);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal((await row()).deal_state, 'ready');
+  assert.equal(posts.length, 2);
+});
+
+test('changed company identity discards stale enrichment cache for a fresh retry', async () => {
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await pool.query("UPDATE demo_company_enrichment SET cached_properties = '{}'::jsonb");
+  lifecycle.apolloEnricher = { async enrich() { throw new Error('apollo_company_identity_changed'); } };
+  await lifecycle.tickCompanyEnrichment();
+  const job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(job.cached_properties, null);
+  assert.equal(job.state, 'pending');
+});
+
+test('company metadata survives the owner refresh and enqueues only one enrichment job', async () => {
+  enableDealFixture();
+  const ensure = lifecycle.requestDeals.ensure;
+  lifecycle.requestDeals.ensure = async input => ({ ...await ensure(input), company: { id: '200', name: 'Example' } });
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const deal = await lifecycle.ensureDealForBooking('123');
+  assert.deepEqual(deal.company, { id: '200', name: 'Example' });
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM demo_company_enrichment')).rows[0].count, 1);
 });

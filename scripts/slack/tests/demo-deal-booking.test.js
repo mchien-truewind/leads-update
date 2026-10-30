@@ -8,8 +8,8 @@ const payload = { email: 'fixture@gmail.com', name: 'Fixture Lead', uri: 'https:
 const event = { name: 'Demo', start_time: '2026-11-01T12:00:00Z', end_time: '2026-11-01T12:30:00Z' };
 const filter = { ownerId: '89305622', hostUserUri: '', eventTypeUri: 'type' };
 
-function mockHubspot(t, { managed = true, cancellation = false, associationError = false } = {}) {
-  const calls = [];
+function mockHubspot(t, { managed = true, cancellation = false, associationError = false, formCompany } = {}) {
+  const calls = [], companyHints = [];
   const oldToken = process.env.HUBSPOT_PRIVATE_TOKEN;
   process.env.HUBSPOT_PRIVATE_TOKEN = 'fixture-only-token';
   t.after(() => { if (oldToken === undefined) delete process.env.HUBSPOT_PRIVATE_TOKEN; else process.env.HUBSPOT_PRIVATE_TOKEN = oldToken; });
@@ -43,12 +43,13 @@ function mockHubspot(t, { managed = true, cancellation = false, associationError
     });
     return req;
   });
-  return { calls, options: { suppressSubmissionAlert: true, demoLifecycle: {
+  return { calls, companyHints, options: { suppressSubmissionAlert: true, demoLifecycle: {
     requestDeals: managed, hasRequestDeal: async () => managed,
-    async ensureDealForBooking(id) {
+    async ensureDealForBooking(id, companyName) {
+      companyHints.push(companyName);
       assert.equal(id, '1');
       if (associationError) throw new Error('HubSpot failed 503');
-      return structuredClone(existingDeal);
+      return { ...structuredClone(existingDeal), company: formCompany };
     },
   } } };
 }
@@ -90,4 +91,20 @@ test('unmanaged cancellation retains the existing close-lost behavior', async t 
   const result = await handleInviteeCanceled(payload, event, filter, f.options);
   assert.equal(result.action, 'closed_lost_no_show');
   assert.ok(f.calls.some(c => c.path === '/crm/v3/objects/deals/20' && c.body.properties.dealstage === CONFIG.closedLostStageId));
+});
+
+
+test('Calendly reuses the form company without invoking its legacy company creator', async t => {
+  const f = mockHubspot(t, { formCompany: { id: '200', name: 'Created Company' } });
+  await handleInviteeCreated(payload, event, filter, f.options);
+  assert.ok(!f.calls.some(c => c.path === '/crm/v3/objects/companies' || c.path === '/crm/v3/objects/companies/search'));
+  assert.ok(f.calls.some(c => c.path === '/crm/v4/objects/deals/20/associations/default/companies/200'));
+  assert.ok(f.calls.some(c => c.path === '/crm/v4/objects/meetings/30/associations/default/companies/200'));
+});
+
+
+test('explicit Calendly company answers are passed into the durable form lifecycle', async t => {
+  const f = mockHubspot(t, { formCompany: { id: '200', name: 'Booking Company' } });
+  await handleInviteeCreated({ ...payload, questions_and_answers: [{ question: 'Company name', answer: 'Booking Company' }] }, event, filter, f.options);
+  assert.deepEqual(f.companyHints, ['Booking Company']);
 });

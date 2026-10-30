@@ -3,6 +3,7 @@ const { buildMessage, CHANNEL_ID } = require('./hubspot_demo');
 const { getOwnerSlackMap } = require('./slack-owner-map');
 const { CONFIG, ensureCalendlyOwnerMap, shouldProcessScheduledEvent, getOrganizerName } = require('./calendly_hubspot');
 const { DemoRequestDeals } = require('./demo-request-deals');
+const { ApolloCompanyEnricher } = require('./apollo-company-enrichment');
 
 const WINDOW_MS = 5 * 60 * 1000;
 const RANDOM_OWNER_IDS = ['84547076', '89305622']; // Sarah Elix, Xavier Marco
@@ -19,6 +20,9 @@ class DemoSubmissionLifecycle {
       this.dealsActivatedAt = ms(env.DEMO_REQUEST_DEALS_ACTIVATED_AT);
       if (!Number.isFinite(this.dealsActivatedAt) || this.dealsActivatedAt <= 0) throw new Error('demo_request_deals_activation_required');
       this.requestDeals = new DemoRequestDeals({ request: hubspotRequest });
+      if (env.APOLLO_API_KEY?.trim()) this.apolloEnricher = new ApolloCompanyEnricher({
+        request: hubspotRequest, apiKey: env.APOLLO_API_KEY.trim(), fetchImpl,
+      });
     }
   }
 
@@ -42,6 +46,7 @@ class DemoSubmissionLifecycle {
     await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS channel_id TEXT NOT NULL DEFAULT 'C066P0YFF6Z'");
     await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS parent_update_state TEXT NOT NULL DEFAULT 'pending'");
     await this.pool.query('ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS deal_id TEXT');
+    await this.pool.query('ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS company_name TEXT');
     await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS deal_state TEXT NOT NULL DEFAULT 'pending'");
     await this.pool.query('ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS deal_next_check BIGINT NOT NULL DEFAULT 0');
     await this.pool.query('CREATE INDEX IF NOT EXISTS demo_submission_deal_due ON demo_submission_lifecycle(deal_next_check) WHERE deal_state = \'pending\'');
@@ -52,7 +57,14 @@ class DemoSubmissionLifecycle {
       owner_id TEXT NOT NULL, details JSONB NOT NULL, canceled BOOLEAN NOT NULL DEFAULT false
     )`);
     await this.pool.query('CREATE INDEX IF NOT EXISTS demo_submission_booking_email ON demo_submission_bookings(email, booked_at)');
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_company_enrichment (
+      company_id TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'pending',
+      next_check BIGINT NOT NULL DEFAULT 0, checked_at BIGINT,
+      attempts INTEGER NOT NULL DEFAULT 0, cached_properties JSONB, last_status TEXT
+    )`);
+    await this.pool.query("CREATE INDEX IF NOT EXISTS demo_company_enrichment_due ON demo_company_enrichment(next_check) WHERE state = 'pending'");
     if (this.requestDeals) await this.requestDeals.initialize();
+    if (this.apolloEnricher) await this.apolloEnricher.initialize();
   }
 
   async enqueue(event) {
@@ -187,6 +199,7 @@ class DemoSubmissionLifecycle {
       const saved = row.deal_id || (await client.query(`SELECT deal_id FROM demo_submission_lifecycle
         WHERE contact_id = $1 AND deal_id IS NOT NULL ORDER BY submitted_at LIMIT 1`, [row.contact_id])).rows[0]?.deal_id;
       const deal = await this.requestDeals.ensure({ contactId: row.contact_id, email: row.email, dealId: saved,
+        companyName: row.company_name,
         saveDeal: async id => client.query('UPDATE demo_submission_lifecycle SET deal_id = $2 WHERE submission_key = $1', [key, id]),
       });
       let ownerId = row.assigned_owner;
@@ -195,22 +208,61 @@ class DemoSubmissionLifecycle {
         ownerId = contact.properties?.hubspot_owner_id;
       }
       if (ownerId) await this.requestDeals.syncOwner(deal.id, row.contact_id, ownerId);
+      if (deal.company?.id) await this.enqueueCompanyEnrichment(client, deal.company.id);
       await client.query("UPDATE demo_submission_lifecycle SET deal_state = 'ready' WHERE submission_key = $1", [key]);
-      return ownerId ? this.requestDeals.readDeal(deal.id) : deal;
+      return ownerId ? { ...await this.requestDeals.readDeal(deal.id), company: deal.company } : deal;
     });
     if (!result) throw new Error('demo_request_deal_busy');
     return result;
   }
 
-  async ensureDealForBooking(contactId) {
+  async ensureDealForBooking(contactId, companyName) {
     if (!this.requestDeals) return null;
     const row = (await this.pool.query(`SELECT submission_key FROM demo_submission_lifecycle
       WHERE contact_id = $1 AND submitted_at >= $2 ORDER BY submitted_at DESC LIMIT 1`, [String(contactId), this.dealsActivatedAt])).rows[0];
+    if (row && String(companyName || '').trim()) await this.pool.query(`UPDATE demo_submission_lifecycle
+      SET company_name = COALESCE(company_name, $2), deal_state = 'pending' WHERE submission_key = $1`, [row.submission_key, String(companyName).trim()]);
     return row ? this.processDealRow(row.submission_key) : null;
   }
 
   async hasRequestDeal(dealId) {
     return (await this.pool.query('SELECT 1 FROM demo_submission_lifecycle WHERE deal_id = $1 LIMIT 1', [String(dealId)])).rows.length > 0;
+  }
+
+  async enqueueCompanyEnrichment(client, companyId) {
+    const stale = "demo_company_enrichment.state = 'ready' AND demo_company_enrichment.checked_at <= $3";
+    await client.query(`INSERT INTO demo_company_enrichment (company_id, next_check) VALUES ($1,$2)
+      ON CONFLICT (company_id) DO UPDATE SET
+        state = CASE WHEN ${stale} THEN 'pending' ELSE demo_company_enrichment.state END,
+        cached_properties = CASE WHEN ${stale} THEN NULL ELSE demo_company_enrichment.cached_properties END,
+        attempts = CASE WHEN ${stale} THEN 0 ELSE demo_company_enrichment.attempts END,
+        next_check = CASE WHEN ${stale} THEN $2 ELSE demo_company_enrichment.next_check END`,
+    [String(companyId), this.now(), this.now() - 30 * 86400000]);
+  }
+
+  async tickCompanyEnrichment() {
+    if (!this.apolloEnricher) return;
+    const due = (await this.pool.query(`SELECT company_id FROM demo_company_enrichment
+      WHERE state = 'pending' AND next_check <= $1 ORDER BY next_check LIMIT 3`, [this.now()])).rows;
+    for (const item of due) {
+      await this.withContactLock(`apollo-company:${item.company_id}`, async client => {
+        const row = (await client.query('SELECT * FROM demo_company_enrichment WHERE company_id = $1', [item.company_id])).rows[0];
+        if (!row || row.state !== 'pending' || Number(row.next_check) > this.now()) return;
+        try {
+          const status = await this.apolloEnricher.enrich(row.company_id, row.cached_properties,
+            async cached => client.query('UPDATE demo_company_enrichment SET cached_properties = $2::jsonb WHERE company_id = $1', [row.company_id, JSON.stringify(cached)]));
+          await client.query(`UPDATE demo_company_enrichment SET state = 'ready', checked_at = $2,
+            last_status = $3, next_check = $4 WHERE company_id = $1`, [row.company_id, this.now(), status, this.now() + 30 * 86400000]);
+        } catch (error) {
+          const reason = /^apollo_company_[a-z0-9_]+$/.test(error.message) ? error.message : 'hubspot_company_enrichment_failed';
+          const delay = Math.min(3600000, Math.max(60000, error.retryAfterMs || 60000 * 2 ** Math.min(Number(row.attempts), 6)));
+          await client.query(`UPDATE demo_company_enrichment SET next_check = $2, attempts = attempts + 1,
+            last_status = $3, cached_properties = CASE WHEN $4 THEN NULL ELSE cached_properties END WHERE company_id = $1`,
+          [row.company_id, this.now() + delay, reason, ['apollo_company_identity_changed', 'apollo_company_cache_invalid'].includes(reason)]);
+          this.logger.error('demo_company_enrichment_retry_pending', { companyId: row.company_id, reason });
+        }
+      });
+    }
   }
 
   async syncDealOwner(client, contactId, ownerId) {
@@ -468,6 +520,18 @@ class DemoSubmissionLifecycle {
     const timer = setInterval(run, 15000);
     timer.unref();
     void run();
+    if (this.apolloEnricher) {
+      let enriching = false;
+      const enrich = async () => {
+        if (enriching) return;
+        enriching = true;
+        try { await this.tickCompanyEnrichment(); } catch { this.logger.error('demo_company_enrichment_worker_failed'); }
+        finally { enriching = false; }
+      };
+      this.enrichmentTimer = setInterval(enrich, 15000);
+      this.enrichmentTimer.unref();
+      void enrich();
+    }
     return timer;
   }
 }

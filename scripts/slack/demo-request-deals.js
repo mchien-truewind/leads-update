@@ -2,6 +2,7 @@ const { findOpenDemoDeal } = require('./demo-open-deal');
 const { getEmailDomain, isUsableCompanyDomain } = require('./calendly_hubspot');
 
 const CONTACT_KEY_PROPERTY = 'truewind_demo_request_contact_id';
+const COMPANY_KEY_PROPERTY = 'truewind_demo_company_key';
 const PIPELINE_ID = '105321581';
 const STAGE_ID = '1307720553';
 const normalize = value => String(value || '').trim().toLowerCase();
@@ -14,6 +15,10 @@ class DemoRequestDeals {
     if (property.name !== CONTACT_KEY_PROPERTY || property.type !== 'string' || property.hasUniqueValue !== true) {
       throw new Error('demo_request_unique_property_required');
     }
+    const companyProperty = await this.request(`/crm/v3/properties/companies/${COMPANY_KEY_PROPERTY}`);
+    if (companyProperty.name !== COMPANY_KEY_PROPERTY || companyProperty.type !== 'string' || companyProperty.hasUniqueValue !== true) {
+      throw new Error('demo_request_unique_company_property_required');
+    }
     const pipeline = await this.request(`/crm/v3/pipelines/deals/${PIPELINE_ID}`);
     if (!pipeline.stages?.some(s => s.id === STAGE_ID && [false, 'false'].includes(s.metadata?.isClosed))) {
       throw new Error('demo_request_stage_unavailable');
@@ -24,7 +29,7 @@ class DemoRequestDeals {
 
   async readDeal(id, unique = false) {
     try {
-      return await this.request(`/crm/v3/objects/deals/${encodeURIComponent(id)}?properties=${CONTACT_KEY_PROPERTY},hubspot_owner_id${unique ? `&idProperty=${CONTACT_KEY_PROPERTY}` : ''}`);
+      return await this.request(`/crm/v3/objects/deals/${encodeURIComponent(id)}?properties=${CONTACT_KEY_PROPERTY},hubspot_owner_id,dealname,description${unique ? `&idProperty=${CONTACT_KEY_PROPERTY}` : ''}`);
     } catch (error) {
       if (unique && error.statusCode === 404) return null;
       throw error;
@@ -54,8 +59,8 @@ class DemoRequestDeals {
       if (company.archived || String(company.id) !== companyId) throw new Error('demo_request_company_unavailable');
       return { id: companyId, name: company.properties?.name || company.properties?.domain || 'Company' };
     }
-    // Match an existing corporate company; do not invent a company from a
-    // personal email address or create an unverified company record.
+    // Match existing records before creating a company from an explicit name
+    // or business email domain. Personal email domains are never companies.
     const domain = getEmailDomain(contact.properties.email);
     if (isUsableCompanyDomain(domain)) {
       const page = await this.request('/crm/v3/objects/companies/search', {
@@ -82,12 +87,38 @@ class DemoRequestDeals {
         return { id: String(match.id), name: match.properties.name };
       }
     }
-    return { reason: 'no associated or matching company record' };
+    if (!name && !isUsableCompanyDomain(domain)) return { reason: 'no company name or business email domain' };
+    const key = isUsableCompanyDomain(domain) ? `domain:${domain}` : `name:${normalize(name)}`;
+    const path = `/crm/v3/objects/companies/${encodeURIComponent(key)}?idProperty=${COMPANY_KEY_PROPERTY}&properties=name,domain,${COMPANY_KEY_PROPERTY}`;
+    const read = async () => {
+      try { return await this.request(path); }
+      catch (error) { if (error.statusCode === 404) return null; throw error; }
+    };
+    let created = await read();
+    if (!created) {
+      try {
+        created = await this.request('/crm/v3/objects/companies', { method: 'POST', body: { properties: {
+          name: name || domain,
+          ...(isUsableCompanyDomain(domain) ? { domain } : {}),
+          [COMPANY_KEY_PROPERTY]: key,
+        } } });
+      } catch (error) {
+        // Recover a committed create after a lost response or unique-key
+        // conflict without depending on HubSpot search indexing.
+        created = await read();
+        if (!created) throw error;
+      }
+    }
+    if (!/^\d+$/.test(String(created.id)) || created.archived || created.properties?.[COMPANY_KEY_PROPERTY] !== key) throw new Error('demo_request_created_company_invalid');
+    return { id: String(created.id), name: created.properties.name || name || domain };
   }
 
-  async ensure({ contactId, email, dealId, saveDeal }) {
+  async ensure({ contactId, email, dealId, saveDeal, companyName }) {
     const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id`);
     if (String(contact.id) !== String(contactId) || contact.archived || normalize(contact.properties?.email) !== normalize(email)) throw new Error('demo_request_contact_identity_invalid');
+    if (!String(contact.properties.company || '').trim() && String(companyName || '').trim()) {
+      contact.properties = { ...contact.properties, company: String(companyName).trim() };
+    }
     const company = await this.company(contact);
     let deal = dealId ? await this.readDeal(dealId) : await this.readDeal(contactId, true);
     if (!deal) deal = await findOpenDemoDeal({ request: this.request, contactId, companyId: company.id, pipelineId: PIPELINE_ID });
@@ -120,8 +151,15 @@ class DemoRequestDeals {
     if (company.id) {
       await this.request(`/crm/v4/objects/contacts/${contactId}/associations/default/companies/${company.id}`, { method: 'PUT' });
       await this.request(`/crm/v4/objects/deals/${deal.id}/associations/default/companies/${company.id}`, { method: 'PUT' });
+      if (deal.properties?.[CONTACT_KEY_PROPERTY] === String(contactId)
+        && deal.properties.dealname?.endsWith(' - Demo Request [Company missing]')
+        && deal.properties.description?.startsWith('Created from a demo request. COMPANY MISSING:')) {
+        const properties = { dealname: `${company.name} - Demo Request`, description: 'Created from a demo request.' };
+        await this.request(`/crm/v3/objects/deals/${deal.id}`, { method: 'PATCH', body: { properties } });
+        deal.properties = { ...deal.properties, ...properties };
+      }
     }
-    return { ...deal, id: String(deal.id) };
+    return { ...deal, id: String(deal.id), company: company.id ? company : null };
   }
 
   async syncOwner(dealId, contactId, ownerId) {
@@ -133,4 +171,4 @@ class DemoRequestDeals {
   }
 }
 
-module.exports = { DemoRequestDeals, CONTACT_KEY_PROPERTY, PIPELINE_ID, STAGE_ID };
+module.exports = { DemoRequestDeals, CONTACT_KEY_PROPERTY, COMPANY_KEY_PROPERTY, PIPELINE_ID, STAGE_ID };

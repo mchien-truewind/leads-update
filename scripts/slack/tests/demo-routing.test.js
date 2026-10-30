@@ -200,3 +200,13 @@ test('internal resolver requires a dedicated credential and rejects malformed re
 });
 
 module.exports = { fixture, environment, registry };
+
+test('submission booking keeps existing opportunity associations without replacing the contact owner', async () => {
+  const { router, state } = fixture();
+  const route = await router.alignContact({ email: state.contact.properties.email, contactId: '10', preserveContactOwner: true });
+  assert.equal(route.dealId, '30');
+  assert.equal(route.ownerId, '40');
+  assert.equal(state.contact.properties.hubspot_owner_id, '99');
+  assert.equal(state.writes.filter(w => w.method === 'PATCH').length, 0);
+  assert.ok(state.writes.some(w => w.path.includes('/associations/default/deals/30')));
+});

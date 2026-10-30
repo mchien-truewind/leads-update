@@ -59,7 +59,7 @@ async function routeBooking({ eventName, payload, scheduledEvent, filter, option
   // Claim the identity before creating the meeting. Retries must never fall through
   // to legacy deal creation after a partial write or a later deal-stage change.
   link = await store.put({ inviteeUri, eventUri, contactId: String(contact.id), dealId: route.dealId, reusedExistingDeal: true });
-  route = await router.alignContact({ email: payload.email, contactId: String(contact.id), dealId: link.deal_id });
+  route = await router.alignContact({ email: payload.email, contactId: String(contact.id), dealId: link.deal_id, preserveContactOwner: options.suppressSubmissionAlert === true });
   if (route.status !== 'existing_deal' || route.dealId !== link.deal_id) throw new Error('booking_owner_reconciliation_failed');
 
   // A new invitee gets its own meeting, including reschedules. Do not overwrite
@@ -78,7 +78,7 @@ async function routeBooking({ eventName, payload, scheduledEvent, filter, option
   }
 
   // Check the owner again immediately before the external notification.
-  route = await router.alignContact({ email: payload.email, contactId: String(contact.id), dealId: link.deal_id });
+  route = await router.alignContact({ email: payload.email, contactId: String(contact.id), dealId: link.deal_id, preserveContactOwner: options.suppressSubmissionAlert === true });
   if (route.status !== 'existing_deal') throw new Error('booking_owner_reconciliation_failed');
   if (!api.isRescheduled(payload) && !route.slackUserId) throw new Error('booking_owner_notification_mapping_missing');
   if (!api.isRescheduled(payload) && await store.claimNotification(inviteeUri)) {

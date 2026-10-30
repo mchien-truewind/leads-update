@@ -240,3 +240,14 @@ test('pending routing notifications recover after provider retries stop, without
   assert.equal((await store.get(eventKey(event))).status, 'completed');
   assert.equal((await store.get(eventKey(historical))).status, 'pending');
 });
+
+test('signed form webhook acknowledges durable queueing and does not immediately send Slack', async () => {
+  const queued = [];
+  const deps = dependencies({ demoLifecycle: { async enqueue(value) { queued.push(value); return 'queued'; } } });
+  const result = await webhook([event], deps);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.queued, 1);
+  assert.equal(result.body.sent, 0);
+  assert.equal(queued[0].objectId, event.objectId);
+  assert.equal(deps.messages.length, 0);
+});

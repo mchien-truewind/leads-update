@@ -74,7 +74,7 @@ function bookedContactOwnerUpdates(dealIds, dealToHost, dealToContacts, contactP
 }
 
 // ---------- Symptom #2: deal owner = meeting host ----------
-async function reconcileDealOwners(owners, { overrideStore = null, api = null, dryRun = cfg.DRY_RUN, demoRouter = getDemoRouter() } = {}) {
+async function reconcileDealOwners(owners, { overrideStore = null, api = null, dryRun = cfg.DRY_RUN, isContactManaged = async () => false, demoRouter = getDemoRouter() } = {}) {
   const crm = api || { hub, searchAll, associations, batchRead, sleep };
   const cutoff = Date.now() - cfg.MEETING_LOOKBACK_MIN * 60000;
   const recentMeetings = await crm.searchAll("meetings", {
@@ -162,7 +162,7 @@ async function reconcileDealOwners(owners, { overrideStore = null, api = null, d
   const contactUpdates = bookedContactOwnerUpdates(activeDealIds, dealToHost, dToContacts, contactProps);
   let contactFixed = 0;
   for (const update of contactUpdates) {
-    if (await protectContact({ id: update.contactId, properties: contactProps.get(update.contactId) }, demoRouter, { dryRun })) continue;
+    if (await protectContact({ id: update.contactId, properties: contactProps.get(update.contactId) }, demoRouter, { dryRun, isContactManaged })) continue;
     if (!owners.has(update.to)) { log(`symptom#2: skip contact ${update.contactId} (${update.email}) host ${update.to} inactive/unknown`); continue; }
     log(`symptom#2: contact ${update.contactId} (${update.email}) owner (none) -> ${owners.get(update.to).name}`);
     if (!dryRun) {
@@ -184,7 +184,7 @@ function isRemovedRoundRobinOwner(ownerId) {
 
 // Existing deals and demo contacts still owned by someone removed from the roster
 // are moved onto the current roster. Every other existing owner stays put.
-async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cfg.DRY_RUN, demoRouter = getDemoRouter() } = {}) {
+async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cfg.DRY_RUN, isContactManaged = async () => false, demoRouter = getDemoRouter() } = {}) {
   const crm = api || { hub, searchAll, sleep, batchRead };
   const removed = cfg.REMOVED_ROUND_ROBIN_OWNER_IDS;
   if (!removed.length) return { checked: 0, reassigned: 0 };
@@ -229,7 +229,7 @@ async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cf
   }
 
   for (const contact of contacts) {
-    if (await protectContact(contact, demoRouter, { dryRun })) continue;
+    if (await protectContact(contact, demoRouter, { dryRun, isContactManaged })) continue;
     const from = String(contact.properties.hubspot_owner_id || "");
     const email = contact.properties.email || "";
     if (!isRemovedRoundRobinOwner(from)) continue;
@@ -253,7 +253,7 @@ async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cf
 }
 
 // ---------- Symptom #1: round-robin ownerless non-booker demo contacts ----------
-async function roundRobinNonBookers(owners, { demoRouter = getDemoRouter() } = {}) {
+async function roundRobinNonBookers(owners, { isContactManaged = async () => false, demoRouter = getDemoRouter() } = {}) {
   const now = Date.now();
   const minCreate = now - cfg.CONTACT_MAX_AGE_DAYS * 86400000;
   const maxCreate = now - cfg.CONTACT_MIN_AGE_MIN * 60000; // grace period to allow a booking to land first
@@ -275,7 +275,7 @@ async function roundRobinNonBookers(owners, { demoRouter = getDemoRouter() } = {
 
   let assigned = 0;
   for (const c of contacts) {
-    if (await protectContact(c, demoRouter, { dryRun: cfg.DRY_RUN })) continue;
+    if (await protectContact(c, demoRouter, { dryRun: cfg.DRY_RUN, isContactManaged })) continue;
     const id = String(c.id);
     const email = c.properties.email || "";
     if (cfg.INTERNAL_EMAIL_RE.test(email)) { log(`symptom#1: skip internal ${email}`); continue; }
@@ -298,10 +298,16 @@ async function runCycle(overrideStore = null) {
   log(`reconciler start | DRY_RUN=${cfg.DRY_RUN} | pipeline=${cfg.ACTIVE_PIPELINE}`);
   const owners = await getOwners();
   const router = getDemoRouter();
-  const routed = await reconcileRoutedSubmissions(router, { searchAll }, { dryRun: cfg.DRY_RUN });
-  const s2 = await reconcileDealOwners(owners, { overrideStore, demoRouter: router });
-  const s1 = await roundRobinNonBookers(owners);
-  const removed = await reassignRemovedRoundRobinOwners(owners);
+  const isContactManaged = async contactId => {
+    if (!overrideStore?.pool) throw new Error('demo_submission_assignment_guard_database_required');
+    const table = (await overrideStore.pool.query("SELECT to_regclass('public.demo_submission_lifecycle') AS name")).rows[0]?.name;
+    if (!table) return false; // notification worker has not been rolled out yet
+    return (await overrideStore.pool.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 LIMIT 1', [String(contactId)])).rows.length > 0;
+  };
+  const routed = await reconcileRoutedSubmissions(router, { searchAll }, { dryRun: cfg.DRY_RUN, isContactManaged });
+  const s2 = await reconcileDealOwners(owners, { overrideStore, demoRouter: router, isContactManaged });
+  const s1 = await roundRobinNonBookers(owners, { isContactManaged });
+  const removed = await reassignRemovedRoundRobinOwners(owners, { isContactManaged });
   log(`reconciler done | routed checked=${routed.checked} protected=${routed.protected} | symptom#2 checked=${s2.checked} fixed=${s2.fixed} contactChecked=${s2.contactChecked || 0} contactFixed=${s2.contactFixed || 0} | symptom#1 checked=${s1.checked} assigned=${s1.assigned} | removed-owner checked=${removed.checked} reassigned=${removed.reassigned}`);
   return { s1, s2, removed };
 }

@@ -179,6 +179,9 @@ function createDemoRouter({ request, env = process.env, logger = console, now = 
       if (!input.dealId && (current.properties?.pipeline !== PIPELINE_ID || !(await openStages()).has(current.properties?.dealstage))) continue;
       if (route.companyId) await request(`/crm/v4/objects/contacts/${route.contactId}/associations/default/companies/${route.companyId}`, { method: 'PUT' });
       await request(`/crm/v4/objects/contacts/${route.contactId}/associations/default/deals/${route.dealId}`, { method: 'PUT' });
+      // The form lifecycle assigns contact ownership from booking status. Keep the
+      // existing opportunity and associations without restoring its different owner.
+      if (input.preserveContactOwner) return route;
       const contact = await request(`/crm/v3/objects/contacts/${route.contactId}?properties=hubspot_owner_id`);
       if (contact.properties?.hubspot_owner_id !== route.ownerId) {
         await request(`/crm/v3/objects/contacts/${route.contactId}`, { method: 'PATCH', body: { properties: { hubspot_owner_id: route.ownerId } } });

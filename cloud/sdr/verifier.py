@@ -8,9 +8,28 @@ from fastapi import FastAPI, HTTPException, Request
 from .common import Authenticate, body, header, load_scope, verify_nooks
 
 
-def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provider=None, approval=None, private_claim=None, disposition_policy=None):
+# Values, rather than exception text, are the only data allowed into diagnostics.
+_REJECTION_REASONS = {
+    'capture not enabled': 'capture_disabled',
+    'invalid signature': 'signature_format',
+    'invalid timestamp': 'signature_timestamp_format',
+    'stale event': 'stale_signature',
+    'signature mismatch': 'signature_mismatch',
+    'unsupported event': 'unsupported_event',
+    'call not finalized': 'not_finalized',
+    'direction mismatch': 'direction_mismatch',
+    'workspace mismatch': 'workspace_mismatch',
+    'prospect mismatch': 'prospect_mismatch',
+    'invalid call time': 'invalid_call_time',
+    'timezone missing': 'invalid_call_time',
+    'invalid event correlation': 'invalid_event_correlation',
+}
+
+
+def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provider=None, approval=None, private_claim=None, disposition_policy=None, notes_enabled=False):
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     auth = Authenticate(public_key, clock)
+    reported_rejections = set()
 
     @app.get('/healthz')
     async def health():
@@ -28,7 +47,9 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
         await authenticated(request, raw)
         if raw != b'':
             raise HTTPException(400, 'Request rejected.')
-        return {'ready': bool(signing_key) and scope['not_before'] <= clock() < scope['expires_at']}
+        window = private_claim.window if private_claim is not None else None
+        allowed = window.allows(scope,clock()) if window is not None else scope['not_before'] <= clock() < scope['expires_at']
+        return {'ready': bool(signing_key) and allowed}
 
     @app.post('/v1/nooks/verify')
     async def verify(request: Request):
@@ -39,8 +60,16 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
             raise HTTPException(403, 'Request rejected.') from None
         await authenticated(request, raw, signature)
         try:
-            return {'event': verify_nooks(raw, signature, signing_key, scope, clock())}
-        except Exception:
+            return {'event': verify_nooks(raw, signature, signing_key, scope, clock(),
+                window=private_claim.window if private_claim is not None else None)}
+        except Exception as exc:
+            # Authenticate the private caller first; never log raw exceptions,
+            # signatures, request fields or provider keys. Each fixed reason is
+            # reported at most once per process, including during retry storms.
+            reason = _REJECTION_REASONS.get(str(exc), 'malformed_event_or_signature')
+            if reason not in reported_rejections:
+                reported_rejections.add(reason)
+                print(json.dumps({'event': 'nooks_verification_rejected', 'reason': reason}), flush=True)
             raise HTTPException(403, 'Event rejected.') from None
 
     completion_lock=threading.Lock()
@@ -85,6 +114,25 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
         except Exception:
             raise HTTPException(503,'Scoped completion unavailable; reconcile by inspection.') from None
 
+    @app.post('/v1/lemlist/note')
+    async def annotate_task(request: Request):
+        from .common import unique
+        raw=await body(request)
+        await authenticated(request,raw)
+        def run_note(value):
+            if not completion_lock.acquire(blocking=False): raise ValueError('task operation in flight')
+            try:
+                if (not notes_enabled or lemlist_provider is None or private_claim is None
+                        or approval is None or disposition_policy is None
+                        or not isinstance(value,dict) or set(value)!={'approval','event'}
+                        or value['approval']!=approval):
+                    raise ValueError('task notes unavailable')
+                disposition_policy.authorize(approval)
+                return lemlist_provider.run('note',note_event=value['event'],note_approval=approval,note_claim=private_claim)
+            finally: completion_lock.release()
+        try: return await asyncio.to_thread(run_note,json.loads(raw,object_pairs_hook=unique))
+        except Exception: raise HTTPException(503,'Scoped task notes unavailable; inspect on retry.') from None
+
     return app
 
 
@@ -97,7 +145,7 @@ def configured(scope):
     from .common import unique
     value=os.environ.get('LEMLIST_TEST_SCOPE','')
     if not value:
-        if os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY'): raise ValueError('approval or mapping without scope')
+        if os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY') or os.environ.get('TEST_RETARGET'): raise ValueError('approval or mapping without scope')
         return None,None,None,None
     selected=json.loads(value,object_pairs_hook=unique)
     expected={'workspace_id':selected['workspace_id'],'prospect_id':selected['hubspot_contact_id'],
@@ -105,19 +153,42 @@ def configured(scope):
     if expected!=scope: raise ValueError('provider and capture scopes differ')
     if os.environ.get('RAILWAY_VOLUME_MOUNT_PATH') != '/data':
         raise ValueError('private completion requires durable Railway volume')
-    claim=PrivateClaim('/data/state',selected)
+    from .retarget import configured as retarget_configured
+    claim=PrivateClaim('/data/state',selected,retarget_plan=retarget_configured(os.environ))
     approval=json.loads(os.environ['COMPLETION_APPROVAL'],object_pairs_hook=unique) if os.environ.get('COMPLETION_APPROVAL') else None
     policy=configured_policy(selected,os.environ)
     if approval is not None:
         validate_approval(approval)
         if policy is None: raise ValueError('approval without disposition policy')
         policy.authorize(approval)
-    return Provider(os.environ.get('LEMLIST_API',''),selected,allow_write=approval is not None),approval,claim,policy
+    from .task_notes import enabled
+    notes=enabled(os.environ)
+    if notes and approval is None: raise ValueError('task notes require approved call')
+    return Provider(os.environ.get('LEMLIST_API',''),selected,allow_write=approval is not None,allow_notes=notes),approval,claim,policy
 
 
 def from_environment():
     scope=load_scope(os.environ['CAPTURE_SCOPE'])
     provider,approval,claim,policy=configured(scope)
-    return create_app(signing_key=os.environ.get('NOOKS_SIGNING_KEY', ''),
+    from .task_notes import enabled
+    app = create_app(signing_key=os.environ.get('NOOKS_SIGNING_KEY', ''),
         public_key=os.environ.get('RECEIVER_PUBLIC_KEY', ''), scope=scope,
-        lemlist_provider=provider,approval=approval,private_claim=claim,disposition_policy=policy)
+        lemlist_provider=provider,approval=approval,private_claim=claim,disposition_policy=policy,notes_enabled=enabled(os.environ))
+    from .secondary import configured as secondary_configured, open_secondary, settings
+    from .retarget import configured as retarget_configured, capture_scope
+    secondary = secondary_configured(os.environ, retarget_configured(os.environ), provider.scope if provider else None)
+    from .test_window import configured as window_configured, bind as bind_window
+    reopen = window_configured(os.environ, provider.scope if provider else None, secondary)
+    if reopen is not None: provider.window = bind_window(claim,provider.scope,reopen)
+    if secondary is not None:
+        from .lemlist_provider import Provider
+        child_claim = open_secondary(claim, secondary, 'verifier')
+        child_approval, child_policy = settings(secondary, os.environ)
+        if reopen is not None: bind_window(child_claim,secondary,reopen)
+        child_provider = Provider(os.environ.get('LEMLIST_API', ''), secondary, allow_write=child_approval is not None)
+        child_provider.window = child_claim.window
+        app.mount('/contacts/'+secondary['hubspot_contact_id'], create_app(
+            signing_key=os.environ.get('NOOKS_SIGNING_KEY', ''), public_key=os.environ.get('RECEIVER_PUBLIC_KEY', ''),
+            scope=capture_scope(secondary), lemlist_provider=child_provider, approval=child_approval,
+            private_claim=child_claim, disposition_policy=child_policy))
+    return app

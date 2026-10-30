@@ -34,16 +34,17 @@ def validate_scope(scope):
             or not 0 < scope['starts_at'] < scope['expires_at'] <= scope['starts_at'] + 172800):
         raise ValueError('test window must be at most 48 hours')
 
-def active(scope, now=None):
+def active(scope, now=None, *, window=None):
     now = time.time() if now is None else now
-    if not scope['starts_at'] <= now < scope['expires_at']:
+    allowed = window.allows(scope,now) if window is not None else scope['starts_at'] <= now < scope['expires_at']
+    if not allowed:
         raise ValueError('test window closed')
 
 def activities(scope, fetch):
     """Bounded, complete activity read; never expose contact text or notes."""
     found, seen = [], set()
     for offset in range(0, 500, 100):
-        rows = fetch('/api/activities?' + urlencode({'campaignId': scope['campaign_id'],
+        rows = fetch('/api/activities?' + urlencode({'version': 'v2', 'campaignId': scope['campaign_id'],
             'leadId': scope['lead_id'], 'type': 'manualDone', 'minDate': scope['starts_at'],
             'limit': 100, 'offset': offset}))
         if not isinstance(rows, list) or len(rows) > 100:
@@ -56,17 +57,22 @@ def activities(scope, fetch):
                     or row.get('contactId', scope['contact_id']) != scope['contact_id']):
                 raise ValueError('activity correlation mismatch')
             seen.add(row['_id'])
-            if row.get('opportunityId') != scope['task_id']:
+            exact_step=(row.get('stepId')==scope['call_step_id'] and row.get('sequenceId')==scope['sequence_id'])
+            if row.get('opportunityId') != scope['task_id'] and not exact_step:
                 continue
+            if row.get('opportunityId') is not None and (not isinstance(row['opportunityId'],str)
+                    or not re.fullmatch(r'opp_[A-Za-z0-9]{1,80}',row['opportunityId'])):
+                raise ValueError('invalid activity task identity')
             stamp = datetime.datetime.fromisoformat(row['createdAt'].replace('Z', '+00:00'))
             if stamp.tzinfo is None or stamp.timestamp() < scope['starts_at']:
                 raise ValueError('activity predates test')
-            # Missing historic fields are incomplete evidence, never inferred.
+            # Keep missing provider IDs unknown. The supervised core may use a
+            # recorded task transition plus exact step evidence, never a guessed ID.
             for field, prefix in (('stepId', 'stp_'), ('sequenceId', 'seq_')):
                 if row.get(field) is not None and (not isinstance(row[field], str)
                         or not re.fullmatch(prefix+r'[A-Za-z0-9]{1,80}', row[field])):
                     raise ValueError('invalid activity step evidence')
-            found.append({'activity_id': row['_id'], 'task_id': scope['task_id'],
+            found.append({'activity_id': row['_id'], 'task_id': row.get('opportunityId'),
                 'step_id': row.get('stepId'), 'sequence_id': row.get('sequenceId'),
                 'created_at': stamp.timestamp()})
         if len(rows) < 100:
@@ -218,13 +224,13 @@ def ready_before(evidence, scope):
             and evidence.get('completion_activities') == [] and evidence.get('continuation_tasks') == [])
 
 
-def complete(scope, fetch, write, *, clock=time.time):
-    active(scope,clock())
+def complete(scope, fetch, write, *, clock=time.time, window=None):
+    active(scope,clock(),window=window)
     before = observe(scope,fetch)
     if before['task']['done']:
         return dict(before,write_attempted=False)
     if not ready_before(before,scope):
         raise ValueError('test is no longer at its initial call task')
-    active(scope,clock())
+    active(scope,clock(),window=window)
     write('PATCH','/api/tasks',{'id':scope['task_id'],'done':True})
     return dict(observe(scope,fetch),write_attempted=True)

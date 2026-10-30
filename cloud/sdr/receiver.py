@@ -22,8 +22,10 @@ from .common import body, envelope, header, load_scope
 
 
 class Store:
-    def __init__(self, directory, scope):
+    def __init__(self, directory, scope, *, retarget_plan=None, clock=time.time):
         self.directory, self.scope = Path(directory), scope
+        self.window = None
+        self.clock = clock
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.directory.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -43,6 +45,8 @@ class Store:
                 CREATE TABLE IF NOT EXISTS registration (id TEXT PRIMARY KEY, deadline INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
             ''')
             db.execute('BEGIN IMMEDIATE')
+            from .retarget import apply
+            self.accepted_call_id = apply(db, 'receiver', retarget_plan, scope, clock())
             value = json.dumps(scope, sort_keys=True)
             row = db.execute('SELECT value FROM scope WHERE singleton=1').fetchone()
             if row and row[0] != value:
@@ -114,12 +118,18 @@ class Store:
                 or any(not isinstance(event[k], str) or not 1 <= len(event[k]) <= 200 for k in fields-{'started_at','finalized_at'})
                 or any(type(event[k]) not in (int, float) for k in ('started_at','finalized_at'))
                 or not self.scope['not_before'] <= event['started_at'] <= event['finalized_at'] <= now+300
-                or now >= self.scope['expires_at']):
+                or (not self.window.allows(self.scope,now) if self.window is not None else now >= self.scope['expires_at'])):
             raise ValueError('invalid verified event')
         raw = json.dumps(event, sort_keys=True, separators=(',', ':'))
         digest = hashlib.sha256(raw.encode()).hexdigest()
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
+            # Thread scheduling and the SQLite lock can outlive the ingress check.
+            current = self.clock()
+            allowed = self.window.allows(self.scope,current) if self.window is not None else self.scope['not_before'] <= current < self.scope['expires_at']
+            if not allowed: raise ValueError('capture window closed before commit')
+            if json.loads(db.execute('SELECT value FROM scope WHERE singleton=1').fetchone()[0]) != self.scope:
+                raise ValueError('retired capture instance')
             old = db.execute('SELECT digest FROM events WHERE call_id=?', (event['call_id'],)).fetchone()
             if old:
                 if old[0] == digest: return 'duplicate'
@@ -141,22 +151,27 @@ class Store:
 
 
 class Broker:
-    def __init__(self, url, key, *, transport=None, clock=time.time):
+    def __init__(self, url, key, *, transport=None, clock=time.time, contact_id=None):
         u = urlsplit(url)
         if (u.scheme != 'http' or not u.hostname or not re.fullmatch(r'[a-z0-9-]+\.railway\.internal', u.hostname)
                 or u.port != 8080 or u.path not in ('','/') or u.query or u.fragment or u.username or u.password):
             raise ValueError('fixed private broker URL required')
+        if contact_id is not None and (not isinstance(contact_id,str) or not re.fullmatch(r'[1-9][0-9]{0,24}',contact_id)):
+            raise ValueError('invalid private contact route')
+        self.prefix = '/contacts/'+contact_id if contact_id is not None else ''
         self.url, self.key, self.transport, self.clock = url.rstrip('/'), key, transport, clock
 
     async def call(self, path, raw=b'', nooks_signature=''):
-        if path not in ('/v1/ready', '/v1/nooks/verify', '/v1/lemlist/inspect', '/v1/lemlist/complete'):
+        if path not in ('/v1/ready', '/v1/nooks/verify', '/v1/lemlist/inspect', '/v1/lemlist/complete', '/v1/lemlist/note'):
             raise ValueError('unknown broker operation')
+        is_completion = path.startswith('/v1/lemlist/')
+        path = self.prefix+path
         stamp, nonce = str(int(self.clock())), secrets.token_hex(16)
         signature = self.key.sign(envelope(path, stamp, nonce, raw, nooks_signature))
         headers = {'x-app-time': stamp, 'x-app-nonce': nonce, 'x-app-signature': base64.b64encode(signature).decode()}
         if nooks_signature: headers['x-webhook-signature'] = nooks_signature
         async def exchange():
-            async with httpx.AsyncClient(transport=self.transport, timeout=55 if path.startswith('/v1/lemlist/') else 5, follow_redirects=False, trust_env=False) as client:
+            async with httpx.AsyncClient(transport=self.transport, timeout=55 if is_completion else 5, follow_redirects=False, trust_env=False) as client:
                 async with client.stream('POST', self.url+path, content=raw, headers=headers) as response:
                     if response.status_code != 200:
                         raise ValueError('broker unavailable or rejected')
@@ -165,19 +180,21 @@ class Broker:
                         result.extend(chunk)
                         if len(result) > 4096: raise ValueError('oversize broker result')
             return json.loads(result)
-        return await asyncio.wait_for(exchange(), 60 if path.startswith('/v1/lemlist/') else 6)
+        return await asyncio.wait_for(exchange(), 60 if is_completion else 6)
 
 
-def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time, worker=None):
+def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time, worker=None, secondary=None):
     store.configure_registration(registration_id, deadline, clock())
     setup_diagnostics=set()
+    ingress_diagnostics=set()
+    workers=[w for w in (worker, secondary[2] if secondary else None) if w is not None]
     @asynccontextmanager
     async def lifespan(app):
-        task=asyncio.create_task(worker.run()) if worker else None
+        tasks=[asyncio.create_task(w.run()) for w in workers]
         try: yield
         finally:
-            if task:
-                task.cancel()
+            for task in tasks: task.cancel()
+            for task in tasks:
                 with suppress(asyncio.CancelledError): await task
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
@@ -193,17 +210,34 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
     async def ready():
         try: verified = (await broker.call('/v1/ready')).get('ready') is True
         except Exception: verified = False
-        return {'verifier_ready': verified, 'registration_open': store.registration(registration_id, clock()),
+        extra={}
+        if secondary:
+            child_store, child_broker, child_worker = secondary
+            try: child_ready = (await child_broker.call('/v1/ready')).get('ready') is True
+            except Exception: child_ready = False
+            extra['secondary']={'verifier_ready':child_ready,**child_store.summary(),
+                'completion_state':child_worker.core.status()['state'], 'capture_only':child_worker.approval is None,
+                'test_window_expires_at':child_store.window.expires_at if child_store.window else child_store.scope['expires_at']}
+        return {**extra, 'test_window_expires_at':store.window.expires_at if store.window else store.scope['expires_at'], 'verifier_ready': verified, 'registration_open': store.registration(registration_id, clock()),
                 'capture_only': worker is None or worker.approval is None, **store.summary(),
                 'completion_state': worker.core.status()['state'] if worker else 'disabled'}
 
     @app.post('/api/sdr/webhooks/nooks')
     async def webhook(request: Request):
         raw = await body(request)
+        stage = 'signature_header'
+        selected_store, selected_broker = store, broker
         try:
+            if secondary:
+                from .common import unique
+                candidate=json.loads(raw,object_pairs_hook=unique)
+                if candidate.get('callData',{}).get('prospectData',{}).get('prospectId') == secondary[0].scope['prospect_id']:
+                    selected_store, selected_broker = secondary[:2]
             signature = header(request, 'x-webhook-signature', 200)
-            result = await broker.call('/v1/nooks/verify', raw, signature)
-            outcome = await asyncio.to_thread(store.capture, result['event'], clock())
+            stage = 'private_verification'
+            result = await selected_broker.call('/v1/nooks/verify', raw, signature)
+            stage = 'durable_capture'
+            outcome = await asyncio.to_thread(selected_store.capture, result['event'], clock())
             return {'status': outcome}  # Only after SQLite commit succeeds.
         except Exception:
             # Nooks' initial probe is signed and can be call-shaped before the
@@ -211,7 +245,7 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
             # consume setup; a selected or ambiguous call must be retried.
             try:
                 if store.registration(registration_id,clock()):
-                    reason=registration_reason(raw,store.scope)
+                    reason=registration_reason(raw,selected_store.scope)
                     if reason in ('empty_probe','outside_scope') and store.registration(registration_id,clock(),consume=True):
                         print(json.dumps({'event':'nooks_setup_accepted'}),flush=True)
                         return Response(status_code=204)
@@ -219,6 +253,9 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
                         setup_diagnostics.add(reason)
                         # Fixed reason codes only: no request values, headers or errors.
                         print(json.dumps({'event':'nooks_setup_rejected','reason':reason}),flush=True)
+                elif stage not in ingress_diagnostics:
+                    ingress_diagnostics.add(stage)
+                    print(json.dumps({'event': 'nooks_ingress_rejected', 'stage': stage}), flush=True)
             except Exception:
                 pass
             raise HTTPException(503, 'Event unavailable or rejected.') from None
@@ -251,24 +288,66 @@ def registration_probe(raw,scope):
     return registration_reason(raw,scope) in ('empty_probe','outside_scope')
 
 
+def owner_lock(directory):
+    directory = Path(directory)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError('unsafe state directory')
+    lock = os.open(directory/'owner.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(lock)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError('unsafe owner lock')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock
+    except BaseException:
+        os.close(lock)
+        raise
+
+
 def from_environment():
     if os.environ.get('RAILWAY_VOLUME_MOUNT_PATH') != '/data':
         raise ValueError('durable Railway volume required')
-    store = Store('/data/state', load_scope(os.environ['CAPTURE_SCOPE']))
-    lock = os.open(store.directory/'owner.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    broker = Broker(os.environ['VERIFIER_URL'], store.identity())
-    worker=None
-    if os.environ.get('LEMLIST_TEST_SCOPE'):
+    # Take ownership before a configured migration can touch the old journal.
+    lock = owner_lock('/data/state')
+    try:
+        from .retarget import configured as retarget_configured
         from .common import unique
-        from .worker import Worker
-        from .dispositions import configured
-        selected=json.loads(os.environ['LEMLIST_TEST_SCOPE'],object_pairs_hook=unique)
-        approval=json.loads(os.environ['COMPLETION_APPROVAL'],object_pairs_hook=unique) if os.environ.get('COMPLETION_APPROVAL') else None
-        worker=Worker(store,selected,broker,approval=approval,policy=configured(selected,os.environ))
-    elif os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY'):
-        raise ValueError('approval without scoped worker')
-    app = create_app(store, broker, worker=worker, registration_id=os.environ.get('REGISTRATION_ID', ''),
-        deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')))
-    app.state.owner_lock = lock  # Single owner for the lifetime of this process.
-    return app
+        plan = retarget_configured(os.environ)
+        if plan is not None and json.loads(os.environ.get('LEMLIST_TEST_SCOPE', '{}'), object_pairs_hook=unique) != plan['to_scope']:
+            raise ValueError('retarget requires its exact worker scope before migration')
+        store = Store('/data/state', load_scope(os.environ['CAPTURE_SCOPE']), retarget_plan=plan)
+        broker = Broker(os.environ['VERIFIER_URL'], store.identity())
+        worker=None
+        if os.environ.get('LEMLIST_TEST_SCOPE'):
+            from .common import unique
+            from .worker import Worker
+            from .task_notes import enabled as notes_enabled
+            from .dispositions import configured
+            selected=json.loads(os.environ['LEMLIST_TEST_SCOPE'],object_pairs_hook=unique)
+            approval=json.loads(os.environ['COMPLETION_APPROVAL'],object_pairs_hook=unique) if os.environ.get('COMPLETION_APPROVAL') else None
+            worker=Worker(store,selected,broker,approval=approval,policy=configured(selected,os.environ),notes_enabled=notes_enabled(os.environ))
+        elif os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY') or os.environ.get('TEST_RETARGET'):
+            raise ValueError('approval or retarget without scoped worker')
+        from .secondary import configured as secondary_configured, open_secondary, settings
+        secondary_scope = secondary_configured(os.environ, plan, selected if worker else None)
+        secondary = None
+        if secondary_scope is not None:
+            child_store = open_secondary(store, secondary_scope, 'receiver')
+            child_broker = Broker(os.environ['VERIFIER_URL'], store.identity(), contact_id=secondary_scope['hubspot_contact_id'])
+            child_approval, child_policy = settings(secondary_scope, os.environ)
+            child_worker = Worker(child_store, secondary_scope, child_broker, approval=child_approval, policy=child_policy)
+            secondary = (child_store, child_broker, child_worker)
+        from .test_window import configured as window_configured, bind as bind_window
+        reopen = window_configured(os.environ, selected if worker else None, secondary_scope)
+        if reopen is not None:
+            bind_window(store, selected, reopen)
+            bind_window(child_store, secondary_scope, reopen)
+        app = create_app(store, broker, worker=worker, secondary=secondary, registration_id=os.environ.get('REGISTRATION_ID', ''),
+            deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')))
+        app.state.owner_lock = lock  # Single owner for the lifetime of this process.
+        return app
+    except BaseException:
+        os.close(lock)
+        raise

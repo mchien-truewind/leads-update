@@ -16,9 +16,10 @@ from .lemlist_contract import active, validate_scope
 
 
 class PrivateClaim:
-    def __init__(self, directory, scope, *, clock=time.time):
+    def __init__(self, directory, scope, *, clock=time.time, retarget_plan=None):
         validate_scope(scope)
         self.scope, self.clock = dict(scope), clock
+        self.window = None
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.directory.lstat()
@@ -37,6 +38,8 @@ class PrivateClaim:
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1), scope TEXT NOT NULL,
                 approval TEXT, claimed_at REAL)''')
             db.execute('BEGIN IMMEDIATE')
+            from .retarget import apply
+            self.accepted_call_id = apply(db, 'verifier', retarget_plan, scope, clock())
             encoded = json.dumps(self.scope, sort_keys=True)
             row = db.execute('SELECT scope FROM write_claim WHERE singleton=1').fetchone()
             if row and row[0] != encoded:
@@ -70,7 +73,7 @@ class PrivateClaim:
                 if row[1] != encoded or row[2] is None:
                     raise ValueError('private claim approval cannot change')
                 return False  # Prior attempt: inspection only, even after expiry.
-            active(self.scope, self.clock())
+            active(self.scope, self.clock(), window=self.window)
             db.execute('UPDATE write_claim SET approval=?,claimed_at=? WHERE singleton=1',
                        (encoded, self.clock()))
         return True  # FULL-synchronous commit completed before provider dispatch.

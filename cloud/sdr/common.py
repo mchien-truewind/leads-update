@@ -95,8 +95,9 @@ def timestamp(value):
     return dt.timestamp()
 
 
-def verify_nooks(raw, signature, key, scope, now):
-    if not key or not scope['not_before'] <= now < scope['expires_at']:
+def verify_nooks(raw, signature, key, scope, now, *, window=None):
+    allowed = window.allows(scope,now) if window is not None else scope['not_before'] <= now < scope['expires_at']
+    if not key or not allowed:
         raise ValueError('capture not enabled')
     parts = {}
     for item in signature.split(','):
@@ -113,9 +114,16 @@ def verify_nooks(raw, signature, key, scope, now):
         raise ValueError('signature mismatch')
     event = json.loads(raw, object_pairs_hook=unique)
     call = event['callData']
-    if (event['event'] != 'call.logged' or call['status'] != 'completed' or call['callDirection'] != 'outbound'
-            or call['workspaceId'] != scope['workspace_id'] or call['prospectData']['prospectId'] != scope['prospect_id']):
-        raise ValueError('call outside scope')
+    # Fixed failures distinguish a valid signature on a different contact from
+    # signature failures. No request values are included in these exceptions.
+    for actual, expected, reason in (
+            (event['event'], 'call.logged', 'unsupported event'),
+            (call['status'], 'completed', 'call not finalized'),
+            (call['callDirection'], 'outbound', 'direction mismatch'),
+            (call['workspaceId'], scope['workspace_id'], 'workspace mismatch'),
+            (call['prospectData']['prospectId'], scope['prospect_id'], 'prospect mismatch')):
+        if actual != expected:
+            raise ValueError(reason)
     result = {'workspace_id': call['workspaceId'], 'prospect_id': call['prospectData']['prospectId'],
         'call_id': call['callId'], 'rep_id': call['userData']['userId'],
         'disposition_id': call['disposition']['id'], 'disposition_name': call['disposition']['name'],

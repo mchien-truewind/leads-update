@@ -34,7 +34,8 @@ class Provider:
             return q in ({'campaignId':[scope['campaign_id']],'taskId':[scope['task_id']],'limit':['2'],'page':['1']},
                 {'campaignId':[scope['campaign_id']],'leadId':[scope['lead_id']],'type':['manual'],'limit':['100'],'page':['1']})
         if u.path == '/api/activities':
-            return (set(q) == {'campaignId','leadId','type','minDate','limit','offset'}
+            return (set(q) == {'version','campaignId','leadId','type','minDate','limit','offset'}
+                and q['version'] == ['v2']
                 and q['campaignId'] == [scope['campaign_id']] and q['leadId'] == [scope['lead_id']]
                 and q['type'] == ['manualDone'] and q['minDate'] == [str(scope['starts_at'])]
                 and q['limit'] == ['100'] and q['offset'] in ([str(x)] for x in range(0,500,100)))

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 from cloud.sdr.completion import Completion
@@ -84,6 +84,28 @@ class CloudCompletionTests(unittest.TestCase):
         if operation=='complete': self.assertEqual(approval,self.approval)
         else: self.assertEqual(approval,{})
         return self.provider.run(operation)
+
+    def test_activity_read_requires_documented_v2_and_keeps_exact_scope(self):
+        transport=self.http
+        def versioned(request):
+            if request.url.path=='/api/activities':
+                q=parse_qs(request.url.query.decode())
+                if q.get('version')!=['v2']:
+                    return httpx.Response(400,json={'error':'version v2 required'})
+                self.assertEqual(q,{'version':['v2'],'campaignId':['cam_test'],'leadId':['lea_test'],
+                    'type':['manualDone'],'minDate':[str(self.scope['starts_at'])],
+                    'limit':['100'],'offset':['0']})
+            return transport(request)
+        self.provider.transport=httpx.MockTransport(versioned)
+        self.assertEqual(self.core.complete(self.approval,self.call),'verified')
+        self.now=self.scope['expires_at']+1
+        self.assertEqual(self.core.reconcile(self.call),'verified')
+        self.assertEqual(len(self.writes),1)
+        for version in ('v1','v3',''):
+            path='/api/activities?'+urlencode({'version':version,'campaignId':'cam_test',
+                'leadId':'lea_test','type':'manualDone','minDate':self.scope['starts_at'],
+                'limit':100,'offset':0})
+            self.assertFalse(self.provider._allowed('GET',path,None))
 
     def test_selected_event_completes_exact_task_and_independently_observes_next_task(self):
         self.assertEqual(self.core.complete(self.approval,self.call),'verified')

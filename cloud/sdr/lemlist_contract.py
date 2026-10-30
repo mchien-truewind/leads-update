@@ -44,7 +44,7 @@ def activities(scope, fetch):
     """Bounded, complete activity read; never expose contact text or notes."""
     found, seen = [], set()
     for offset in range(0, 500, 100):
-        rows = fetch('/api/activities?' + urlencode({'campaignId': scope['campaign_id'],
+        rows = fetch('/api/activities?' + urlencode({'version': 'v2', 'campaignId': scope['campaign_id'],
             'leadId': scope['lead_id'], 'type': 'manualDone', 'minDate': scope['starts_at'],
             'limit': 100, 'offset': offset}))
         if not isinstance(rows, list) or len(rows) > 100:

@@ -66,7 +66,7 @@ class Completion:
     def observation_summary(self):
         """Fixed diagnostics from saved normalized readback; no provider calls or writes."""
         with self.store.db() as db:
-            row=db.execute('SELECT claimed_at,after_evidence FROM completion WHERE singleton=1').fetchone()
+            row=db.execute('SELECT claimed_at,after_evidence,write_receipt,before_evidence FROM completion WHERE singleton=1').fetchone()
         if not row or row[0] is None or row[1] is None:
             return None
         evidence=json.loads(row[1])
@@ -77,6 +77,7 @@ class Completion:
         event=events[0] if isinstance(events,list) and len(events)==1 and isinstance(events[0],dict) else {}
         continuation=pending[0] if isinstance(pending,list) and len(pending)==1 and isinstance(pending[0],dict) else {}
         return {
+            'correlation_basis':self._activity_basis(events,row[0],row[2],json.loads(row[3])),
             'task_done':isinstance(task,dict) and task.get('task_id')==self.scope['task_id'] and task.get('done') is True,
             'activity_count':len(events) if isinstance(events,list) else None,
             'activity_task_matches':event.get('task_id')==self.scope['task_id'],
@@ -89,6 +90,23 @@ class Completion:
             'continuation_pending':continuation.get('status') in ('due','upcoming'),
             'continuation_sequence_matches':continuation.get('provider_sequence_id')==self.scope['sequence_id'],
         }
+
+    def _activity_basis(self, events, claimed_at, receipt, before):
+        if not (isinstance(events,list) and len(events)==1 and isinstance(events[0],dict)):
+            return None
+        event=events[0]
+        if (event.get('step_id')!=self.scope['call_step_id']
+                or event.get('sequence_id')!=self.scope['sequence_id']
+                or type(event.get('created_at')) not in (int,float) or event['created_at']<claimed_at):
+            return None
+        if event.get('task_id')==self.scope['task_id']:
+            return 'provider_task_id'
+        # The controlled test has an acknowledged write to one pinned task,
+        # an empty activity baseline, and exact independent provider step evidence.
+        # Retain task_id=None; never present this inference as a returned task ID.
+        if event.get('task_id') is None and receipt==1 and ready_before(before,self.scope):
+            return 'task_transition_and_provider_step'
+        return None
 
     def arm(self, call):
         active(self.scope,self.clock(),window=self.store.window)
@@ -180,18 +198,14 @@ class Completion:
     def reconcile(self,call):
         # Deliberately available after expiry. This method never dispatches a write.
         with self.store.db() as db:
-            row = db.execute('SELECT state,claimed_at,write_receipt FROM completion WHERE singleton=1').fetchone()
+            row = db.execute('SELECT state,claimed_at,write_receipt,before_evidence FROM completion WHERE singleton=1').fetchone()
         allowed = ('claimed','uncertain','observing','verified','observed_after_uncertain_write')
         if not row or row[0] not in allowed: raise ValueError('no attempt to reconcile')
         evidence = call('inspect',{})
         if not isinstance(evidence,dict) or evidence.get('scope') != self.scope:
             raise ValueError('invalid observation scope')
         events, pending = evidence.get('completion_activities'),evidence.get('continuation_tasks')
-        mapped = (isinstance(events,list) and len(events)==1 and isinstance(events[0],dict)
-            and events[0].get('task_id') == self.scope['task_id']
-            and events[0].get('step_id') == self.scope['call_step_id']
-            and events[0].get('sequence_id') == self.scope['sequence_id']
-            and type(events[0].get('created_at')) in (int,float) and events[0]['created_at'] >= row[1])
+        mapped = self._activity_basis(events,row[1],row[2],json.loads(row[3])) is not None
         continuation = (isinstance(pending,list) and len(pending)==1 and isinstance(pending[0],dict)
             and pending[0].get('task_id') != self.scope['task_id']
             and isinstance(pending[0].get('task_id'),str)
@@ -204,6 +218,7 @@ class Completion:
         verified = task.get('task_id')==self.scope['task_id'] and task.get('done') is True and mapped and continuation
         state = ('verified' if row[2]==1 else 'observed_after_uncertain_write') if verified else 'observing'
         if isinstance(events,list) and any(not isinstance(x,dict)
+                or x.get('task_id') not in (None,self.scope['task_id'])
                 or x.get('step_id') not in (None,self.scope['call_step_id'])
                 or x.get('sequence_id') not in (None,self.scope['sequence_id']) for x in events):
             state = 'held'

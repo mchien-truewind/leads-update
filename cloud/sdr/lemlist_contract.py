@@ -57,17 +57,22 @@ def activities(scope, fetch):
                     or row.get('contactId', scope['contact_id']) != scope['contact_id']):
                 raise ValueError('activity correlation mismatch')
             seen.add(row['_id'])
-            if row.get('opportunityId') != scope['task_id']:
+            exact_step=(row.get('stepId')==scope['call_step_id'] and row.get('sequenceId')==scope['sequence_id'])
+            if row.get('opportunityId') != scope['task_id'] and not exact_step:
                 continue
+            if row.get('opportunityId') is not None and (not isinstance(row['opportunityId'],str)
+                    or not re.fullmatch(r'opp_[A-Za-z0-9]{1,80}',row['opportunityId'])):
+                raise ValueError('invalid activity task identity')
             stamp = datetime.datetime.fromisoformat(row['createdAt'].replace('Z', '+00:00'))
             if stamp.tzinfo is None or stamp.timestamp() < scope['starts_at']:
                 raise ValueError('activity predates test')
-            # Missing historic fields are incomplete evidence, never inferred.
+            # Keep missing provider IDs unknown. The supervised core may use a
+            # recorded task transition plus exact step evidence, never a guessed ID.
             for field, prefix in (('stepId', 'stp_'), ('sequenceId', 'seq_')):
                 if row.get(field) is not None and (not isinstance(row[field], str)
                         or not re.fullmatch(prefix+r'[A-Za-z0-9]{1,80}', row[field])):
                     raise ValueError('invalid activity step evidence')
-            found.append({'activity_id': row['_id'], 'task_id': scope['task_id'],
+            found.append({'activity_id': row['_id'], 'task_id': row.get('opportunityId'),
                 'step_id': row.get('stepId'), 'sequence_id': row.get('sequenceId'),
                 'created_at': stamp.timestamp()})
         if len(rows) < 100:

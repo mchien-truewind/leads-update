@@ -35,6 +35,7 @@ class CloudCompletionTests(unittest.TestCase):
             'type':'manual','title':'M0 Call in Nooks','status':'due','assignedTo':'usr_test',
             'campaign':{'id':'cam_test','sequenceId':'seq_test'}}
         self.next_task=dict(self.task,_id='opp_next',title='M0 Continuation confirmed')
+        self.activity_task='opp_call';self.activity_time=None;self.duplicate_activity=False
         self.done=False;self.step='stp_call';self.continuation=True;self.writes=[];self.requests=[]
         self.provider=Provider('dummy-private-key',self.scope,allow_write=True,
             transport=httpx.MockTransport(self.http),clock=lambda:self.now,report=lambda _:None)
@@ -75,8 +76,10 @@ class CloudCompletionTests(unittest.TestCase):
             result={'total':len(rows),'results':rows}
         elif path=='/api/activities':
             result=[] if not self.done else [{'_id':'act_test','type':'manualDone','campaignId':'cam_test',
-                'leadId':'lea_test','contactId':'ctc_test','opportunityId':'opp_call','stepId':self.step,
-                'sequenceId':'seq_test','createdAt':datetime.datetime.fromtimestamp(self.now,datetime.timezone.utc).isoformat()}]
+                'leadId':'lea_test','contactId':'ctc_test','opportunityId':self.activity_task,'stepId':self.step,
+                'sequenceId':'seq_test','createdAt':datetime.datetime.fromtimestamp(self.now if self.activity_time is None else self.activity_time,datetime.timezone.utc).isoformat()}]
+            if result and self.activity_task is None: result[0].pop('opportunityId')
+            if result and self.duplicate_activity: result.append(dict(result[0],_id='act_duplicate'))
         else: self.fail('Unexpected provider path')
         return httpx.Response(200,json=result)
 
@@ -84,6 +87,51 @@ class CloudCompletionTests(unittest.TestCase):
         if operation=='complete': self.assertEqual(approval,self.approval)
         else: self.assertEqual(approval,{})
         return self.provider.run(operation)
+
+    def test_missing_activity_task_id_uses_recorded_write_and_exact_provider_step(self):
+        self.activity_task=None
+        self.assertEqual(self.core.complete(self.approval,self.call),'verified')
+        evidence=self.provider.run('inspect')
+        self.assertIsNone(evidence['completion_activities'][0]['task_id'])
+        self.assertEqual(self.core.observation_summary()['correlation_basis'],'task_transition_and_provider_step')
+        self.now=self.scope['expires_at']+1
+        restarted=Completion(self.store,self.scope,clock=lambda:self.now)
+        self.assertEqual(restarted.reconcile(self.call),'verified')
+        self.assertEqual(len(self.writes),1)
+
+    def test_missing_activity_task_id_cannot_verify_an_uncertain_write(self):
+        self.activity_task=None
+        def lost(operation,approval):
+            result=self.call(operation,approval)
+            if operation=='complete': raise OSError('lost receipt')
+            return result
+        with self.assertRaises(ValueError): self.core.complete(self.approval,lost)
+        self.assertEqual(self.core.reconcile(self.call),'observing')
+        self.assertIsNone(self.core.observation_summary()['correlation_basis'])
+        self.assertEqual(len(self.writes),1)
+
+    def test_missing_activity_task_id_requires_post_claim_activity_and_original_preflight(self):
+        self.activity_task=None;self.activity_time=self.now-0.5
+        self.assertEqual(self.core.complete(self.approval,self.call),'observing')
+        self.activity_time=None
+        with self.store.db() as db:
+            before=json.loads(db.execute('SELECT before_evidence FROM completion').fetchone()[0])
+            before['task']['done']=True
+            db.execute('UPDATE completion SET before_evidence=?',(json.dumps(before),))
+        self.assertEqual(self.core.reconcile(self.call),'observing')
+        self.assertEqual(len(self.writes),1)
+
+    def test_known_conflicting_activity_task_id_is_held_even_with_matching_step(self):
+        self.activity_task='opp_other'
+        self.assertEqual(self.core.complete(self.approval,self.call),'held')
+        self.assertEqual(len(self.writes),1)
+
+    def test_ambiguous_step_activities_never_verify_or_repeat_completion(self):
+        self.activity_task=None;self.duplicate_activity=True
+        with self.assertRaises(ValueError):self.core.complete(self.approval,self.call)
+        with self.assertRaises(ValueError):self.core.reconcile(self.call)
+        self.assertEqual(self.core.status()['state'],'uncertain')
+        self.assertEqual(len(self.writes),1)
 
     def test_activity_diagnostics_distinguish_empty_history_from_unlinked_records(self):
         reports=[]
@@ -94,11 +142,13 @@ class CloudCompletionTests(unittest.TestCase):
                 return httpx.Response(200,json=[{'_id':'act_test','type':'manualDone',
                     'campaignId':'cam_test','leadId':'lea_test','contactId':'ctc_test',
                     'private':'private-record-must-not-log',
+                    'createdAt':datetime.datetime.fromtimestamp(self.now,datetime.timezone.utc).isoformat(),
                     'stepId':'stp_call','sequenceId':'seq_test'}])
             return original(request)
         self.provider.transport=httpx.MockTransport(unlinked)
         result=self.provider.run('inspect')
-        self.assertEqual(result['completion_activities'],[])
+        self.assertEqual(len(result['completion_activities']),1)
+        self.assertIsNone(result['completion_activities'][0]['task_id'])
         diagnostic=reports[-1]
         self.assertEqual(set(diagnostic),{'event','page_offset','response_status','response_shape',
             'response_rows','matching_identity_count','with_opportunity_count','matching_opportunity_count',

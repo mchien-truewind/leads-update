@@ -1,0 +1,10 @@
+{
+  "name": "truewind_google_calendar_event_key",
+  "label": "Truewind Google Calendar event key",
+  "type": "string",
+  "fieldType": "text",
+  "groupName": "meeting",
+  "hasUniqueValue": true,
+  "hidden": true,
+  "description": "Unique Google Calendar occurrence identity for retry-safe Truewind meeting synchronization."
+}

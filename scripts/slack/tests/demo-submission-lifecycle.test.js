@@ -215,15 +215,16 @@ test('unmapped booking owner fails closed before posting', async () => {
   assert.equal(posts.length, 0);
 });
 
-test('newer form submission owns a later booking; prior submissions are not falsely marked booked', async () => {
+test('repeated forms before the first notification retain the original clock and one parent', async () => {
   await lifecycle.enqueue(formEvent);
   await lifecycle.enqueue({ ...formEvent, propertyValue: String(submittedAt + 60000) });
-  bookings.push(booking(120));
-  time += WINDOW_MS + 60000;
+  const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle')).rows;
+  assert.equal(rows.length, 1);
+  assert.equal(Number(rows[0].submitted_at), submittedAt);
+  time = submittedAt + WINDOW_MS;
   await lifecycle.tick();
-  const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
-  assert.equal(rows[0].booked_state, 'pending');
-  assert.equal(rows[1].booked_state, 'sent');
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].thread_ts, '1.001');
 });
 
 test('signed webhook processing queues rather than immediately posting when lifecycle is enabled', async () => {
@@ -421,4 +422,87 @@ test('worker uses the held client for booking persistence, so it works with a on
     assert.equal(posts.length, 1);
     assert.equal(held, false);
   } finally { lifecycle.pool = original; }
+});
+
+
+test('re-entering the same email to book replies in the original thread instead of posting another parent', async () => {
+  await lifecycle.enqueue(formEvent);
+  time = submittedAt + WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  const repeatAt = submittedAt + 16 * 60000;
+  time = repeatAt;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(repeatAt) });
+  const b = booking(16 * 60 + 1);
+  bookings.push(b);
+  time += 1000;
+  const observed = await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.reconcileBooking(observed);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.equal(posts[2].thread_ts, '1.001');
+  assert.match(posts[2].text, /This lead booked a meeting\./);
+  assert.match(posts[2].text, /Sarah Elix/);
+  assert.equal(posts.filter(m => !m.thread_ts).length, 1);
+  assert.equal(contactOwner, '89305622');
+  const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
+  assert.equal(rows[1].thread_root_key, rows[0].submission_key);
+  assert.equal(rows[1].parent_ts, rows[0].parent_ts);
+  assert.equal(rows[0].booked_state, 'sent');
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(repeatAt) });
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+});
+
+test('booking-first delivery followed by repeat form webhook keeps one original thread', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b = booking(600);
+  bookings.push(b);
+  time = submittedAt + 600000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time - 1000) });
+  await lifecycle.tick();
+  assert.equal(posts.filter(m => !m.thread_ts).length, 1);
+  // The already-notified booking must not be repeated for a delayed form webhook.
+  assert.equal(posts.length, 3);
+});
+
+test('a repeat form without a booking does not repeat the original unbooked alert', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  time += WINDOW_MS;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+});
+
+test('later bookings and delayed old form webhooks keep one thread without repeating an earlier booking', async () => {
+  await lifecycle.enqueue(formEvent);
+  const first = booking(100);
+  bookings.push(first);
+  time = submittedAt + 100000;
+  await lifecycle.observeBooking('invitee.created', first.payload, first.scheduledEvent, first.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 1);
+  time = submittedAt + 600000;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  const second = booking(601, '84547076', 'two');
+  bookings.push(second);
+  time += 1000;
+  await lifecycle.observeBooking('invitee.created', second.payload, second.scheduledEvent, second.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].thread_ts, '1.001');
+  assert.equal((await row()).booking_uri, first.payload.uri);
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(submittedAt + 99000) });
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal(posts.filter(m => !m.thread_ts).length, 1);
 });

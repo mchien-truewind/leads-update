@@ -25,12 +25,13 @@ class DemoSubmissionLifecycle {
     this.activatedAt = Number((await this.pool.query('SELECT activated_at FROM demo_submission_activation WHERE id = 1')).rows[0].activated_at);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_submission_lifecycle (
       submission_key TEXT PRIMARY KEY, contact_id TEXT NOT NULL, submitted_at BIGINT NOT NULL,
-      email TEXT NOT NULL, assigned_owner TEXT, parent_ts TEXT,
+      email TEXT NOT NULL, assigned_owner TEXT, parent_ts TEXT, thread_root_key TEXT,
       parent_state TEXT NOT NULL DEFAULT 'pending', parent_update_state TEXT NOT NULL DEFAULT 'pending', no_booking_state TEXT NOT NULL DEFAULT 'pending',
       booked_state TEXT NOT NULL DEFAULT 'pending', booking_uri TEXT,
       next_check BIGINT NOT NULL, last_error TEXT,
       UNIQUE(contact_id, submitted_at)
     )`);
+    await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS thread_root_key TEXT");
     await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS parent_update_state TEXT NOT NULL DEFAULT 'pending'");
     await this.pool.query(`CREATE INDEX IF NOT EXISTS demo_submission_due ON demo_submission_lifecycle(next_check)
       WHERE booked_state = 'pending' AND parent_state != 'needs_review'`);
@@ -47,14 +48,35 @@ class DemoSubmissionLifecycle {
     const contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${event.objectId}?properties=email`);
     const email = normalizeEmail(contact.properties?.email);
     if (!email || String(contact.id) !== String(event.objectId)) throw new Error('submission_contact_unavailable');
-    const key = `${event.objectId}:${submittedAt}`;
-    await this.pool.query(`INSERT INTO demo_submission_lifecycle
-      (submission_key, contact_id, submitted_at, email, next_check) VALUES ($1,$2,$3,$4,$5)
-      ON CONFLICT (contact_id, submitted_at) DO NOTHING`, [key, String(event.objectId), submittedAt, email, submittedAt + WINDOW_MS]);
-    // Already-received bookings (including out-of-order webhooks) can notify immediately.
-    await this.pool.query(`UPDATE demo_submission_lifecycle SET next_check = $2 WHERE submission_key = $1
-      AND EXISTS (SELECT 1 FROM demo_submission_bookings b WHERE b.email = demo_submission_lifecycle.email
-        AND b.booked_at >= submitted_at AND b.canceled = false)`, [key, this.now()]);
+    // Serialize by normalized email, including Calendly-first delivery on a held DB client.
+    const client = typeof this.pool.release === 'function' ? this.pool : await this.pool.connect();
+    const borrowed = client !== this.pool;
+    try {
+      await client.query('BEGIN');
+      const locked = (await client.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked', [`demo-email:${email}`])).rows[0]?.locked;
+      if (!locked) throw new Error('submission_email_busy');
+      const existing = (await client.query(`SELECT * FROM demo_submission_lifecycle WHERE email = $1
+        AND thread_root_key IS NULL ORDER BY submitted_at, submission_key LIMIT 1`, [email])).rows[0];
+      const key = `${event.objectId}:${submittedAt}`;
+      let targetKey = key;
+      if (existing && !existing.parent_ts && existing.booked_state === 'pending') {
+        // Re-entering the form before the first notification must not restart its clock.
+        targetKey = existing.submission_key;
+      } else {
+        await client.query(`INSERT INTO demo_submission_lifecycle
+          (submission_key, contact_id, submitted_at, email, next_check, thread_root_key, assigned_owner)
+          VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (contact_id, submitted_at) DO NOTHING`,
+        [key, String(event.objectId), submittedAt, email, submittedAt + WINDOW_MS,
+          existing && existing.submission_key !== key ? existing.submission_key : null, existing?.assigned_owner || null]);
+      }
+      await client.query(`UPDATE demo_submission_lifecycle SET next_check = $2 WHERE submission_key = $1
+        AND EXISTS (SELECT 1 FROM demo_submission_bookings b WHERE b.email = demo_submission_lifecycle.email
+          AND b.booked_at >= submitted_at AND b.canceled = false)`, [targetKey, this.now()]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { if (borrowed) client.release(); }
     return 'queued';
   }
 
@@ -100,9 +122,8 @@ class DemoSubmissionLifecycle {
     if (eventName !== 'invitee.created') return null;
     const booking = await this.saveBooking(payload, scheduledEvent, filter);
     if (!booking) return null;
-    const result = await this.pool.query(`SELECT contact_id, submitted_at FROM demo_submission_lifecycle
-      WHERE email = $1 AND submitted_at <= $2 ORDER BY submitted_at DESC LIMIT 1`, [booking.email, booking.bookedAt]);
-    if (result.rows[0]) return { ...booking, contactId: result.rows[0].contact_id, submittedAt: Number(result.rows[0].submitted_at) };
+    const linked = await this.findBookingSubmission(booking);
+    if (linked) return linked;
     // Calendly may arrive before the form webhook. Recover the form identity from HubSpot
     // so the old standalone booking alert is suppressed for this submission as well.
     const contacts = await this.hubspotRequest('/crm/v3/objects/contacts/search', {
@@ -114,7 +135,16 @@ class DemoSubmissionLifecycle {
     const submittedAt = ms(contact?.properties?.demo_form_submission_datetime);
     if (!contact || !Number.isFinite(submittedAt) || submittedAt < this.activatedAt || submittedAt > booking.bookedAt) return null;
     await this.enqueue({ objectId: contact.id, propertyValue: String(submittedAt) });
-    return { ...booking, contactId: String(contact.id), submittedAt };
+    const recovered = await this.findBookingSubmission(booking);
+    if (!recovered) throw new Error('submission_booking_correlation_unavailable');
+    return recovered;
+  }
+
+  async findBookingSubmission(booking) {
+    const result = await this.pool.query(`SELECT contact_id, submitted_at, thread_root_key FROM demo_submission_lifecycle
+      WHERE email = $1 AND submitted_at <= $2 ORDER BY submitted_at DESC LIMIT 1`, [booking.email, booking.bookedAt]);
+    if (result.rows[0]) return { ...booking, contactId: result.rows[0].contact_id, submittedAt: Number(result.rows[0].submitted_at), threadRootKey: result.rows[0].thread_root_key };
+    return null;
   }
 
   async hasContact(contactId) {
@@ -122,8 +152,8 @@ class DemoSubmissionLifecycle {
   }
 
   async reconcileBooking(booking) {
-    if (!booking || booking.bookedAt > booking.submittedAt + WINDOW_MS) return;
-    await this.withContactLock(booking.contactId, async client => {
+    if (!booking || booking.threadRootKey || booking.bookedAt > booking.submittedAt + WINDOW_MS) return;
+    await this.withContactLock(booking.email, async client => {
       const newer = (await client.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 AND submitted_at > $2 LIMIT 1', [booking.contactId, booking.bookedAt])).rows.length;
       if (newer) return;
       await this.assignOwner(booking.contactId, booking.ownerId);
@@ -224,7 +254,7 @@ class DemoSubmissionLifecycle {
   async processRow(key) {
     const initial = (await this.pool.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
     if (!initial) return;
-    await this.withContactLock(initial.contact_id, async client => {
+    await this.withContactLock(initial.email, async client => {
       const row = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
       if (Number(row.next_check) > this.now() || row.parent_state === 'needs_review' || row.booked_state !== 'pending') return;
       for (const column of ['parent_state', 'parent_update_state', 'no_booking_state', 'booked_state']) {
@@ -240,6 +270,16 @@ class DemoSubmissionLifecycle {
         }
       }
       if (row.parent_state === 'needs_review' || row.booked_state !== 'pending') return;
+      const repeat = Boolean(row.thread_root_key);
+      if (repeat) {
+        const root = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [row.thread_root_key])).rows[0];
+        if (!root?.parent_ts || root.parent_state !== 'sent') return;
+        row.parent_ts = root.parent_ts;
+        row.parent_state = 'sent';
+        row.no_booking_state = 'sent';
+        await client.query(`UPDATE demo_submission_lifecycle SET parent_ts = $2, parent_state = 'sent', no_booking_state = 'sent'
+          WHERE submission_key = $1`, [key, root.parent_ts]);
+      }
       // Discover outside no state assumptions: this also recovers missed late webhooks.
       const scoped = Object.create(this);
       scoped.pool = client;
@@ -249,9 +289,18 @@ class DemoSubmissionLifecycle {
         AND NOT EXISTS (SELECT 1 FROM demo_submission_lifecycle s WHERE s.email = $1
           AND s.submitted_at > $2 AND s.submitted_at <= b.booked_at)
         ORDER BY b.booked_at, b.invitee_uri LIMIT 1`, [row.email, row.submitted_at])).rows[0];
-      const early = booking && Number(booking.booked_at) <= Number(row.submitted_at) + WINDOW_MS;
+      if (booking) {
+        const notified = (await client.query(`SELECT 1 FROM demo_submission_lifecycle
+          WHERE email = $1 AND booking_uri = $2 AND booked_state = 'sent' AND submission_key != $3 LIMIT 1`,
+        [row.email, booking.invitee_uri, key])).rows.length > 0;
+        if (notified) {
+          await client.query("UPDATE demo_submission_lifecycle SET booked_state = 'sent', booking_uri = $2 WHERE submission_key = $1", [key, booking.invitee_uri]);
+          return;
+        }
+      }
+      const early = !repeat && booking && Number(booking.booked_at) <= Number(row.submitted_at) + WINDOW_MS;
       if (!booking && this.now() < Number(row.submitted_at) + WINDOW_MS) return;
-      const newer = (await client.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 AND submitted_at > $2 LIMIT 1', [row.contact_id, row.submitted_at])).rows.length > 0;
+      const newer = (await client.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 AND submitted_at > $2 AND thread_root_key IS NULL LIMIT 1', [row.contact_id, row.submitted_at])).rows.length > 0;
       let ownerId = early ? booking.owner_id : row.assigned_owner;
       if (!ownerId) {
         ownerId = RANDOM_OWNER_IDS[this.randomInt(RANDOM_OWNER_IDS.length)];
@@ -290,12 +339,13 @@ class DemoSubmissionLifecycle {
         const bookedMention = `<@${this.ownerSlackMap[bookedOwner]}>`;
         if (!early || row.parent_ts) {
           await this.send(client, row, 'booked_state', {
-            thread_ts: parentTs, text: `${bookedMention} This lead booked a meeting${early ? ' within the first five minutes (booking confirmation arrived later)' : ' after the first five minutes'}.\n${this.meetingText(booking)}`,
+            thread_ts: parentTs, text: `${bookedMention} This lead booked a meeting${repeat ? '' : early ? ' within the first five minutes (booking confirmation arrived later)' : ' after the first five minutes'}.\n${this.meetingText(booking)}`,
           });
         } else {
           await client.query("UPDATE demo_submission_lifecycle SET booked_state = 'sent' WHERE submission_key = $1", [key]);
         }
         await client.query('UPDATE demo_submission_lifecycle SET booking_uri = $2 WHERE submission_key = $1', [key, booking.invitee_uri]);
+        if (repeat) await client.query("UPDATE demo_submission_lifecycle SET booked_state = 'sent', booking_uri = COALESCE(booking_uri, $2) WHERE submission_key = $1", [row.thread_root_key, booking.invitee_uri]);
       }
       await client.query('UPDATE demo_submission_lifecycle SET next_check = $2, last_error = NULL WHERE submission_key = $1', [key, this.now() + WINDOW_MS]);
     });

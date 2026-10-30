@@ -880,9 +880,6 @@ async function ensureContact({ payload, ownerId = '' }) {
 
 async function handleInviteeCreated(payload, scheduledEvent, filter, options = {}) {
   const contact = await ensureContact({ payload, ownerId: filter.ownerId });
-  const company = await ensureCompany({ payload });
-  const companyName = company?.properties?.name || getCompanyIdentityFromPayload(payload).name;
-  if (company) await associate('companies', company.id, 'contacts', contact.id);
   const eventUri = getScheduledEventUri(payload);
   const inviteeUri = getInviteeUri(payload);
   const oldInviteeUri = getOldInviteeUri(payload);
@@ -897,9 +894,16 @@ async function handleInviteeCreated(payload, scheduledEvent, filter, options = {
   deal = deal || await findDealByCalendlyIdentifiers({ inviteeUri, eventUri });
   // A demo request may already have produced its opportunity before booking.
   // Keep the same deal and attach this meeting rather than creating another.
-  if (!deal && options.demoLifecycle?.requestDeals) {
-    deal = await options.demoLifecycle.ensureDealForBooking(contact.id);
+  let formDeal;
+  if (options.demoLifecycle?.requestDeals && (!deal || await options.demoLifecycle.hasRequestDeal(deal.id))) {
+    formDeal = await options.demoLifecycle.ensureDealForBooking(contact.id, getCompanyNameFromPayload(payload));
+    deal = deal || formDeal;
   }
+  // The form lifecycle owns company creation for managed submissions. Its
+  // direct unique-key lookup also works before a new company is searchable.
+  const company = formDeal ? (formDeal.company ? { id: formDeal.company.id, properties: { name: formDeal.company.name } } : null) : await ensureCompany({ payload });
+  const companyName = company?.properties?.name || getCompanyIdentityFromPayload(payload).name;
+  if (company) await associate('companies', company.id, 'contacts', contact.id);
 
   if (deal) {
     const properties = {

@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { DemoRequestDeals, CONTACT_KEY_PROPERTY, PIPELINE_ID, STAGE_ID } = require('../demo-request-deals');
+const { DemoRequestDeals, CONTACT_KEY_PROPERTY, COMPANY_KEY_PROPERTY, PIPELINE_ID, STAGE_ID } = require('../demo-request-deals');
 
 function fixture({ company = true, openDeal = false, timeout = false, companyLinkFailure = false } = {}) {
   const calls = [], saved = [], deals = new Map();
@@ -9,6 +9,7 @@ function fixture({ company = true, openDeal = false, timeout = false, companyLin
   const request = async (path, options = {}) => {
     calls.push({ path, ...options });
     if (path.startsWith('/crm/v3/objects/contacts/1?')) return { id: '1', properties: { email: 'lead@gmail.com', firstname: 'Fixture', lastname: 'Lead' } };
+    if (path === `/crm/v3/properties/companies/${COMPANY_KEY_PROPERTY}`) return { name: COMPANY_KEY_PROPERTY, type: 'string', hasUniqueValue: true };
     if (path === `/crm/v3/properties/deals/${CONTACT_KEY_PROPERTY}`) return { name: CONTACT_KEY_PROPERTY, type: 'string', hasUniqueValue: true };
     if (path === `/crm/v3/pipelines/deals/${PIPELINE_ID}`) return { stages: [{ id: STAGE_ID, metadata: { isClosed: 'false' } }] };
     if (path === '/automation/v4/flows/1901925124') return { isEnabled: false };
@@ -148,4 +149,41 @@ test('company lookup failure never turns into a missing-company deal create', as
   };
   await assert.rejects(f.ensure(), /unavailable/);
   assert.ok(!f.calls.some(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST'));
+});
+
+test('newly created company is linked to both the contact and the newly created deal', async () => {
+  const f = fixture({ company: false }); const request = f.service.request;
+  let company;
+  f.service.request = async (path, options = {}) => {
+    if (path.startsWith('/crm/v3/objects/contacts/1?')) return { id: '1', properties: { email: 'lead@example.business', company: 'Example Business' } };
+    if (path === '/crm/v3/objects/companies/search') return { results: [] };
+    if (path.includes('/crm/v3/objects/companies/') && path.includes('idProperty=')) {
+      if (!company) throw Object.assign(new Error('not found'), { statusCode: 404 });
+      return company;
+    }
+    if (path === '/crm/v3/objects/companies' && options.method === 'POST') {
+      company = { id: '200', properties: { ...options.body.properties } }; return company;
+    }
+    if (path.startsWith('/crm/v4/objects/companies/200/associations/deals?')) return { results: [] };
+    return request(path, options);
+  };
+  const deal = await f.service.ensure({ contactId: '1', email: 'lead@example.business', saveDeal: async id => f.saved.push(id) });
+  assert.deepEqual(deal.company, { id: '200', name: 'Example Business' });
+  const create = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST');
+  assert.deepEqual(create.body.associations.map(a => a.to.id), ['1', '200']);
+  assert.equal(create.body.properties.dealname, 'Example Business - Demo Request');
+  assert.ok(f.calls.some(c => c.path === '/crm/v4/objects/contacts/1/associations/default/companies/200'));
+  assert.ok(f.calls.some(c => c.path === '/crm/v4/objects/deals/100/associations/default/companies/200'));
+});
+
+
+test('linking a newly known company clears only the generated missing-company title and description', async () => {
+  const f = fixture(); const request = f.service.request;
+  f.deals.set('100', { id: '100', properties: {
+    [CONTACT_KEY_PROPERTY]: '1', dealname: 'Fixture Lead - Demo Request [Company missing]',
+    description: 'Created from a demo request. COMPANY MISSING: no company.',
+  } });
+  await f.ensure('100');
+  assert.equal(f.deals.get('100').properties.dealname, 'Fixture Company - Demo Request');
+  assert.equal(f.deals.get('100').properties.description, 'Created from a demo request.');
 });

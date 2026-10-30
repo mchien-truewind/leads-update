@@ -1,0 +1,11 @@
+{
+  "name": "truewind_demo_company_key",
+  "label": "Truewind demo company key",
+  "description": "Internal unique business-domain or explicit company-name key for retry-safe automatic demo company creation.",
+  "groupName": "companyinformation",
+  "type": "string",
+  "fieldType": "text",
+  "hasUniqueValue": true,
+  "hidden": true,
+  "formField": false
+}

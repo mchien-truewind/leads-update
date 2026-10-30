@@ -9,12 +9,13 @@ from .common import unique
 
 
 class Provider:
-    def __init__(self, key, scope, *, allow_write=False, transport=None, clock=time.time, monotonic=time.monotonic, window=None, report=None):
+    def __init__(self, key, scope, *, allow_write=False, transport=None, clock=time.time, monotonic=time.monotonic, window=None, report=None, allow_notes=False):
         contract.validate_scope(scope)
         self.key, self.scope = key, dict(scope)
         self.allow_write, self.transport = allow_write, transport
         self.clock, self.monotonic = clock, monotonic
         self.window = window
+        self.allow_notes = allow_notes
         self.report = report or (lambda value: print(json.dumps(value,sort_keys=True),flush=True))
         self.activity_reports = {}
 
@@ -38,12 +39,21 @@ class Provider:
             except Exception: pass  # Diagnostics cannot alter provider results.
             self.activity_reports[offset]=result  # At most five allowlisted page offsets.
 
-    def _allowed(self, method, path, payload):
+    def _allowed(self, method, path, payload, note_block=None):
         u = urlsplit(path)
         if u.scheme or u.netloc or u.fragment or not path.startswith('/api/'):
             return False
         q = parse_qs(u.query,keep_blank_values=True)
         scope = self.scope
+        note_path='/api/contacts/'+scope['contact_id']+'/notes'
+        if note_block is not None:
+            if method=='POST':
+                return self.allow_notes is True and path==note_path and payload=={'note':note_block}
+            if method=='PATCH': return False
+            if method=='GET' and u.path==note_path and payload is None:
+                return (set(q)=={'limit','page','sortBy','sortOrder'} and q['limit']==['100']
+                    and q['page'] in ([str(x)] for x in range(1,6))
+                    and q['sortBy']==['createdAt'] and q['sortOrder']==['desc'])
         if method == 'PATCH':
             return (self.allow_write is True and path == '/api/tasks'
                     and payload == {'id':scope['task_id'],'done':True})
@@ -63,20 +73,26 @@ class Provider:
                 and q['limit'] == ['100'] and q['offset'] in ([str(x)] for x in range(0,500,100)))
         return False
 
-    def run(self, operation):
-        if operation not in ('inspect','complete') or not self.key:
+    def run(self, operation, *, note_event=None, note_approval=None, note_claim=None):
+        if operation not in ('inspect','complete','note') or not self.key:
             raise ValueError('provider operation unavailable')
         if operation == 'complete' and self.allow_write is not True:
             raise ValueError('task completion disabled')
+        block=None
+        if operation=='note':
+            from .task_notes import TaskNotes, note_block
+            if self.allow_notes is not True or note_claim is None or note_claim.scope!=self.scope:
+                raise ValueError('task notes disabled')
+            block=note_block(note_event,note_approval,self.scope)
         deadline, calls, writes = self.monotonic()+45, 0, 0
         with httpx.Client(base_url='https://api.lemlist.com',auth=httpx.BasicAuth('',self.key),
                 transport=self.transport,trust_env=False,follow_redirects=False,timeout=5) as client:
             def request(method,path,payload=None):
                 nonlocal calls,writes
-                if not self._allowed(method,path,payload) or calls >= 24 or self.monotonic() >= deadline:
+                if not self._allowed(method,path,payload,block) or calls >= 24 or self.monotonic() >= deadline:
                     raise ValueError('provider request outside scope')
                 calls += 1
-                if method == 'PATCH':
+                if method in ('PATCH','POST'):
                     contract.active(self.scope,self.clock(),window=self.window)
                     if writes: raise ValueError('one write attempt only')
                     writes += 1
@@ -96,4 +112,5 @@ class Provider:
                 except Exception:
                     raise ValueError('provider unavailable or rejected') from None
             if operation == 'inspect': return contract.observe(self.scope,lambda p:request('GET',p))
+            if operation == 'note': return TaskNotes(note_claim).run(note_event,note_approval,lambda p:request('GET',p),request)
             return contract.complete(self.scope,lambda p:request('GET',p),request,clock=self.clock,window=self.window)

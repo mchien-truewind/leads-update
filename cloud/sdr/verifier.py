@@ -26,7 +26,7 @@ _REJECTION_REASONS = {
 }
 
 
-def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provider=None, approval=None, private_claim=None, disposition_policy=None):
+def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provider=None, approval=None, private_claim=None, disposition_policy=None, notes_enabled=False):
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     auth = Authenticate(public_key, clock)
     reported_rejections = set()
@@ -114,6 +114,25 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
         except Exception:
             raise HTTPException(503,'Scoped completion unavailable; reconcile by inspection.') from None
 
+    @app.post('/v1/lemlist/note')
+    async def annotate_task(request: Request):
+        from .common import unique
+        raw=await body(request)
+        await authenticated(request,raw)
+        def run_note(value):
+            if not completion_lock.acquire(blocking=False): raise ValueError('task operation in flight')
+            try:
+                if (not notes_enabled or lemlist_provider is None or private_claim is None
+                        or approval is None or disposition_policy is None
+                        or not isinstance(value,dict) or set(value)!={'approval','event'}
+                        or value['approval']!=approval):
+                    raise ValueError('task notes unavailable')
+                disposition_policy.authorize(approval)
+                return lemlist_provider.run('note',note_event=value['event'],note_approval=approval,note_claim=private_claim)
+            finally: completion_lock.release()
+        try: return await asyncio.to_thread(run_note,json.loads(raw,object_pairs_hook=unique))
+        except Exception: raise HTTPException(503,'Scoped task notes unavailable; inspect on retry.') from None
+
     return app
 
 
@@ -142,15 +161,19 @@ def configured(scope):
         validate_approval(approval)
         if policy is None: raise ValueError('approval without disposition policy')
         policy.authorize(approval)
-    return Provider(os.environ.get('LEMLIST_API',''),selected,allow_write=approval is not None),approval,claim,policy
+    from .task_notes import enabled
+    notes=enabled(os.environ)
+    if notes and approval is None: raise ValueError('task notes require approved call')
+    return Provider(os.environ.get('LEMLIST_API',''),selected,allow_write=approval is not None,allow_notes=notes),approval,claim,policy
 
 
 def from_environment():
     scope=load_scope(os.environ['CAPTURE_SCOPE'])
     provider,approval,claim,policy=configured(scope)
+    from .task_notes import enabled
     app = create_app(signing_key=os.environ.get('NOOKS_SIGNING_KEY', ''),
         public_key=os.environ.get('RECEIVER_PUBLIC_KEY', ''), scope=scope,
-        lemlist_provider=provider,approval=approval,private_claim=claim,disposition_policy=policy)
+        lemlist_provider=provider,approval=approval,private_claim=claim,disposition_policy=policy,notes_enabled=enabled(os.environ))
     from .secondary import configured as secondary_configured, open_secondary, settings
     from .retarget import configured as retarget_configured, capture_scope
     secondary = secondary_configured(os.environ, retarget_configured(os.environ), provider.scope if provider else None)

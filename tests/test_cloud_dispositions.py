@@ -2,6 +2,7 @@
 
 Uses both ASGI applications, real signatures/SQLite, and only dummy provider data.
 """
+import asyncio
 import base64
 import copy
 import datetime
@@ -20,6 +21,7 @@ from cloud.sdr.private_claim import PrivateClaim
 from cloud.sdr.receiver import Store, Broker, create_app
 from cloud.sdr.verifier import create_app as private_app
 from cloud.sdr.worker import Worker
+from cloud.sdr.task_notes import note_block
 import test_cloud_completion as fixtures
 
 
@@ -493,3 +495,191 @@ class RetargetTests(unittest.TestCase):
             with self.assertRaises(ValueError):receiver.from_environment()
             constructor.assert_not_called()
         with self.assertRaises(OSError):os.fstat(lock)
+
+
+class TaskNoteTests(unittest.TestCase):
+    post=SignedDispositionTests.post
+    approval_for_call=SignedDispositionTests.approval_for_call
+    call=fixtures.CloudCompletionTests.call
+
+    def setUp(self):
+        self.note_writes=[];self.lose_note_ack=False;self.private_notes_enabled=True;self.notes=[]
+        SignedDispositionTests.setUp(self)
+        self.provider.allow_notes=True
+        self.task['message']='Existing instructions. Keep these.'
+
+    def http(self, request):
+        if request.url.path=='/api/contacts/'+self.scope['contact_id']+'/notes':
+            if request.method=='GET':
+                start=(int(request.url.params['page'])-1)*100
+                return httpx.Response(200,json={'data':self.notes[start:start+100],'total':len(self.notes)})
+            self.assertEqual(request.method,'POST')
+            body=json.loads(request.content);self.assertEqual(set(body),{'note'})
+            self.note_writes.append(body)
+            self.notes.append({'_id':'act_'+str(len(self.notes)),'contactId':self.scope['contact_id'],'note':body['note']})
+            if self.lose_note_ack:
+                self.lose_note_ack=False
+                raise httpx.ReadError('lost acknowledgement')
+            return httpx.Response(200,json=self.notes[-1])
+        return fixtures.CloudCompletionTests.http(self,request)
+
+    def bridge(self, approval=None, policy=None):
+        key=self.store.identity()
+        app=private_app(signing_key='dummy-nooks-key',public_key=key.public_key().public_bytes_raw().hex(),
+            scope=self.store.scope,clock=lambda:self.now,lemlist_provider=self.provider,approval=approval,
+            private_claim=PrivateClaim(Path(self.tmp.name)/'signed-private',self.scope,clock=lambda:self.now),
+            disposition_policy=policy or self.policy,notes_enabled=self.private_notes_enabled)
+        return Broker('http://nooks-verifier.railway.internal:8080',key,
+            transport=httpx.ASGITransport(app=app),clock=lambda:self.now)
+
+    def ready_worker(self, *, notes=True):
+        self.assertEqual(self.post().json(),{'status':'captured'})
+        self.approved=self.approval_for_call()
+        return Worker(self.store,self.scope,self.bridge(self.approved),approval=self.approved,policy=self.policy,
+            clock=lambda:self.now,report=self.logs.append,notes_enabled=notes)
+
+    def saved_event(self):
+        with self.store.db() as db: return json.loads(db.execute('SELECT evidence FROM events').fetchone()[0])
+
+    def test_signed_disposition_adds_one_note_without_editing_task_and_survives_restart(self):
+        worker=self.ready_worker();original=self.task['message']
+        result=worker.tick()
+        self.assertEqual((result['state'],result['note_state']),('verified','verified'))
+        block=note_block(self.saved_event(),self.approved,self.scope)
+        self.assertEqual(self.notes[0]['note'],block)
+        self.assertIn('Nooks disposition: No Answer',block)
+        self.assertIn('Completed lemlist task: opp_call',block)
+        self.assertEqual(self.task['message'],original)
+        self.assertEqual(self.post().json(),{'status':'duplicate'})
+        self.now=self.scope['expires_at']+1
+        restarted=Worker(self.store,self.scope,self.bridge(self.approved),approval=self.approved,policy=self.policy,
+            clock=lambda:self.now,report=self.logs.append,notes_enabled=True)
+        self.assertEqual(restarted.tick()['note_state'],'verified')
+        self.assertEqual((len(self.writes),len(self.note_writes)),(1,1))
+        self.assertNotIn('Existing instructions',json.dumps(self.logs))
+
+    def test_concurrent_task_and_contact_note_edits_are_preserved_at_write_time(self):
+        worker=self.ready_worker()
+        def concurrent(request):
+            if request.method=='POST':
+                self.task['message']='New human instructions at write time.'
+                self.notes.append({'_id':'human','contactId':self.scope['contact_id'],'note':'Human note during write.'})
+            return self.http(request)
+        self.provider.transport=httpx.MockTransport(concurrent)
+        self.assertEqual(worker.tick()['note_state'],'verified')
+        self.assertEqual(self.task['message'],'New human instructions at write time.')
+        self.assertEqual(self.notes[0]['note'],'Human note during write.')
+        self.assertEqual(len(self.notes),2)
+
+    def test_lost_note_ack_reconciles_without_another_post(self):
+        worker=self.ready_worker();self.lose_note_ack=True
+        self.assertEqual(worker.tick()['note_state'],'uncertain')
+        self.now=self.scope['expires_at']+1
+        self.assertEqual(worker.tick()['note_state'],'verified')
+        self.assertEqual((len(self.writes),len(self.note_writes)),(1,1))
+
+    def test_existing_exact_note_on_second_page_is_not_duplicated(self):
+        worker=self.ready_worker()
+        self.notes=[{'_id':str(i),'contactId':self.scope['contact_id'],'note':'Existing note'} for i in range(100)]
+        self.notes.append({'_id':'existing-call','contactId':self.scope['contact_id'],
+            'note':note_block(self.saved_event(),self.approved,self.scope)})
+        self.assertEqual(worker.tick()['note_state'],'verified')
+        self.assertEqual(self.note_writes,[])
+
+    def test_conflicting_call_note_is_preserved(self):
+        worker=self.ready_worker()
+        self.notes=[{'_id':'existing-call','contactId':self.scope['contact_id'],
+            'note':note_block(self.saved_event(),self.approved,self.scope).replace('No Answer','Other outcome')}]
+        self.assertEqual(worker.tick()['note_state'],'pending')
+        self.assertEqual(self.note_writes,[])
+
+    def test_incomplete_note_read_cannot_create_a_duplicate(self):
+        worker=self.ready_worker()
+        def incomplete(request):
+            if request.method=='GET' and request.url.path.endswith('/notes'):
+                return httpx.Response(200,json={'data':[],'total':1})
+            return self.http(request)
+        self.provider.transport=httpx.MockTransport(incomplete)
+        self.assertEqual(worker.tick()['note_state'],'pending')
+        self.assertEqual(self.note_writes,[])
+
+    def test_disabled_private_notes_do_not_write_or_change_completion(self):
+        self.private_notes_enabled=False;worker=self.ready_worker()
+        result=worker.tick()
+        self.assertEqual((result['state'],result['note_state']),('verified','pending'))
+        self.assertEqual(self.note_writes,[])
+        self.assertEqual(len(self.writes),1)
+
+    def test_changed_event_rejected_by_private_boundary(self):
+        worker=self.ready_worker(notes=False)
+        self.assertEqual(worker.tick()['state'],'verified')
+        broker=self.bridge(self.approved)
+        for field,value in (('disposition_name','Connected'),('prospect_id','999'),('call_id','different-call')):
+            raw=json.dumps({'approval':self.approved,'event':dict(self.saved_event(),**{field:value})}).encode()
+            with self.subTest(field=field),self.assertRaises(ValueError):
+                asyncio.run(broker.call('/v1/lemlist/note',raw))
+        self.assertEqual(self.note_writes,[])
+
+    def test_expired_window_cannot_start_new_note(self):
+        worker=self.ready_worker(notes=False)
+        self.assertEqual(worker.tick()['state'],'verified');self.now=self.scope['expires_at']+1
+        notes=Worker(self.store,self.scope,self.bridge(self.approved),approval=self.approved,policy=self.policy,
+            clock=lambda:self.now,report=self.logs.append,notes_enabled=True)
+        self.assertEqual(notes.tick()['note_state'],'pending')
+        self.assertEqual(self.note_writes,[])
+
+    def test_changed_task_owner_blocks_note(self):
+        worker=self.ready_worker(notes=False)
+        self.assertEqual(worker.tick()['state'],'verified');self.task['assignedTo']='usr_other'
+        notes=Worker(self.store,self.scope,self.bridge(self.approved),approval=self.approved,policy=self.policy,
+            clock=lambda:self.now,report=self.logs.append,notes_enabled=True)
+        self.assertEqual(notes.tick()['note_state'],'pending')
+        self.assertEqual(self.note_writes,[])
+
+    def test_failed_note_post_is_never_repeated(self):
+        worker=self.ready_worker();attempts=[]
+        def unavailable(request):
+            if request.method=='POST':
+                attempts.append(1);return httpx.Response(503)
+            return self.http(request)
+        self.provider.transport=httpx.MockTransport(unavailable)
+        self.assertEqual(worker.tick()['note_state'],'uncertain')
+        self.assertEqual(worker.tick()['note_state'],'observing')
+        self.assertEqual(worker.tick()['note_state'],'observing')
+        self.assertEqual(len(attempts),1)
+        self.assertEqual(self.note_writes,[])
+
+    def test_note_transport_only_allows_exact_generated_note_for_pinned_contact(self):
+        block='verified block';path='/api/contacts/'+self.scope['contact_id']+'/notes'
+        self.assertTrue(self.provider._allowed('POST',path,{'note':block},block))
+        for method,payload in [('PATCH',{'id':'opp_call','message':block}),('PATCH',{'id':'opp_call','done':True}),
+                ('POST',{'note':'changed'}),('POST',{'note':block,'contactId':'other'})]:
+            self.assertFalse(self.provider._allowed(method,path,payload,block))
+        self.assertFalse(self.provider._allowed('POST','/api/contacts/ctc_other/notes',{'note':block},block))
+        self.assertFalse(self.provider._allowed('POST',path,{'note':block}))
+
+    def test_private_runtime_enables_notes_only_with_explicit_setting(self):
+        from unittest.mock import patch
+        from cloud.sdr import verifier
+        from cloud.sdr.lemlist_provider import Provider
+        base=self.ready_worker(notes=False)
+        self.assertEqual(base.tick()['state'],'verified')
+        key=self.store.identity()
+        env={'CAPTURE_SCOPE':json.dumps(self.store.scope),'LEMLIST_TEST_SCOPE':json.dumps(self.scope),
+            'RAILWAY_VOLUME_MOUNT_PATH':'/data','LEMLIST_API':'dummy-key','NOOKS_SIGNING_KEY':'dummy-nooks-key',
+            'RECEIVER_PUBLIC_KEY':key.public_key().public_bytes_raw().hex(),
+            'COMPLETION_APPROVAL':json.dumps(self.approved),'NOOKS_DISPOSITION_POLICY':self.policy.encoded}
+        raw=json.dumps({'approval':self.approved,'event':self.saved_event()}).encode()
+        def provider(key,scope,**kwargs):
+            return Provider(key,scope,transport=httpx.MockTransport(self.http),clock=lambda:self.now,report=lambda _:None,**kwargs)
+        def claim(directory,scope,**kwargs):
+            return PrivateClaim(Path(self.tmp.name)/'signed-private',scope,clock=lambda:self.now,**kwargs)
+        for flag in ('','1'):
+            with patch.dict('os.environ',dict(env,LEMLIST_CALL_NOTES=flag),clear=True),patch('cloud.sdr.lemlist_provider.Provider',side_effect=provider),patch('cloud.sdr.private_claim.PrivateClaim',side_effect=claim),patch.object(verifier,'create_app',side_effect=lambda **kwargs:private_app(clock=lambda:self.now,**kwargs)):
+                app=verifier.from_environment()
+            broker=Broker('http://nooks-verifier.railway.internal:8080',key,transport=httpx.ASGITransport(app=app),clock=lambda:self.now)
+            if not flag:
+                with self.assertRaises(ValueError):asyncio.run(broker.call('/v1/lemlist/note',raw))
+            else:self.assertEqual(asyncio.run(broker.call('/v1/lemlist/note',raw))['note_state'],'verified')
+        self.assertEqual(len(self.note_writes),1)
+

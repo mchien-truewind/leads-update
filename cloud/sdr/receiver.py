@@ -162,7 +162,7 @@ class Broker:
         self.url, self.key, self.transport, self.clock = url.rstrip('/'), key, transport, clock
 
     async def call(self, path, raw=b'', nooks_signature=''):
-        if path not in ('/v1/ready', '/v1/nooks/verify', '/v1/lemlist/inspect', '/v1/lemlist/complete'):
+        if path not in ('/v1/ready', '/v1/nooks/verify', '/v1/lemlist/inspect', '/v1/lemlist/complete', '/v1/lemlist/note'):
             raise ValueError('unknown broker operation')
         is_completion = path.startswith('/v1/lemlist/')
         path = self.prefix+path
@@ -323,10 +323,11 @@ def from_environment():
         if os.environ.get('LEMLIST_TEST_SCOPE'):
             from .common import unique
             from .worker import Worker
+            from .task_notes import enabled as notes_enabled
             from .dispositions import configured
             selected=json.loads(os.environ['LEMLIST_TEST_SCOPE'],object_pairs_hook=unique)
             approval=json.loads(os.environ['COMPLETION_APPROVAL'],object_pairs_hook=unique) if os.environ.get('COMPLETION_APPROVAL') else None
-            worker=Worker(store,selected,broker,approval=approval,policy=configured(selected,os.environ))
+            worker=Worker(store,selected,broker,approval=approval,policy=configured(selected,os.environ),notes_enabled=notes_enabled(os.environ))
         elif os.environ.get('COMPLETION_APPROVAL') or os.environ.get('NOOKS_DISPOSITION_POLICY') or os.environ.get('TEST_RETARGET'):
             raise ValueError('approval or retarget without scoped worker')
         from .secondary import configured as secondary_configured, open_secondary, settings

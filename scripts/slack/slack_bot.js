@@ -6563,7 +6563,7 @@ async function startSlackBot() {
     demoLifecycle = new DemoSubmissionLifecycle({ pool: slackStateStore.pool,
       hubspotRequest: hubspotRequestFromFetchOptions, calendlyRequest });
     await demoLifecycle.initialize();
-    console.log('HubSpot demo webhook ready: #slack-testing (five-minute booking window)');
+    console.log('HubSpot demo webhook ready: #leads (five-minute booking window)');
   }
 
   if (process.env.DEMO_ROUTING_ENABLED === 'true' || process.env.DEMO_ROUTING_ACTIVATED_AT) {

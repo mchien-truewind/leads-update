@@ -1,10 +1,9 @@
 const crypto = require('crypto');
-const { buildMessage } = require('./hubspot_demo');
+const { buildMessage, CHANNEL_ID } = require('./hubspot_demo');
 const { getOwnerSlackMap } = require('./slack-owner-map');
 const { CONFIG, ensureCalendlyOwnerMap, shouldProcessScheduledEvent, getOrganizerName } = require('./calendly_hubspot');
 
 const WINDOW_MS = 5 * 60 * 1000;
-const CHANNEL_ID = 'C066P0YFF6Z';
 const RANDOM_OWNER_IDS = ['84547076', '89305622']; // Sarah Elix, Xavier Marco
 const PROPERTIES = ['firstname', 'lastname', 'email', 'erp', 'jobtitle', 'how_did_you_hear_about_us', 'finance_team_size', 'phone', 'createdate', 'hubspot_owner_id'];
 const ms = value => /^\d+$/.test(String(value)) ? Number(value) : Date.parse(value);
@@ -26,12 +25,15 @@ class DemoSubmissionLifecycle {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_submission_lifecycle (
       submission_key TEXT PRIMARY KEY, contact_id TEXT NOT NULL, submitted_at BIGINT NOT NULL,
       email TEXT NOT NULL, assigned_owner TEXT, parent_ts TEXT, thread_root_key TEXT,
+      channel_id TEXT NOT NULL DEFAULT 'C066P0YFF6Z',
       parent_state TEXT NOT NULL DEFAULT 'pending', parent_update_state TEXT NOT NULL DEFAULT 'pending', no_booking_state TEXT NOT NULL DEFAULT 'pending',
       booked_state TEXT NOT NULL DEFAULT 'pending', booking_uri TEXT,
       next_check BIGINT NOT NULL, last_error TEXT,
       UNIQUE(contact_id, submitted_at)
     )`);
     await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS thread_root_key TEXT");
+    // Existing timestamps belong to slack-testing; new rows explicitly use the current destination.
+    await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS channel_id TEXT NOT NULL DEFAULT 'C066P0YFF6Z'");
     await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS parent_update_state TEXT NOT NULL DEFAULT 'pending'");
     await this.pool.query(`CREATE INDEX IF NOT EXISTS demo_submission_due ON demo_submission_lifecycle(next_check)
       WHERE booked_state = 'pending' AND parent_state != 'needs_review'`);
@@ -55,8 +57,8 @@ class DemoSubmissionLifecycle {
       await client.query('BEGIN');
       const locked = (await client.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked', [`demo-email:${email}`])).rows[0]?.locked;
       if (!locked) throw new Error('submission_email_busy');
-      const existing = (await client.query(`SELECT * FROM demo_submission_lifecycle WHERE email = $1
-        AND thread_root_key IS NULL ORDER BY submitted_at, submission_key LIMIT 1`, [email])).rows[0];
+      const existing = (await client.query(`SELECT * FROM demo_submission_lifecycle WHERE email = $1 AND channel_id = $2
+        AND thread_root_key IS NULL ORDER BY submitted_at, submission_key LIMIT 1`, [email, CHANNEL_ID])).rows[0];
       const key = `${event.objectId}:${submittedAt}`;
       let targetKey = key;
       if (existing && !existing.parent_ts && existing.booked_state === 'pending') {
@@ -64,10 +66,10 @@ class DemoSubmissionLifecycle {
         targetKey = existing.submission_key;
       } else {
         await client.query(`INSERT INTO demo_submission_lifecycle
-          (submission_key, contact_id, submitted_at, email, next_check, thread_root_key, assigned_owner)
-          VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (contact_id, submitted_at) DO NOTHING`,
+          (submission_key, contact_id, submitted_at, email, next_check, thread_root_key, assigned_owner, channel_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (contact_id, submitted_at) DO NOTHING`,
         [key, String(event.objectId), submittedAt, email, submittedAt + WINDOW_MS,
-          existing && existing.submission_key !== key ? existing.submission_key : null, existing?.assigned_owner || null]);
+          existing && existing.submission_key !== key ? existing.submission_key : null, existing?.assigned_owner || null, CHANNEL_ID]);
       }
       await client.query(`UPDATE demo_submission_lifecycle SET next_check = $2 WHERE submission_key = $1
         AND EXISTS (SELECT 1 FROM demo_submission_bookings b WHERE b.email = demo_submission_lifecycle.email
@@ -238,20 +240,21 @@ class DemoSubmissionLifecycle {
       WHERE submission_key = $1 AND ${stateColumn} = 'pending' RETURNING submission_key`, [row.submission_key]);
     if (!claim.rows.length) return null;
     const updating = stateColumn === 'parent_update_state';
+    const channel = row.channel_id || CHANNEL_ID;
     let definitelyRejected = updating;
     try {
       const response = await this.fetchImpl(`https://slack.com/api/${updating ? 'chat.update' : 'chat.postMessage'}`, {
         method: 'POST', signal: AbortSignal.timeout(15000),
         headers: { authorization: `Bearer ${this.env.SLACK_BOT_TOKEN.replace(/\s+/g, '')}`, 'content-type': 'application/json' },
         body: JSON.stringify(updating
-          ? { channel: CHANNEL_ID, ts: row.parent_ts, text: message.text, blocks: message.blocks }
-          : { channel: CHANNEL_ID, unfurl_links: false, unfurl_media: false, ...message }),
+          ? { channel, ts: row.parent_ts, text: message.text, blocks: message.blocks }
+          : { unfurl_links: false, unfurl_media: false, ...message, channel }),
       });
       if (response.status === 429) { definitelyRejected = true; throw new Error('slack_rate_limited'); }
       if (!response.ok) throw new Error('slack_http_delivery_unknown');
       const result = await response.json();
       if (result.ok === false) { definitelyRejected = true; throw new Error('slack_rejected'); }
-      if (result.ok !== true || !result.ts || result.channel !== CHANNEL_ID) throw new Error('slack_delivery_unknown');
+      if (result.ok !== true || !result.ts || result.channel !== channel) throw new Error('slack_delivery_unknown');
       await client.query(`UPDATE demo_submission_lifecycle SET ${stateColumn} = 'sent'
         ${stateColumn === 'parent_state' ? ', parent_ts = $2' : ''} WHERE submission_key = $1`,
       stateColumn === 'parent_state' ? [row.submission_key, result.ts] : [row.submission_key]);
@@ -287,6 +290,7 @@ class DemoSubmissionLifecycle {
       if (repeat) {
         const root = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [row.thread_root_key])).rows[0];
         if (!root?.parent_ts || root.parent_state !== 'sent') return;
+        if (root.channel_id !== row.channel_id) throw new Error('submission_thread_channel_mismatch');
         row.parent_ts = root.parent_ts;
         row.parent_state = 'sent';
         row.no_booking_state = 'sent';

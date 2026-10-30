@@ -58,11 +58,11 @@ before(async () => {
       const message = JSON.parse(options.body);
       if (url.endsWith('chat.update')) {
         updates.push(message);
-        return Response.json({ ok: true, ts: message.ts, channel: CHANNEL_ID });
+        return Response.json({ ok: true, ts: message.ts, channel: message.channel });
       }
       posts.push(message);
       if (failPost) throw new Error('connection reset after send');
-      return Response.json({ ok: true, ts: `${posts.length}.001`, channel: CHANNEL_ID });
+      return Response.json({ ok: true, ts: `${posts.length}.001`, channel: message.channel });
     },
   });
   await lifecycle.initialize();
@@ -524,4 +524,57 @@ test('a second Calendly booking without another form webhook also replies to the
   assert.equal(posts.length, 2);
   assert.equal(posts[1].thread_ts, '1.001');
   assert.equal(posts.filter(m => !m.thread_ts).length, 1);
+});
+
+
+test('new demo notifications and their booking replies target leads', async () => {
+  assert.equal(CHANNEL_ID, 'C05MF0R662J');
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b = booking(400);
+  bookings.push(b);
+  time = submittedAt + 400000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.ok(posts.every(m => m.channel === 'C05MF0R662J'));
+  assert.equal(posts[2].thread_ts, '1.001');
+});
+
+test('migration retains slack-testing for existing message timestamps and followups', async () => {
+  await lifecycle.enqueue(formEvent);
+  await db.exec('ALTER TABLE demo_submission_lifecycle DROP COLUMN channel_id');
+  await lifecycle.initialize();
+  assert.equal((await row()).channel_id, 'C066P0YFF6Z');
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b = booking(400);
+  bookings.push(b);
+  time = submittedAt + 400000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.ok(posts.every(m => m.channel === 'C066P0YFF6Z'));
+  assert.equal(posts[2].thread_ts, '1.001');
+});
+
+test('a fresh form in leads does not reuse an old slack-testing thread', async () => {
+  await lifecycle.enqueue(formEvent);
+  await pool.query("UPDATE demo_submission_lifecycle SET channel_id = 'C066P0YFF6Z'");
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  time = submittedAt + 600000;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  const b = booking(601);
+  bookings.push(b);
+  time += 1000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.equal(posts[2].channel, 'C05MF0R662J');
+  assert.equal(posts[2].thread_ts, undefined);
+  const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
+  assert.equal(rows[1].thread_root_key, null);
+  assert.equal(rows[1].channel_id, 'C05MF0R662J');
 });

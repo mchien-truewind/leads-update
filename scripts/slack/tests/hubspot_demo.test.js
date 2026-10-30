@@ -49,7 +49,7 @@ function dependencies(overrides = {}) {
       assert.equal(url, 'https://slack.com/api/chat.postMessage');
       assert.equal(options.headers.authorization, 'Bearer test-slack-token');
       messages.push(JSON.parse(options.body));
-      return Response.json({ ok: true, ts: '1792018273.000100', channel: 'C066P0YFF6Z' });
+      return Response.json({ ok: true, ts: '1792018273.000100', channel: 'C05MF0R662J' });
     },
     ...overrides,
   };
@@ -75,7 +75,7 @@ test('signed demo webhook sends the exact message, mention, channel, and HubSpot
   assert.equal(response.body.sent, 1);
   assert.equal(deps.messages.length, 1);
   const message = deps.messages[0];
-  assert.equal(message.channel, 'C066P0YFF6Z');
+  assert.equal(message.channel, 'C05MF0R662J');
   assert.equal(message.text, [
     '<@U0ABULY5TEK>', 'New DEMO Submission', 'mercedes test', 'testa@testa.com',
     '- ERP: Netsuite', '- Job Title: test', '- How did you hear about us? Search engine (Google, Bing, etc.)',

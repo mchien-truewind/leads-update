@@ -4,7 +4,7 @@ const { appliesToSubmission } = require('./demo-routing');
 const PORTAL_ID = 43974586;
 const APP_ID = 31714623;
 const PROPERTY = 'demo_form_submission_datetime';
-const CHANNEL_ID = 'C066P0YFF6Z';
+const CHANNEL_ID = 'C05MF0R662J';
 const MENTION_ID = 'U0ABULY5TEK';
 const CONTACT_PROPERTIES = ['firstname', 'lastname', 'email', 'erp', 'jobtitle', 'how_did_you_hear_about_us', 'finance_team_size', 'phone', 'createdate'];
 
@@ -267,4 +267,4 @@ async function handleHubSpotDemoWebhook(req, res, options) {
   }
 }
 
-module.exports = { DemoNotificationStore, isDemoEvent, eventKey, buildMessage, processEvent, handleHubSpotDemoWebhook };
+module.exports = { CHANNEL_ID, DemoNotificationStore, isDemoEvent, eventKey, buildMessage, processEvent, handleHubSpotDemoWebhook };

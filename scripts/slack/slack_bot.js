@@ -51,6 +51,7 @@ const { createDemoRouter, routingEnabled } = require('./demo-routing');
 const { handleDemoRoutingRequest } = require('./demo-routing-http');
 const { DemoBookingStore } = require('./demo-booking-store');
 const { DemoSubmissionLifecycle } = require('./demo-submission-lifecycle');
+const { GoogleCalendarDealSync } = require('./google-calendar-deal-sync');
 const { startDemoRoutingRecovery } = require('./demo-routing-recovery');
 const { verifyOwnerRegistry } = require('./demo-routing-readiness');
 const {
@@ -6608,6 +6609,14 @@ async function startSlackBot() {
   console.log(`  Firecrawl: ${FIRECRAWL_API_KEY ? 'ready' : 'NOT CONFIGURED'}`);
 
   if (runsWorker) {
+    if (process.env.GOOGLE_CALENDAR_DEAL_SYNC_ENABLED === 'true') {
+      if (!slackStateStore?.pool || !HUBSPOT_TOKEN) throw new Error('Calendar deal sync requires HubSpot and durable state');
+      const calendarSync = new GoogleCalendarDealSync({ pool: slackStateStore.pool,
+        request: hubspotRequestFromFetchOptions,
+        calendar: google.calendar({ version: 'v3', auth: createCalendarOAuthClient() }) });
+      await calendarSync.initialize();
+      calendarSync.start();
+    }
     // Scheduled jobs post via the Slack Web API (app.client), so they run without
     // Socket Mode. Keeping them in the worker (or single 'all') process means they
     // never block the dedicated 'bot' process's Socket Mode heartbeat.

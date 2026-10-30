@@ -212,3 +212,8 @@ test('an unavailable old CRM meeting does not block unrelated deal updates or tr
   const stats = await f.sync.tick(); assert.equal(stats.failed, 1); assert.equal(stats.synced, 1);
   assert.deepEqual(f.links.get('100'), ['10']);
 });
+test('closing a deal preserves its previously synchronized meeting association', async t => {
+  const f = fixture(); await database(t, f.sync); await f.sync.tick();
+  f.s.contactDeals.clear(); f.s.deals = [];
+  await f.sync.tick(); assert.deepEqual(f.links.get('100'), ['10']);
+});

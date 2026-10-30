@@ -287,7 +287,8 @@ class GoogleCalendarDealSync {
         const plan = await this.plan(snapshot, event);
         if (plan.reason) {
           if (plan.reason.startsWith('ambiguous')) stats.ambiguous++;
-          else if (prior.get(event.key)?.owned_deal_id) await this.retire(client, prior.get(event.key));
+          // A contact/deal disappearing from the open-deal index (for example,
+          // a won deal) must not erase its historical meeting association.
           return;
         }
         await this.persist(client, event, plan, prior.get(event.key));

@@ -84,6 +84,42 @@ class SignedDispositionTests(unittest.TestCase):
         self.assertEqual(restarted.tick()['state'],'verified')
         self.assertEqual(len(self.writes),1)
 
+    def test_worker_reports_missing_activity_link_and_later_progression_without_another_write(self):
+        self.assertEqual(self.post().json(),{'status':'captured'})
+        approved=self.approval_for_call()
+        self.step=None
+        worker=Worker(self.store,self.scope,self.bridge(approved),policy=self.policy,approval=approved,
+            clock=lambda:self.now,report=self.logs.append)
+        first=worker.tick()
+        self.assertEqual(first['state'],'observing')
+        self.assertTrue(first['readback']['task_done'])
+        self.assertEqual(first['readback']['activity_count'],1)
+        self.assertFalse(first['readback']['activity_step_present'])
+        self.assertFalse(first['readback']['activity_step_matches'])
+        self.assertTrue(first['readback']['activity_sequence_matches'])
+        self.assertEqual(first['readback']['continuation_task_count'],1)
+        self.assertTrue(first['readback']['continuation_pending'])
+        with self.store.db() as db:
+            before=db.execute('SELECT claimed_at,approval,write_receipt FROM completion').fetchone()
+            evidence=json.loads(db.execute('SELECT after_evidence FROM completion').fetchone()[0])
+            evidence['private']='dummy-secret-never-log'
+            evidence['completion_activities'][0]['note']='private-contact-notes'
+            db.execute('UPDATE completion SET after_evidence=?',(json.dumps(evidence),))
+        summary=worker.core.observation_summary()
+        self.assertEqual(summary,first['readback'])
+        for hidden in ('dummy-secret-never-log','private-contact-notes','private@example.test','dummy-private-key'):
+            self.assertNotIn(hidden,json.dumps(summary))
+        self.step='stp_call'
+        self.now=self.scope['expires_at']+1
+        restarted=Worker(self.store,self.scope,self.bridge(approved),policy=self.policy,approval=approved,
+            clock=lambda:self.now,report=self.logs.append)
+        final=restarted.tick()
+        self.assertEqual(final['state'],'verified')
+        self.assertTrue(final['readback']['activity_step_matches'])
+        self.assertEqual(len(self.writes),1)
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT claimed_at,approval,write_receipt FROM completion').fetchone(),before)
+
     def test_unknown_id_cannot_complete_even_with_safe_display_name_and_confirmation(self):
         self.webhook['callData']['disposition']['id']='unreviewed'
         self.assertEqual(self.post().status_code,200)

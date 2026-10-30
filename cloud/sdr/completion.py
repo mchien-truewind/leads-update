@@ -63,6 +63,33 @@ class Completion:
         return {'state':'held' if held else row[0] if row else 'not_armed',
                 'write_receipt':row[1] if row else None}
 
+    def observation_summary(self):
+        """Fixed diagnostics from saved normalized readback; no provider calls or writes."""
+        with self.store.db() as db:
+            row=db.execute('SELECT claimed_at,after_evidence FROM completion WHERE singleton=1').fetchone()
+        if not row or row[0] is None or row[1] is None:
+            return None
+        evidence=json.loads(row[1])
+        if not isinstance(evidence,dict): return None
+        task=evidence.get('task')
+        events=evidence.get('completion_activities')
+        pending=evidence.get('continuation_tasks')
+        event=events[0] if isinstance(events,list) and len(events)==1 and isinstance(events[0],dict) else {}
+        continuation=pending[0] if isinstance(pending,list) and len(pending)==1 and isinstance(pending[0],dict) else {}
+        return {
+            'task_done':isinstance(task,dict) and task.get('task_id')==self.scope['task_id'] and task.get('done') is True,
+            'activity_count':len(events) if isinstance(events,list) else None,
+            'activity_task_matches':event.get('task_id')==self.scope['task_id'],
+            'activity_step_present':event.get('step_id') is not None,
+            'activity_step_matches':event.get('step_id')==self.scope['call_step_id'],
+            'activity_sequence_present':event.get('sequence_id') is not None,
+            'activity_sequence_matches':event.get('sequence_id')==self.scope['sequence_id'],
+            'activity_after_claim':type(event.get('created_at')) in (int,float) and event['created_at']>=row[0],
+            'continuation_task_count':len(pending) if isinstance(pending,list) else None,
+            'continuation_pending':continuation.get('status') in ('due','upcoming'),
+            'continuation_sequence_matches':continuation.get('provider_sequence_id')==self.scope['sequence_id'],
+        }
+
     def arm(self, call):
         active(self.scope,self.clock(),window=self.store.window)
         evidence = call('inspect',{})

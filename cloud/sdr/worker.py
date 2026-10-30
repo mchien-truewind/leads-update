@@ -35,6 +35,8 @@ class Worker:
             pass
         result={'event':'sdr_test_status','test_contact_id':self.core.scope['hubspot_contact_id'],**self.core.status()}
         if action: result['disposition_action']=action
+        readback=self.core.observation_summary()
+        if readback is not None: result['readback']=readback
         if result['state']=='armed' and self.approval is None:
             with self.store.db() as db:
                 rows=db.execute('SELECT digest,evidence FROM events').fetchall()

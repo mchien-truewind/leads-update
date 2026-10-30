@@ -72,6 +72,8 @@ beforeEach(async () => {
   time = submittedAt;
   posts = []; updates = []; assignments = []; bookings = []; discoverCalls = [];
   contactOwner = '91143842'; failDiscovery = false; failPost = false;
+  delete lifecycle.requestDeals;
+  delete lifecycle.dealsActivatedAt;
   // The lookup behavior is tested independently below; avoid real requests in lifecycle tests.
   lifecycle.discoverBookings = async function (row) {
     discoverCalls.push(row.email);
@@ -577,4 +579,104 @@ test('a fresh form in leads does not reuse an old slack-testing thread', async (
   const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
   assert.equal(rows[1].thread_root_key, null);
   assert.equal(rows[1].channel_id, 'C05MF0R662J');
+});
+
+function enableDealFixture({ fail = false } = {}) {
+  const ensured = [], owners = [];
+  lifecycle.dealsActivatedAt = submittedAt;
+  lifecycle.requestDeals = {
+    async ensure(input) {
+      ensured.push(input);
+      if (fail) throw new Error('CRM unavailable');
+      await input.saveDeal(input.dealId || '900');
+      return { id: input.dealId || '900', properties: {} };
+    },
+    async syncOwner(...args) { owners.push(args); },
+    async readDeal(id) { return { id, properties: {} }; },
+  };
+  return { ensured, owners, recover() { fail = false; } };
+}
+
+test('new form deal is processed before five-minute Slack deadline and only once', async () => {
+  const f = enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 1);
+  assert.equal((await row()).deal_id, '900');
+  assert.equal((await row()).deal_state, 'ready');
+  assert.equal(posts.length, 0);
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 1);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.deepEqual(f.owners.at(-1), ['900', '123', '89305622']);
+});
+
+test('deal retry survives completed notification and does not block Slack delivery', async () => {
+  const f = enableDealFixture({ fail: true });
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal((await row()).deal_state, 'pending');
+  await pool.query("UPDATE demo_submission_lifecycle SET booked_state = 'sent'");
+  f.recover();
+  time += 30000;
+  await lifecycle.tick();
+  assert.equal((await row()).deal_state, 'ready');
+  assert.equal(posts.length, 2);
+});
+
+test('Calendly-first processing ensures the form deal synchronously before the worker tick', async () => {
+  const f = enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  assert.equal((await lifecycle.ensureDealForBooking('123')).id, '900');
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 1);
+  assert.equal(await lifecycle.hasRequestDeal('900'), true);
+  delete lifecycle.requestDeals;
+  assert.equal(await lifecycle.hasRequestDeal('900'), true);
+});
+
+test('deal activation does not backfill historical submissions', async () => {
+  const f = enableDealFixture();
+  lifecycle.dealsActivatedAt = submittedAt + 1;
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 0);
+  assert.equal(await lifecycle.ensureDealForBooking('123'), null);
+});
+
+test('repeat form reuses the previously saved deal ID', async () => {
+  const f = enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  time += 1000;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 2);
+  assert.equal(f.ensured[1].dealId, '900');
+  assert.deepEqual((await pool.query('SELECT DISTINCT deal_id FROM demo_submission_lifecycle')).rows, [{ deal_id: '900' }]);
+});
+
+test('enabling deal creation requires an explicit activation timestamp', () => {
+  assert.throws(() => new DemoSubmissionLifecycle({ pool, env: { DEMO_REQUEST_DEALS_ENABLED: 'true' } }), /activation_required/);
+});
+
+test('deal owner sync failure retries independently without delaying Slack notifications', async () => {
+  enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  lifecycle.requestDeals.syncOwner = async () => { throw new Error('deal write unavailable'); };
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal((await row()).deal_state, 'pending');
+  lifecycle.requestDeals.syncOwner = async () => {};
+  time += 30000;
+  await lifecycle.tick();
+  assert.equal((await row()).deal_state, 'ready');
+  assert.equal(posts.length, 2);
 });

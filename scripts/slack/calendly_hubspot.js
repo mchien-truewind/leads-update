@@ -895,6 +895,11 @@ async function handleInviteeCreated(payload, scheduledEvent, filter, options = {
     oldMeeting = await findMeetingByCalendlyIdentifiers({ inviteeUri: oldInviteeUri, eventUri: '' });
   }
   deal = deal || await findDealByCalendlyIdentifiers({ inviteeUri, eventUri });
+  // A demo request may already have produced its opportunity before booking.
+  // Keep the same deal and attach this meeting rather than creating another.
+  if (!deal && options.demoLifecycle?.requestDeals) {
+    deal = await options.demoLifecycle.ensureDealForBooking(contact.id);
+  }
 
   if (deal) {
     const properties = {
@@ -905,7 +910,7 @@ async function handleInviteeCreated(payload, scheduledEvent, filter, options = {
       calendly_host_user_uri: filter.hostUserUri,
     };
     if (!hasOwner(deal) && clean(filter.ownerId)) properties.hubspot_owner_id = filter.ownerId;
-    if (foundByOldInvitee) properties.dealstage = CONFIG.newDealStageId;
+    if (foundByOldInvitee && !await options.demoLifecycle?.hasRequestDeal?.(deal.id)) properties.dealstage = CONFIG.newDealStageId;
     await hubspotRequest(`/crm/v3/objects/deals/${deal.id}`, {
       method: 'PATCH',
       body: { properties },
@@ -1000,7 +1005,7 @@ async function handleInviteeCreated(payload, scheduledEvent, filter, options = {
   };
 }
 
-async function handleInviteeCanceled(payload, scheduledEvent, filter) {
+async function handleInviteeCanceled(payload, scheduledEvent, filter, options = {}) {
   const eventUri = getScheduledEventUri(payload);
   const inviteeUri = getInviteeUri(payload);
   const deal = await findDealByCalendlyIdentifiers({ inviteeUri, eventUri });
@@ -1011,6 +1016,15 @@ async function handleInviteeCanceled(payload, scheduledEvent, filter) {
 
   if (isRescheduled(payload)) {
     return { action: 'reschedule_note_deferred_to_created_event', dealId: deal.id, meetingId: meeting?.id };
+  }
+
+  // Canceling a meeting does not withdraw the lead's demo request or close its
+  // opportunity. This also protects pre-existing opportunities reused above.
+  if (await options.demoLifecycle?.hasRequestDeal?.(deal.id)) {
+    if (meeting) await hubspotRequest(`/crm/v3/objects/meetings/${meeting.id}`, {
+      method: 'PATCH', body: { properties: { hs_meeting_outcome: 'CANCELED' } },
+    });
+    return { action: 'canceled_meeting_preserved_demo_deal', dealId: deal.id, meetingId: meeting?.id };
   }
 
   await hubspotRequest(`/crm/v3/objects/deals/${deal.id}`, {
@@ -1104,7 +1118,7 @@ async function processCalendlyWebhook(body, options = {}) {
     }
     let result;
     if (eventName === 'invitee.created') result = await handleInviteeCreated(payload, scheduledEvent, filter, options);
-    else if (eventName === 'invitee.canceled') result = await handleInviteeCanceled(payload, scheduledEvent, filter);
+    else if (eventName === 'invitee.canceled') result = await handleInviteeCanceled(payload, scheduledEvent, filter, options);
     else result = { action: 'ignored_event_type' };
     if (options.demoBookingStore && eventName === 'invitee.created' && result?.dealId) {
       await options.demoBookingStore.put({ inviteeUri: getInviteeUri(payload), eventUri,
@@ -1180,6 +1194,8 @@ module.exports = {
   getEventTypeUri,
   getOrganizerName,
   handleCalendlyHubSpotWebhook,
+  handleInviteeCreated,
+  handleInviteeCanceled,
   hasOwner,
   hubspotDateMs,
   inferCompanyNameFromDomain,

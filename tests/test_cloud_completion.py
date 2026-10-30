@@ -37,7 +37,7 @@ class CloudCompletionTests(unittest.TestCase):
         self.next_task=dict(self.task,_id='opp_next',title='M0 Continuation confirmed')
         self.done=False;self.step='stp_call';self.continuation=True;self.writes=[];self.requests=[]
         self.provider=Provider('dummy-private-key',self.scope,allow_write=True,
-            transport=httpx.MockTransport(self.http),clock=lambda:self.now)
+            transport=httpx.MockTransport(self.http),clock=lambda:self.now,report=lambda _:None)
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.store=Store(Path(self.tmp.name)/'state',dict(workspace_id='workspace',prospect_id='123',
             not_before=self.scope['starts_at'],expires_at=self.scope['expires_at']),clock=lambda:self.now)
@@ -84,6 +84,59 @@ class CloudCompletionTests(unittest.TestCase):
         if operation=='complete': self.assertEqual(approval,self.approval)
         else: self.assertEqual(approval,{})
         return self.provider.run(operation)
+
+    def test_activity_diagnostics_distinguish_empty_history_from_unlinked_records(self):
+        reports=[]
+        self.provider.report=reports.append
+        original=self.http
+        def unlinked(request):
+            if request.url.path=='/api/activities':
+                return httpx.Response(200,json=[{'_id':'act_test','type':'manualDone',
+                    'campaignId':'cam_test','leadId':'lea_test','contactId':'ctc_test',
+                    'private':'private-record-must-not-log',
+                    'stepId':'stp_call','sequenceId':'seq_test'}])
+            return original(request)
+        self.provider.transport=httpx.MockTransport(unlinked)
+        result=self.provider.run('inspect')
+        self.assertEqual(result['completion_activities'],[])
+        diagnostic=reports[-1]
+        self.assertEqual(set(diagnostic),{'event','page_offset','response_status','response_shape',
+            'response_rows','matching_identity_count','with_opportunity_count','matching_opportunity_count',
+            'with_step_count','matching_step_count','with_sequence_count','matching_sequence_count'})
+        self.assertNotIn(self.scope['hubspot_contact_id'],json.dumps(diagnostic))
+        self.assertEqual(diagnostic['response_rows'],1)
+        self.assertEqual(diagnostic['matching_identity_count'],1)
+        self.assertEqual(diagnostic['with_opportunity_count'],0)
+        self.assertEqual(diagnostic['matching_opportunity_count'],0)
+        self.assertEqual(diagnostic['matching_step_count'],1)
+        self.provider.transport=httpx.MockTransport(original)
+        self.provider.run('inspect')
+        self.assertEqual(reports[-1]['response_rows'],0)
+        report_count=len(reports)
+        self.provider.run('inspect')
+        self.assertEqual(len(reports),report_count)
+        for hidden in ('private-record-must-not-log','private@example.test','dummy-private-key'):
+            self.assertNotIn(hidden,json.dumps(reports))
+        self.assertEqual(self.writes,[])
+
+    def test_repeated_multipage_activity_inspection_does_not_repeat_page_diagnostics(self):
+        reports=[]
+        self.provider.report=reports.append
+        original=self.http
+        def pages(request):
+            if request.url.path=='/api/activities':
+                offset=int(parse_qs(request.url.query.decode())['offset'][0])
+                rows=[{'_id':'act_'+str(i),'type':'manualDone','campaignId':'cam_test',
+                    'leadId':'lea_test','contactId':'ctc_test'} for i in range(100)] if offset==0 else []
+                return httpx.Response(200,json=rows)
+            return original(request)
+        self.provider.transport=httpx.MockTransport(pages)
+        for _ in range(3):
+            self.assertEqual(self.provider.run('inspect')['completion_activities'],[])
+        self.assertEqual(len(reports),2)
+        self.assertEqual([r['response_rows'] for r in reports],[100,0])
+        self.assertEqual([r['page_offset'] for r in reports],[0,100])
+        self.assertEqual(self.writes,[])
 
     def test_activity_read_requires_documented_v2_and_keeps_exact_scope(self):
         transport=self.http
@@ -225,7 +278,7 @@ class CloudCompletionTests(unittest.TestCase):
         self.assertEqual(len(self.writes),1)
 
     def test_private_transport_default_disabled_and_fixed_origin_and_resource_scope(self):
-        disabled=Provider('dummy',self.scope,transport=httpx.MockTransport(self.http),clock=lambda:self.now)
+        disabled=Provider('dummy',self.scope,transport=httpx.MockTransport(self.http),clock=lambda:self.now,report=lambda _:None)
         with self.assertRaises(ValueError):disabled.run('complete')
         for method,path,payload in [('GET','https://example.test/api/contacts',None),
              ('GET','/api/contacts?crmIds=999',None),('PATCH','/api/tasks',{'id':'opp_other','done':True}),

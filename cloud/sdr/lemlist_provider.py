@@ -9,12 +9,34 @@ from .common import unique
 
 
 class Provider:
-    def __init__(self, key, scope, *, allow_write=False, transport=None, clock=time.time, monotonic=time.monotonic, window=None):
+    def __init__(self, key, scope, *, allow_write=False, transport=None, clock=time.time, monotonic=time.monotonic, window=None, report=None):
         contract.validate_scope(scope)
         self.key, self.scope = key, dict(scope)
         self.allow_write, self.transport = allow_write, transport
         self.clock, self.monotonic = clock, monotonic
         self.window = window
+        self.report = report or (lambda value: print(json.dumps(value,sort_keys=True),flush=True))
+        self.activity_reports = {}
+
+    def _report_activity(self, status, value, offset):
+        """Only fixed shape/count diagnostics; never provider fields or response text."""
+        rows=value if isinstance(value,list) else []
+        fields={'opportunity':'opportunityId','step':'stepId','sequence':'sequenceId'}
+        expected={'opportunity':self.scope['task_id'],'step':self.scope['call_step_id'],
+                  'sequence':self.scope['sequence_id']}
+        result={'event':'lemlist_activity_read','page_offset':offset,
+            'response_status':status,'response_shape':'array' if isinstance(value,list) else 'other',
+            'response_rows':len(rows) if isinstance(value,list) else None,
+            'matching_identity_count':sum(isinstance(row,dict) and row.get('campaignId')==self.scope['campaign_id']
+                and row.get('leadId')==self.scope['lead_id'] and row.get('contactId',self.scope['contact_id'])==self.scope['contact_id']
+                for row in rows)}
+        for name,field in fields.items():
+            result['with_'+name+'_count']=sum(isinstance(row,dict) and row.get(field) is not None for row in rows)
+            result['matching_'+name+'_count']=sum(isinstance(row,dict) and row.get(field)==expected[name] for row in rows)
+        if result!=self.activity_reports.get(offset):
+            try: self.report(result)
+            except Exception: pass  # Diagnostics cannot alter provider results.
+            self.activity_reports[offset]=result  # At most five allowlisted page offsets.
 
     def _allowed(self, method, path, payload):
         u = urlsplit(path)
@@ -61,13 +83,16 @@ class Provider:
                 try:
                     with client.stream(method,path,json=payload,headers={'Accept':'application/json'}) as response:
                         if response.status_code not in ((200,) if method == 'GET' else (200,201,204)):
+                            if urlsplit(path).path=='/api/activities': self._report_activity(response.status_code,None,int(parse_qs(urlsplit(path).query)['offset'][0]))
                             raise ValueError('provider request rejected')
                         raw=bytearray()
                         for chunk in response.iter_bytes():
                             raw.extend(chunk)
                             if len(raw)>131072 or self.monotonic()>=deadline:
                                 raise ValueError('provider response exceeded limits')
-                        return json.loads(raw,object_pairs_hook=unique) if method=='GET' else None
+                        result=json.loads(raw,object_pairs_hook=unique) if method=='GET' else None
+                        if urlsplit(path).path=='/api/activities': self._report_activity(response.status_code,result,int(parse_qs(urlsplit(path).query)['offset'][0]))
+                        return result
                 except Exception:
                     raise ValueError('provider unavailable or rejected') from None
             if operation == 'inspect': return contract.observe(self.scope,lambda p:request('GET',p))

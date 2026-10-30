@@ -49,7 +49,7 @@ class GoogleCalendarDealSync {
   constructor({ pool, request, calendar, logger = console, now = Date.now, env = process.env }) {
     Object.assign(this, { pool, request, calendar, logger, now, env });
     this.horizonDays = Math.min(730, Math.max(1, Number(env.GOOGLE_CALENDAR_DEAL_SYNC_HORIZON_DAYS) || 365));
-    this.intervalMs = Math.max(60000, Number(env.GOOGLE_CALENDAR_DEAL_SYNC_INTERVAL_MS) || 300000);
+    this.intervalMs = Math.max(60000, Number(env.GOOGLE_CALENDAR_DEAL_SYNC_INTERVAL_MS) || 60000);
   }
 
   async initialize() {
@@ -57,14 +57,15 @@ class GoogleCalendarDealSync {
     if (property.type !== 'string' || property.hasUniqueValue !== true) throw new Error('calendar_unique_meeting_property_required');
     await this.pool.query(`CREATE TABLE IF NOT EXISTS google_calendar_deal_meetings (
       event_key TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, calendar_id TEXT NOT NULL, event_id TEXT NOT NULL,
-      start_at TIMESTAMPTZ NOT NULL, owned_deal_id TEXT, active BOOLEAN NOT NULL DEFAULT true,
+      start_at TIMESTAMPTZ NOT NULL, owned_deal_id TEXT, deal_id TEXT, active BOOLEAN NOT NULL DEFAULT true,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
+    await this.pool.query('ALTER TABLE google_calendar_deal_meetings ADD COLUMN IF NOT EXISTS deal_id TEXT');
   }
 
-  async pages(path, field = 'results') {
+  async pages(path, field = 'results', initialAfter) {
     const rows = [], cursors = new Set();
-    let after;
+    let after = initialAfter;
     do {
       const page = await this.request(`${path}${after == null ? '' : `&after=${encodeURIComponent(after)}`}`);
       if (!Array.isArray(page[field])) throw new Error('calendar_hubspot_page_invalid');
@@ -80,6 +81,36 @@ class GoogleCalendarDealSync {
     const rows = await this.pages(`/crm/v4/objects/${type}/${id}/associations/${target}?limit=500`);
     if (rows.some(row => !/^\d+$/.test(String(row.toObjectId)))) throw new Error('calendar_association_id_invalid');
     return [...new Set(rows.map(row => String(row.toObjectId)))];
+  }
+
+  async associationIndex(type, ids, target) {
+    const index = new Map();
+    for (let i = 0; i < ids.length; i += 1000) {
+      const chunk = ids.slice(i, i + 1000).map(String);
+      const page = await this.request(`/crm/v4/associations/${type}/${target}/batch/read`, {
+        method: 'POST', body: { inputs: chunk.map(id => ({ id })) },
+      });
+      if (page.status !== 'COMPLETE' || !Array.isArray(page.results)) throw new Error('calendar_association_batch_incomplete');
+      for (const error of page.errors || []) {
+        const missing = error.context?.fromObjectId;
+        if (error.subCategory !== 'crm.associations.NO_ASSOCIATIONS_FOUND' || !Array.isArray(missing)) throw new Error('calendar_association_batch_error');
+        for (const id of missing.map(String)) {
+          if (!chunk.includes(id) || index.has(id)) throw new Error('calendar_association_batch_identity');
+          index.set(id, []);
+        }
+      }
+      for (const row of page.results) {
+        const id = String(row.from?.id);
+        if (!chunk.includes(id) || index.has(id) || !Array.isArray(row.to)) throw new Error('calendar_association_batch_identity');
+        const rest = row.paging?.next?.after == null ? [] : await this.pages(
+          `/crm/v4/objects/${type}/${id}/associations/${target}?limit=500`, 'results', row.paging.next.after);
+        const related = [...row.to, ...rest].map(r => String(r.toObjectId));
+        if (related.some(id => !/^\d+$/.test(id))) throw new Error('calendar_association_id_invalid');
+        index.set(id, [...new Set(related)]);
+      }
+      if (chunk.some(id => !index.has(id))) throw new Error('calendar_association_batch_incomplete');
+    }
+    return index;
   }
 
   async search(type, filters, properties) {
@@ -115,13 +146,18 @@ class GoogleCalendarDealSync {
 
   async snapshot() {
     const now = this.now(), until = now + this.horizonDays * DAY;
+    const deals = await this.search('deals', [{ propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' }], ['dealname', 'hubspot_owner_id', 'hs_next_meeting_start_time']);
     const owners = await this.pages('/crm/v3/owners?limit=100&archived=false');
-    const roster = new Map(owners.filter(o => !o.archived && internal(o.email)).map(o => [normalize(o.email), String(o.id)]));
-    for (const email of (this.env.GOOGLE_CALENDAR_DEAL_SYNC_CALENDARS || '').split(',')) {
-      if (email.trim()) roster.set(email.trim(), roster.get(email.trim()) || '');
+    const ownerById = new Map(owners.filter(o => !o.archived && normalize(o.email).includes('@')).map(o => [String(o.id), normalize(o.email)]));
+    const dealOwners = new Map(), roster = new Map();
+    for (const deal of deals) {
+      const ownerId = String(deal.properties.hubspot_owner_id || ''), calendarId = ownerById.get(ownerId);
+      if (!calendarId) continue;
+      dealOwners.set(String(deal.id), { ownerId, calendarId });
+      roster.set(calendarId, ownerId);
     }
     const events = new Map(), readable = new Set(), unavailable = [];
-    for (const [calendarId, ownerId] of roster) {
+    const calendars = await Promise.all([...roster].map(async ([calendarId, ownerId]) => {
       let pageToken;
       const cursors = new Set(), copies = [];
       try {
@@ -138,29 +174,34 @@ class GoogleCalendarDealSync {
       } catch (error) {
         // A failed/partial calendar read must never imply that its meetings were cancelled.
         unavailable.push({ calendarId, status: Number(error.code || error.statusCode) || 'unavailable' });
-        continue;
+        return null;
       }
+      return { calendarId, ownerId, copies };
+    }));
+    for (const calendar of calendars.filter(Boolean)) {
+      const { calendarId, ownerId, copies } = calendar;
       for (const copy of copies) {
         if (!copy.iCalUID) continue;
         const key = occurrenceKey(copy), existing = events.get(key);
-        const variant = { ...copy, key, calendarId, ownerId, ids: new Set([copy.id]) };
+        const variant = { ...copy, key, calendarId, ownerId, ids: new Set([copy.id]), calendarCopies: new Map([[ownerId, { ...copy, calendarId, ownerId }]]) };
         if (!existing) events.set(key, variant);
         else {
           const ids = new Set([...existing.ids, copy.id]);
+          const calendarCopies = new Map([...existing.calendarCopies, ...variant.calendarCopies]);
           // Prefer the organizer's authoritative copy over an invitee's stale copy.
           const organizerCopy = normalize(copy.organizer?.email) === normalize(calendarId);
           const wasOrganizer = normalize(existing.organizer?.email) === normalize(existing.calendarId);
-          if ((organizerCopy && !wasOrganizer) || (organizerCopy === wasOrganizer && time(copy.updated) > time(existing.updated))) events.set(key, { ...variant, ids });
-          else existing.ids = ids;
+          if ((organizerCopy && !wasOrganizer) || (organizerCopy === wasOrganizer && time(copy.updated) > time(existing.updated))) events.set(key, { ...variant, ids, calendarCopies });
+          else { existing.ids = ids; existing.calendarCopies = calendarCopies; }
         }
       }
     }
-    if (!readable.size) throw new Error('calendar_no_readable_calendars');
+    if (roster.size && !readable.size) throw new Error('calendar_no_readable_calendars');
     for (const [key, event] of events) if (!eligible(event, now, until)) events.delete(key);
-    const deals = await this.search('deals', [{ propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' }], ['dealname', 'hubspot_owner_id', 'hs_next_meeting_start_time']);
     const contactDeals = new Map();
+    const dealContacts = await this.associationIndex('deals', [...dealOwners.keys()], 'contacts');
     for (const deal of deals) {
-      for (const id of await this.associations('deals', deal.id, 'contacts')) {
+      for (const id of dealContacts.get(String(deal.id)) || []) {
         if (!contactDeals.has(id)) contactDeals.set(id, new Set());
         contactDeals.get(id).add(String(deal.id));
       }
@@ -177,12 +218,21 @@ class GoogleCalendarDealSync {
       { propertyName: 'hs_meeting_start_time', operator: 'GTE', value: String(now - DAY) },
       { propertyName: 'hs_meeting_start_time', operator: 'LT', value: String(until) },
     ], MEETING_PROPERTIES);
-    return { now, until, events, readable, unavailable, deals, meetings, emailContacts, contactDeals };
+    const meetingIds = meetings.map(m => String(m.id));
+    const [meetingDeals, meetingContacts] = await Promise.all([
+      this.associationIndex('meetings', meetingIds, 'deals'), this.associationIndex('meetings', meetingIds, 'contacts'),
+    ]);
+    return { now, until, events, readable, unavailable, deals, meetings, emailContacts, contactDeals, dealOwners, meetingDeals, meetingContacts };
   }
 
   async plan(snapshot, event) {
     const contacts = [...new Set(externalAttendees(event).flatMap(email => [...(snapshot.emailContacts.get(email) || [])]))];
-    const candidates = [...new Set(contacts.flatMap(id => [...(snapshot.contactDeals.get(id) || [])]))];
+    const ownedContact = (contactId, dealId) => {
+      const owner = snapshot.dealOwners.get(dealId), copy = owner && event.calendarCopies?.get(owner.ownerId);
+      return copy && copy.calendarId === owner.calendarId && eligible(copy, snapshot.now, Infinity)
+        && externalAttendees(copy).some(email => snapshot.emailContacts.get(email)?.has(contactId));
+    };
+    const candidates = [...new Set(contacts.flatMap(id => [...(snapshot.contactDeals.get(id) || [])].filter(dealId => ownedContact(id, dealId))))];
     if (!candidates.length) return { reason: 'no_customer_deal' };
     let matches = snapshot.meetings.filter(m => nativeIdentity(m, event));
     if (!matches.length) {
@@ -192,12 +242,12 @@ class GoogleCalendarDealSync {
         && time(m.properties.hs_meeting_end_time) === time(event.end.dateTime)
         && normalize(m.properties.hs_meeting_title) === normalize(event.summary));
       for (const m of sameSlot) {
-        const associated = await this.associations('meetings', m.id, 'contacts');
+        const associated = snapshot.meetingContacts?.get(String(m.id)) || await this.associations('meetings', m.id, 'contacts');
         if (associated.some(id => contacts.includes(id))) matches.push(m);
       }
     }
     const matchDeals = new Map();
-    for (const meeting of matches) matchDeals.set(meeting.id, await this.associations('meetings', meeting.id, 'deals'));
+    for (const meeting of matches) matchDeals.set(meeting.id, snapshot.meetingDeals?.get(String(meeting.id)) || await this.associations('meetings', meeting.id, 'deals'));
     const dealId = chooseDeal(candidates, [...matchDeals.values()].flat());
     if (!dealId) return { reason: 'ambiguous_deal' };
     // A matching meeting already assigned elsewhere is not silently moved.
@@ -210,7 +260,10 @@ class GoogleCalendarDealSync {
       else return { reason: 'ambiguous_meeting' };
     }
     const meeting = matches[0];
-    return { dealId, contacts: contacts.filter(id => snapshot.contactDeals.get(id)?.has(dealId)), meeting,
+    const owner = snapshot.dealOwners.get(dealId), copy = event.calendarCopies.get(owner.ownerId);
+    return { dealId, contacts: contacts.filter(id => snapshot.contactDeals.get(id)?.has(dealId) && ownedContact(id, dealId)), meeting,
+      calendarId: owner.calendarId, ownerId: owner.ownerId, eventId: copy.id, copy,
+      existingDeals: meeting && matchDeals.get(meeting.id), existingContacts: meeting && snapshot.meetingContacts?.get(String(meeting.id)),
       linked: meeting ? matchDeals.get(meeting.id).includes(dealId) : false };
   }
 
@@ -220,8 +273,9 @@ class GoogleCalendarDealSync {
   }
 
   async persist(client, event, plan, prior) {
-    let meeting = prior ? await this.request(`/crm/v3/objects/meetings/${prior.meeting_id}?properties=${MEETING_PROPERTIES.join(',')}`)
-      : (await this.uniqueMeeting(event.key)) || plan.meeting;
+    let meeting = prior
+      ? (String(plan.meeting?.id) === prior.meeting_id ? plan.meeting : await this.request(`/crm/v3/objects/meetings/${prior.meeting_id}?properties=${MEETING_PROPERTIES.join(',')}`))
+      : plan.meeting || await this.uniqueMeeting(event.key);
     if (meeting?.archived) throw new Error('calendar_meeting_archived');
     const properties = { hs_timestamp: event.start.dateTime, hs_meeting_start_time: event.start.dateTime,
       hs_meeting_end_time: event.end.dateTime, hs_meeting_title: event.summary || 'Customer meeting',
@@ -240,18 +294,21 @@ class GoogleCalendarDealSync {
     })) {
       await this.request(`/crm/v3/objects/meetings/${meeting.id}`, { method: 'PATCH', body: { properties } });
     }
-    const linked = await this.associations('meetings', meeting.id, 'deals');
+    const sameMeeting = String(plan.meeting?.id) === String(meeting.id);
+    const linked = sameMeeting && plan.existingDeals ? plan.existingDeals : await this.associations('meetings', meeting.id, 'deals');
+    const linkedContacts = sameMeeting && plan.existingContacts ? plan.existingContacts : await this.associations('meetings', meeting.id, 'contacts');
     const ownedDeal = prior?.owned_deal_id || (!linked.includes(plan.dealId) ? plan.dealId : null);
     // Save identity before any associations so a partial failure is retryable.
-    await client.query(`INSERT INTO google_calendar_deal_meetings(event_key,meeting_id,calendar_id,event_id,start_at,owned_deal_id)
-      VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO UPDATE SET meeting_id=$2,calendar_id=$3,event_id=$4,start_at=$5,owned_deal_id=$6,active=true,updated_at=now()`,
-    [event.key, String(meeting.id), event.calendarId, event.id, event.start.dateTime, ownedDeal]);
+    await client.query(`INSERT INTO google_calendar_deal_meetings(event_key,meeting_id,calendar_id,event_id,start_at,owned_deal_id,deal_id)
+      VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(event_key) DO UPDATE SET meeting_id=$2,calendar_id=$3,event_id=$4,start_at=$5,owned_deal_id=$6,deal_id=$7,active=true,updated_at=now()`,
+    [event.key, String(meeting.id), event.calendarId, event.id, event.start.dateTime, ownedDeal, plan.dealId]);
     if (prior?.owned_deal_id && prior.owned_deal_id !== plan.dealId) {
       await this.request(`/crm/v4/objects/meetings/${meeting.id}/associations/deals/${prior.owned_deal_id}`, { method: 'DELETE' });
       await client.query('UPDATE google_calendar_deal_meetings SET owned_deal_id=$2 WHERE event_key=$1', [event.key, plan.dealId]);
     }
     for (const [target, ids] of [['contacts', plan.contacts], ['deals', [plan.dealId]]]) {
-      for (const id of ids) await this.request(`/crm/v4/objects/meetings/${meeting.id}/associations/default/${target}/${id}`, { method: 'PUT' });
+      const existing = target === 'contacts' ? linkedContacts : linked;
+      for (const id of ids.filter(id => !existing.includes(id))) await this.request(`/crm/v4/objects/meetings/${meeting.id}/associations/default/${target}/${id}`, { method: 'PUT' });
     }
     return String(meeting.id);
   }
@@ -291,7 +348,7 @@ class GoogleCalendarDealSync {
           // a won deal) must not erase its historical meeting association.
           return;
         }
-        await this.persist(client, event, plan, prior.get(event.key));
+        await this.persist(client, { ...plan.copy, key: event.key, calendarId: plan.calendarId, id: plan.eventId, ownerId: plan.ownerId }, plan, prior.get(event.key));
         stats.synced++;
       };
       for (const event of snapshot.events.values()) {
@@ -299,6 +356,10 @@ class GoogleCalendarDealSync {
       }
       for (const row of tracked) {
         if (blocked.has(row.event_key) || snapshot.events.has(row.event_key) || !snapshot.readable.has(row.calendar_id)) continue;
+        const owner = snapshot.dealOwners.get(row.deal_id);
+        // Reassigned, unassigned, or closed deals must never cause an event read
+        // from the previous owner's calendar. A new owner's copy is required.
+        if (!owner || owner.calendarId !== row.calendar_id) continue;
         // Check the specific occurrence: absence from the time window alone is
         // insufficient evidence of cancellation (it may have been rescheduled).
         try {
@@ -315,7 +376,8 @@ class GoogleCalendarDealSync {
             } } });
             await client.query('UPDATE google_calendar_deal_meetings SET active=false WHERE event_key=$1', [row.event_key]);
           } else if (eligible(event, snapshot.now, Infinity)) {
-            await process({ ...event, key: row.event_key, calendarId: row.calendar_id, ids: new Set([event.id]), ownerId: '' });
+            await process({ ...event, key: row.event_key, calendarId: row.calendar_id, ids: new Set([event.id]), ownerId: owner.ownerId,
+              calendarCopies: new Map([[owner.ownerId, { ...event, calendarId: row.calendar_id, ownerId: owner.ownerId }]]) });
           } else if (!event.attendeesOmitted && event.visibility !== 'private') {
             await this.retire(client, row);
           }

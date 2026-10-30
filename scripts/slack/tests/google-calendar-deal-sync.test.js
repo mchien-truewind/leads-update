@@ -7,10 +7,10 @@ const event = (extra = {}) => ({ id: 'gcal1', iCalUID: 'uid@example.com', summar
   start: { dateTime: '2026-11-01T15:00:00Z' }, end: { dateTime: '2026-11-01T15:30:00Z' },
   attendees: [{ email: 'buyer@example.com' }, { email: 'sarah@trytruewind.com' }],
   htmlLink: 'https://calendar.google.com/calendar/event?eid=abc', status: 'confirmed', ...extra });
-const prepared = extra => { const e = event(extra); return { ...e, key: occurrenceKey(e), ids: new Set([e.id]), calendarId: 'sarah@trytruewind.com', ownerId: '42' }; };
+const prepared = extra => { const e = event(extra); return { ...e, key: occurrenceKey(e), ids: new Set([e.id]), calendarId: 'sarah@trytruewind.com', ownerId: '42', calendarCopies: new Map([['42', { ...e, calendarId: 'sarah@trytruewind.com', ownerId: '42' }]]) }; };
 function snapshot(events = [prepared()], meetings = []) {
   return { now: NOW, until: NOW + 365 * 86400000, events: new Map(events.map(e => [e.key, e])),
-    readable: new Set(['sarah@trytruewind.com']), unavailable: [], deals: [{ id: '10' }], meetings,
+    readable: new Set(['sarah@trytruewind.com']), unavailable: [], deals: [{ id: '10' }], meetings, dealOwners: new Map([['10', { ownerId: '42', calendarId: 'sarah@trytruewind.com' }]]),
     emailContacts: new Map([['buyer@example.com', new Set(['1'])]]), contactDeals: new Map([['1', new Set(['10'])]]) };
 }
 function fixture({ meetings = [], lostCreate = false } = {}) {
@@ -102,7 +102,7 @@ test('reuses older Calendly meeting only with exact title/time and matching cont
   f.contacts.set('50', ['2']); assert.equal((await f.sync.plan(f.s, e)).meeting, undefined);
 });
 test('ambiguous deals, duplicate meetings and conflicting existing associations are skipped', async () => {
-  const f = fixture(); f.s.contactDeals.set('1', new Set(['10', '20']));
+  const f = fixture(); f.s.contactDeals.set('1', new Set(['10', '20'])); f.s.dealOwners.set('20', { ownerId: '42', calendarId: 'sarah@trytruewind.com' });
   assert.equal((await f.sync.plan(f.s, prepared())).reason, 'ambiguous_deal');
   f.s.contactDeals.set('1', new Set(['10']));
   f.s.meetings = [{ id: '50', properties: { hs_meeting_source_id: 'gcal1' } }]; f.links.set('50', ['20']);
@@ -146,9 +146,9 @@ test('full snapshot pages calendars, coalesces organizer copies, reads contact a
   const calls = [], a = event({ organizer: { email: 'sarah@trytruewind.com' } });
   const request = async (path, options = {}) => {
     if (path.startsWith('/crm/v3/owners?')) return { results: [{ id: '42', email: 'sarah@trytruewind.com' }, { id: '43', email: 'mercedes@trytruewind.com' }, { id: '44', email: 'gtm@trytruewind.com' }] };
-    if (path === '/crm/v3/objects/deals/search') return { total: 1, results: [{ id: '10', properties: {} }] };
+    if (path === '/crm/v3/objects/deals/search') return { total: 3, results: ['42', '43', '44'].map((id, i) => ({ id: String(10 + i), properties: { hubspot_owner_id: id } })) };
     if (path === '/crm/v3/objects/meetings/search') return { total: 0, results: [] };
-    if (path.startsWith('/crm/v4/objects/deals/10/associations/contacts?')) return { results: [{ toObjectId: '1' }] };
+    if (path.startsWith('/crm/v4/associations/')) return { status: 'COMPLETE', results: options.body.inputs.map(({ id }) => ({ from: { id }, to: id === '10' ? [{ toObjectId: '1' }] : [] })) };
     if (path === '/crm/v3/objects/contacts/batch/read') return { results: [{ id: '1', properties: { email: 'primary@example.com', hs_additional_emails: 'buyer@example.com;alias@example.com' } }] };
     throw Error(path);
   };
@@ -173,9 +173,11 @@ test('full snapshot pages calendars, coalesces organizer copies, reads contact a
   assert.ok(calls.some(p => p.pageToken === 'second'));
 });
 test('authoritative organizer removing attendees overrides a stale eligible invitee copy', async () => {
-  const request = async path => {
+  const request = async (path, options = {}) => {
     if (path.startsWith('/crm/v3/owners?')) return { results: [{ id: '1', email: 'mercedes@trytruewind.com' }, { id: '2', email: 'sarah@trytruewind.com' }] };
+    if (path === '/crm/v3/objects/deals/search') return { total: 2, results: [{ id: '10', properties: { hubspot_owner_id: '1' } }, { id: '11', properties: { hubspot_owner_id: '2' } }] };
     if (path.endsWith('/search')) return { total: 0, results: [] };
+    if (path.startsWith('/crm/v4/associations/')) return { status: 'COMPLETE', results: options.body.inputs.map(({ id }) => ({ from: { id }, to: [] })) };
     throw Error(path);
   };
   const sync = new GoogleCalendarDealSync({ request, now: () => NOW, env: {}, calendar: { events: { list: async ({ calendarId }) => ({ data: {
@@ -216,4 +218,73 @@ test('closing a deal preserves its previously synchronized meeting association',
   const f = fixture(); await database(t, f.sync); await f.sync.tick();
   f.s.contactDeals.clear(); f.s.deals = [];
   await f.sync.tick(); assert.deepEqual(f.links.get('100'), ['10']);
+});
+
+test('deal must match its own owner calendar; the same customer on another calendar cannot qualify', async () => {
+  const f = fixture(), e = prepared();
+  f.s.dealOwners.set('10', { ownerId: '43', calendarId: 'xavier@trytruewind.com' });
+  assert.equal((await f.sync.plan(f.s, e)).reason, 'no_customer_deal');
+  e.calendarCopies.set('43', { ...event(), id: 'xavier-copy', calendarId: 'xavier@trytruewind.com', ownerId: '43' });
+  const p = await f.sync.plan(f.s, e);
+  assert.equal(p.dealId, '10'); assert.equal(p.calendarId, 'xavier@trytruewind.com'); assert.equal(p.eventId, 'xavier-copy');
+});
+test('same-contact deals owned by different people are resolved using the calendar owner', async () => {
+  const f = fixture(); f.s.contactDeals.set('1', new Set(['10', '20']));
+  f.s.dealOwners.set('20', { ownerId: '43', calendarId: 'xavier@trytruewind.com' });
+  assert.equal((await f.sync.plan(f.s, prepared())).dealId, '10');
+});
+test('after reassignment the old owner calendar is never fetched for a tracked deal', async t => {
+  const f = fixture(); await database(t, f.sync); await f.sync.tick(); f.s.events.clear();
+  f.s.dealOwners.set('10', { ownerId: '43', calendarId: 'xavier@trytruewind.com' });
+  let fetched = false; f.sync.calendar.events.get = async () => { fetched = true; throw Error('must not fetch old owner'); };
+  await f.sync.tick(); assert.equal(fetched, false); assert.deepEqual(f.links.get('100'), ['10']);
+});
+test('new-owner copy updates tracked identity and supplies dates from that owners calendar', async t => {
+  const f = fixture(); const db = await database(t, f.sync); await f.sync.tick();
+  const e = prepared();
+  e.calendarCopies.set('43', { ...event({ start: { dateTime: '2026-11-03T15:00:00Z' }, end: { dateTime: '2026-11-03T15:30:00Z' } }), id: 'xavier-copy', calendarId: 'xavier@trytruewind.com', ownerId: '43' });
+  f.s.events.set(e.key, e); f.s.dealOwners.set('10', { ownerId: '43', calendarId: 'xavier@trytruewind.com' });
+  assert.equal((await f.sync.tick()).synced, 1);
+  const row = (await db.query('SELECT * FROM google_calendar_deal_meetings')).rows[0];
+  assert.equal(row.calendar_id, 'xavier@trytruewind.com'); assert.equal(row.event_id, 'xavier-copy'); assert.equal(row.deal_id, '10');
+  assert.equal(f.records.get('100').properties.hs_meeting_start_time, '2026-11-03T15:00:00Z');
+  assert.equal(f.records.size, 1);
+});
+test('only owners of open deals are polled; other owners and extra-calendar settings cannot broaden scope', async () => {
+  const polled = [];
+  const request = async (path, options = {}) => {
+    if (path.includes('/owners?')) return { results: [{ id: '42', email: 'sarah@trytruewind.com' }, { id: '43', email: 'xavier@trytruewind.com' }, { id: '44', email: 'other@trytruewind.com' }] };
+    if (path === '/crm/v3/objects/deals/search') return { total: 2, results: [{ id: '10', properties: { hubspot_owner_id: '43' } }, { id: '11', properties: {} }] };
+    if (path === '/crm/v3/objects/meetings/search') return { total: 0, results: [] };
+    if (path.startsWith('/crm/v4/associations/')) return { status: 'COMPLETE', results: options.body.inputs.map(({ id }) => ({ from: { id }, to: [] })) };
+    throw Error(path);
+  };
+  const sync = new GoogleCalendarDealSync({ request, now: () => NOW, env: { GOOGLE_CALENDAR_DEAL_SYNC_CALENDARS: 'other@trytruewind.com' }, calendar: { events: {
+    list: async ({ calendarId }) => { polled.push(calendarId); return { data: { accessRole: 'reader', items: [] } }; },
+  } } });
+  const s = await sync.snapshot(); assert.deepEqual(polled, ['xavier@trytruewind.com']); assert.equal(s.dealOwners.has('11'), false);
+});
+test('batch association reads handle known empty rows and finish per-record pagination', async () => {
+  const calls = [];
+  const sync = new GoogleCalendarDealSync({ env: {}, request: async (path, options) => {
+    calls.push(path);
+    if (options?.method === 'POST') return { status: 'COMPLETE', results: [{ from: { id: '10' }, to: [{ toObjectId: '1' }], paging: { next: { after: 'next' } } }],
+      errors: [{ subCategory: 'crm.associations.NO_ASSOCIATIONS_FOUND', context: { fromObjectId: ['11'] } }] };
+    assert.ok(path.endsWith('&after=next')); return { results: [{ toObjectId: '2' }] };
+  } });
+  const index = await sync.associationIndex('deals', ['10', '11'], 'contacts');
+  assert.deepEqual(index.get('10'), ['1', '2']); assert.deepEqual(index.get('11'), []); assert.equal(calls.length, 2);
+});
+test('incomplete association batches or unexpected errors never produce a partial deal index', async () => {
+  const sync = new GoogleCalendarDealSync({ env: {}, request: async () => ({ status: 'COMPLETE', results: [] }) });
+  await assert.rejects(sync.associationIndex('deals', ['10'], 'contacts'), /batch_incomplete/);
+  sync.request = async () => ({ status: 'COMPLETE', results: [], errors: [{ subCategory: 'permission_denied' }] });
+  await assert.rejects(sync.associationIndex('deals', ['10'], 'contacts'), /batch_error/);
+});
+test('already linked meetings avoid repeated association writes on the one-minute poll', async t => {
+  const e = prepared(), f = fixture({ meetings: [{ id: '50', properties: { hs_meeting_source_id: 'gcal1' } }] });
+  f.links.set('50', ['10']); f.contacts.set('50', ['1']);
+  f.s.meetingDeals = new Map([['50', ['10']]]); f.s.meetingContacts = new Map([['50', ['1']]]);
+  await database(t, f.sync); await f.sync.tick();
+  assert.ok(!f.calls.some(c => c.method === 'PUT')); assert.equal(f.sync.intervalMs, 60000);
 });

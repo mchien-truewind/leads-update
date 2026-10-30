@@ -19,6 +19,7 @@ class PrivateClaim:
     def __init__(self, directory, scope, *, clock=time.time, retarget_plan=None):
         validate_scope(scope)
         self.scope, self.clock = dict(scope), clock
+        self.window = None
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.directory.lstat()
@@ -72,7 +73,7 @@ class PrivateClaim:
                 if row[1] != encoded or row[2] is None:
                     raise ValueError('private claim approval cannot change')
                 return False  # Prior attempt: inspection only, even after expiry.
-            active(self.scope, self.clock())
+            active(self.scope, self.clock(), window=self.window)
             db.execute('UPDATE write_claim SET approval=?,claimed_at=? WHERE singleton=1',
                        (encoded, self.clock()))
         return True  # FULL-synchronous commit completed before provider dispatch.

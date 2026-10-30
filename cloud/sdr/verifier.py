@@ -47,7 +47,9 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
         await authenticated(request, raw)
         if raw != b'':
             raise HTTPException(400, 'Request rejected.')
-        return {'ready': bool(signing_key) and scope['not_before'] <= clock() < scope['expires_at']}
+        window = private_claim.window if private_claim is not None else None
+        allowed = window.allows(scope,clock()) if window is not None else scope['not_before'] <= clock() < scope['expires_at']
+        return {'ready': bool(signing_key) and allowed}
 
     @app.post('/v1/nooks/verify')
     async def verify(request: Request):
@@ -58,7 +60,8 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
             raise HTTPException(403, 'Request rejected.') from None
         await authenticated(request, raw, signature)
         try:
-            return {'event': verify_nooks(raw, signature, signing_key, scope, clock())}
+            return {'event': verify_nooks(raw, signature, signing_key, scope, clock(),
+                window=private_claim.window if private_claim is not None else None)}
         except Exception as exc:
             # Authenticate the private caller first; never log raw exceptions,
             # signatures, request fields or provider keys. Each fixed reason is
@@ -151,11 +154,16 @@ def from_environment():
     from .secondary import configured as secondary_configured, open_secondary, settings
     from .retarget import configured as retarget_configured, capture_scope
     secondary = secondary_configured(os.environ, retarget_configured(os.environ), provider.scope if provider else None)
+    from .test_window import configured as window_configured, bind as bind_window
+    reopen = window_configured(os.environ, provider.scope if provider else None, secondary)
+    if reopen is not None: provider.window = bind_window(claim,provider.scope,reopen)
     if secondary is not None:
         from .lemlist_provider import Provider
         child_claim = open_secondary(claim, secondary, 'verifier')
         child_approval, child_policy = settings(secondary, os.environ)
+        if reopen is not None: bind_window(child_claim,secondary,reopen)
         child_provider = Provider(os.environ.get('LEMLIST_API', ''), secondary, allow_write=child_approval is not None)
+        child_provider.window = child_claim.window
         app.mount('/contacts/'+secondary['hubspot_contact_id'], create_app(
             signing_key=os.environ.get('NOOKS_SIGNING_KEY', ''), public_key=os.environ.get('RECEIVER_PUBLIC_KEY', ''),
             scope=capture_scope(secondary), lemlist_provider=child_provider, approval=child_approval,

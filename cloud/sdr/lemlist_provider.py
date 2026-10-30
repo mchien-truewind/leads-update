@@ -9,11 +9,12 @@ from .common import unique
 
 
 class Provider:
-    def __init__(self, key, scope, *, allow_write=False, transport=None, clock=time.time, monotonic=time.monotonic):
+    def __init__(self, key, scope, *, allow_write=False, transport=None, clock=time.time, monotonic=time.monotonic, window=None):
         contract.validate_scope(scope)
         self.key, self.scope = key, dict(scope)
         self.allow_write, self.transport = allow_write, transport
         self.clock, self.monotonic = clock, monotonic
+        self.window = window
 
     def _allowed(self, method, path, payload):
         u = urlsplit(path)
@@ -53,7 +54,7 @@ class Provider:
                     raise ValueError('provider request outside scope')
                 calls += 1
                 if method == 'PATCH':
-                    contract.active(self.scope,self.clock())
+                    contract.active(self.scope,self.clock(),window=self.window)
                     if writes: raise ValueError('one write attempt only')
                     writes += 1
                 try:
@@ -69,4 +70,4 @@ class Provider:
                 except Exception:
                     raise ValueError('provider unavailable or rejected') from None
             if operation == 'inspect': return contract.observe(self.scope,lambda p:request('GET',p))
-            return contract.complete(self.scope,lambda p:request('GET',p),request,clock=self.clock)
+            return contract.complete(self.scope,lambda p:request('GET',p),request,clock=self.clock,window=self.window)

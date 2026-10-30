@@ -43,6 +43,7 @@ class DualContactTests(unittest.TestCase):
              'SECONDARY_TEST_SCOPE':json.dumps(f.old),'NOOKS_SIGNING_KEY':'dummy-signing',
              'LEMLIST_API':'dummy','RECEIVER_PUBLIC_KEY':key.public_key().public_bytes_raw().hex(),
              'SECONDARY_NOOKS_DISPOSITION_POLICY':self.old_policy.encoded}
+        env.update(getattr(self,'extra_env',{}))
         if self.approvals[1]:env['SECONDARY_COMPLETION_APPROVAL']=json.dumps(self.approvals[1])
         def provider(scope,write):
             actor=f if scope==f.scope else self.other
@@ -157,6 +158,7 @@ class DualContactTests(unittest.TestCase):
              'CAPTURE_SCOPE':json.dumps(f.store.scope),'LEMLIST_TEST_SCOPE':json.dumps(f.scope),
              'SECONDARY_TEST_SCOPE':json.dumps(f.old),'VERIFIER_URL':'http://nooks-verifier.railway.internal:8080',
              'NOOKS_DISPOSITION_POLICY':f.policy.encoded,'SECONDARY_NOOKS_DISPOSITION_POLICY':self.old_policy.encoded}
+        env.update(getattr(self,'extra_env',{}))
         lock=os.open(f.root/'runtime-lock',os.O_RDWR|os.O_CREAT,0o600)
         self.addCleanup(os.close,lock)
         real_store,real_broker,real_worker=Store,Broker,Worker

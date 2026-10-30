@@ -64,12 +64,12 @@ class Completion:
                 'write_receipt':row[1] if row else None}
 
     def arm(self, call):
-        active(self.scope,self.clock())
+        active(self.scope,self.clock(),window=self.store.window)
         evidence = call('inspect',{})
         if not ready_before(evidence,self.scope): raise ValueError('test preflight failed')
         with self.store.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            active(self.scope,self.clock())
+            active(self.scope,self.clock(),window=self.store.window)
             from .retarget import capture_scope
             if json.loads(db.execute('SELECT value FROM scope WHERE singleton=1').fetchone()[0]) != capture_scope(self.scope):
                 raise ValueError('retired completion instance')
@@ -101,7 +101,7 @@ class Completion:
         self.assess_event()
         if self.policy is None: raise ValueError('reviewed disposition policy missing')
         self.policy.authorize(approval)
-        active(self.scope,self.clock())
+        active(self.scope,self.clock(),window=self.store.window)
         before = call('inspect',{})
         if not ready_before(before,self.scope): raise ValueError('test preflight changed')
         with self.store.db() as db:
@@ -124,7 +124,7 @@ class Completion:
                              self.scope['starts_at'] <= event['started_at']))
                     or not event['started_at'] <= event['finalized_at'] <= self.clock()+300):
                 raise ValueError('call differs from reviewed confirmation')
-            active(self.scope,self.clock())
+            active(self.scope,self.clock(),window=self.store.window)
             db.execute("UPDATE completion SET state='claimed',approval=?,claimed_at=? WHERE singleton=1",
                 (json.dumps(approval,sort_keys=True),self.clock()))
         # Commit precedes external dispatch. A crash from here never resets this claim.
@@ -134,7 +134,7 @@ class Completion:
                 state = db.execute('SELECT state FROM completion WHERE singleton=1').fetchone()[0]
                 if state != 'claimed' or db.execute('SELECT held FROM scope WHERE singleton=1').fetchone()[0]:
                     raise ValueError('test held before dispatch')
-                active(self.scope,self.clock())
+                active(self.scope,self.clock(),window=self.store.window)
                 result = call('complete',approval)
                 if not isinstance(result,dict) or result.get('scope') != self.scope:
                     raise ValueError('missing completion receipt')

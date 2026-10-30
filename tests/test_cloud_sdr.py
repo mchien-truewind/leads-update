@@ -26,7 +26,7 @@ class CloudTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.directory = Path(self.tmp.name)/'state'
-        self.store = receiver.Store(self.directory, self.scope)
+        self.store = receiver.Store(self.directory, self.scope,clock=lambda:self.now)
         self.key = self.store.identity()
         self.private = verifier.create_app(signing_key='dummy-nooks-key',
             public_key=self.key.public_key().public_bytes_raw().hex(), scope=self.scope, clock=lambda:self.now)
@@ -91,7 +91,7 @@ class CloudTests(unittest.TestCase):
 
     def test_restart_keeps_identity_and_deduplication_without_exporting_private_key(self):
         self.post()
-        new_store = receiver.Store(self.directory,self.scope)
+        new_store = receiver.Store(self.directory,self.scope,clock=lambda:self.now)
         new_key = new_store.identity()
         self.assertEqual(new_key.public_key().public_bytes_raw(), self.key.public_key().public_bytes_raw())
         new_client = TestClient(receiver.create_app(new_store,self.broker,clock=lambda:self.now))
@@ -193,7 +193,7 @@ class CloudTests(unittest.TestCase):
         self.assertEqual(private.post('/v1/nooks/verify',content=raw,headers=headers).status_code,403)
 
     def test_registration_is_one_shot_durable_and_never_captures_a_call(self):
-        make=lambda: TestClient(receiver.create_app(receiver.Store(self.directory,self.scope),self.broker,
+        make=lambda: TestClient(receiver.create_app(receiver.Store(self.directory,self.scope,clock=lambda:self.now),self.broker,
             registration_id='b'*32,deadline=self.now+60,clock=lambda:self.now))
         client=make()
         self.assertTrue(client.get('/ready').json()['registration_open'])
@@ -231,7 +231,7 @@ class CloudTests(unittest.TestCase):
         self.assertFalse(client.get('/ready').json()['registration_open'])
 
     def test_scope_change_missing_volume_and_local_cloud_launcher_fail_closed(self):
-        with self.assertRaises(ValueError): receiver.Store(self.directory,dict(self.scope,prospect_id='999'))
+        with self.assertRaises(ValueError): receiver.Store(self.directory,dict(self.scope,prospect_id='999'),clock=lambda:self.now)
         with patch.dict('os.environ',{},clear=True):
             with self.assertRaises(ValueError): receiver.from_environment()
             with self.assertRaises(SystemExit): start.main()

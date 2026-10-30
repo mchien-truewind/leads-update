@@ -95,8 +95,9 @@ def timestamp(value):
     return dt.timestamp()
 
 
-def verify_nooks(raw, signature, key, scope, now):
-    if not key or not scope['not_before'] <= now < scope['expires_at']:
+def verify_nooks(raw, signature, key, scope, now, *, window=None):
+    allowed = window.allows(scope,now) if window is not None else scope['not_before'] <= now < scope['expires_at']
+    if not key or not allowed:
         raise ValueError('capture not enabled')
     parts = {}
     for item in signature.split(','):

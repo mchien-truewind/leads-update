@@ -313,3 +313,30 @@ boundaries remain unchanged. `/ready` includes a `secondary` status object;
 bounded worker diagnostics include `test_contact_id` to distinguish the two.
 The same suite (`test_cloud_*.py`) exercises both signed HTTP paths through
 independent mocked task completion, continuation, duplicate delivery and restart.
+
+
+## Explicit two-hour test reopening
+
+The original 48-hour scope is immutable. After it expires, an operator may
+explicitly approve one bounded reopening by setting the same non-secret
+`TEST_WINDOW_REOPEN` on both services. It contains `scopes` (an ordered array of
+the complete primary and secondary scope), integer UTC `starts_at` and
+`expires_at`, and `confirmed_reopen: true`. Duration must be at most 7200 seconds,
+and its start must follow both original expiries. It cannot include other contacts,
+change provider IDs, replace the migration plan, or rewrite old timestamps.
+
+Each of the four existing journals binds this exact authorization once in a
+separate table. Restarting accepts only the same value; extending or replacing it
+is rejected. Removing the variable closes access. A delayed rollout may use the
+remaining original reopening window, but cannot shift its deadline. First install
+rejects an already-expired window or a start more than five minutes in the future.
+Existing events, holds, policy, completion evidence and private/public write claims
+are never cleared. A previously claimed task remains readback-only.
+
+The same window gates signature verification, durable capture, public and private
+claims, and the provider immediately before PATCH. Read-only reconciliation remains
+available after expiry. `/ready` reports `test_window_expires_at` separately for
+each slot. Deploy the private service first, then the receiver with identical
+configuration; retain the same value on recovery. Do not reset a journal to grant
+another window. This is an explicitly approved supervised-test extension, not a
+rolling renewal or a production scheduling mechanism.

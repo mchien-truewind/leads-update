@@ -24,6 +24,8 @@ from .common import body, envelope, header, load_scope
 class Store:
     def __init__(self, directory, scope, *, retarget_plan=None, clock=time.time):
         self.directory, self.scope = Path(directory), scope
+        self.window = None
+        self.clock = clock
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.directory.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -116,12 +118,16 @@ class Store:
                 or any(not isinstance(event[k], str) or not 1 <= len(event[k]) <= 200 for k in fields-{'started_at','finalized_at'})
                 or any(type(event[k]) not in (int, float) for k in ('started_at','finalized_at'))
                 or not self.scope['not_before'] <= event['started_at'] <= event['finalized_at'] <= now+300
-                or now >= self.scope['expires_at']):
+                or (not self.window.allows(self.scope,now) if self.window is not None else now >= self.scope['expires_at'])):
             raise ValueError('invalid verified event')
         raw = json.dumps(event, sort_keys=True, separators=(',', ':'))
         digest = hashlib.sha256(raw.encode()).hexdigest()
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
+            # Thread scheduling and the SQLite lock can outlive the ingress check.
+            current = self.clock()
+            allowed = self.window.allows(self.scope,current) if self.window is not None else self.scope['not_before'] <= current < self.scope['expires_at']
+            if not allowed: raise ValueError('capture window closed before commit')
             if json.loads(db.execute('SELECT value FROM scope WHERE singleton=1').fetchone()[0]) != self.scope:
                 raise ValueError('retired capture instance')
             old = db.execute('SELECT digest FROM events WHERE call_id=?', (event['call_id'],)).fetchone()
@@ -210,8 +216,9 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
             try: child_ready = (await child_broker.call('/v1/ready')).get('ready') is True
             except Exception: child_ready = False
             extra['secondary']={'verifier_ready':child_ready,**child_store.summary(),
-                'completion_state':child_worker.core.status()['state'], 'capture_only':child_worker.approval is None}
-        return {**extra, 'verifier_ready': verified, 'registration_open': store.registration(registration_id, clock()),
+                'completion_state':child_worker.core.status()['state'], 'capture_only':child_worker.approval is None,
+                'test_window_expires_at':child_store.window.expires_at if child_store.window else child_store.scope['expires_at']}
+        return {**extra, 'test_window_expires_at':store.window.expires_at if store.window else store.scope['expires_at'], 'verifier_ready': verified, 'registration_open': store.registration(registration_id, clock()),
                 'capture_only': worker is None or worker.approval is None, **store.summary(),
                 'completion_state': worker.core.status()['state'] if worker else 'disabled'}
 
@@ -331,6 +338,11 @@ def from_environment():
             child_approval, child_policy = settings(secondary_scope, os.environ)
             child_worker = Worker(child_store, secondary_scope, child_broker, approval=child_approval, policy=child_policy)
             secondary = (child_store, child_broker, child_worker)
+        from .test_window import configured as window_configured, bind as bind_window
+        reopen = window_configured(os.environ, selected if worker else None, secondary_scope)
+        if reopen is not None:
+            bind_window(store, selected, reopen)
+            bind_window(child_store, secondary_scope, reopen)
         app = create_app(store, broker, worker=worker, secondary=secondary, registration_id=os.environ.get('REGISTRATION_ID', ''),
             deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')))
         app.state.owner_lock = lock  # Single owner for the lifetime of this process.

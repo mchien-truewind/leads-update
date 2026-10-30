@@ -34,9 +34,10 @@ def validate_scope(scope):
             or not 0 < scope['starts_at'] < scope['expires_at'] <= scope['starts_at'] + 172800):
         raise ValueError('test window must be at most 48 hours')
 
-def active(scope, now=None):
+def active(scope, now=None, *, window=None):
     now = time.time() if now is None else now
-    if not scope['starts_at'] <= now < scope['expires_at']:
+    allowed = window.allows(scope,now) if window is not None else scope['starts_at'] <= now < scope['expires_at']
+    if not allowed:
         raise ValueError('test window closed')
 
 def activities(scope, fetch):
@@ -218,13 +219,13 @@ def ready_before(evidence, scope):
             and evidence.get('completion_activities') == [] and evidence.get('continuation_tasks') == [])
 
 
-def complete(scope, fetch, write, *, clock=time.time):
-    active(scope,clock())
+def complete(scope, fetch, write, *, clock=time.time, window=None):
+    active(scope,clock(),window=window)
     before = observe(scope,fetch)
     if before['task']['done']:
         return dict(before,write_attempted=False)
     if not ready_before(before,scope):
         raise ValueError('test is no longer at its initial call task')
-    active(scope,clock())
+    active(scope,clock(),window=window)
     write('PATCH','/api/tasks',{'id':scope['task_id'],'done':True})
     return dict(observe(scope,fetch),write_attempted=True)

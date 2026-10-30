@@ -58,7 +58,7 @@ def open_secondary(parent, scope, role):
         if role == 'receiver':
             from .receiver import Store
             from .completion import Completion
-            child = Store(directory,capture_scope(scope))
+            child = Store(directory,capture_scope(scope),clock=parent.clock)
             Completion(child,scope)  # Schema only; preserve the original arm timestamp below.
         else:
             from .private_claim import PrivateClaim

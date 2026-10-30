@@ -29,7 +29,7 @@ class SignedDispositionTests(unittest.TestCase):
 
     def setUp(self):
         fixtures.CloudCompletionTests.setUp(self)
-        self.store=Store(Path(self.tmp.name)/'signed',self.store.scope)
+        self.store=Store(Path(self.tmp.name)/'signed',self.store.scope,clock=lambda:self.now)
         self.logs=[]
         self.worker=Worker(self.store,self.scope,self.bridge(),policy=self.policy,
             clock=lambda:self.now,report=self.logs.append)
@@ -125,7 +125,7 @@ class SignedDispositionTests(unittest.TestCase):
         self.assertEqual(self.writes,[])
 
     def test_initial_capture_can_discover_ids_but_mapping_is_required_before_completion(self):
-        store=Store(Path(self.tmp.name)/'unconfigured',self.store.scope)
+        store=Store(Path(self.tmp.name)/'unconfigured',self.store.scope,clock=lambda:self.now)
         core=Completion(store,self.scope,clock=lambda:self.now)
         core.arm(self.call)
         self.now+=1
@@ -202,7 +202,7 @@ class RetargetTests(unittest.TestCase):
             starts_at=self.now-500,expires_at=self.now+1000)
         self.scope=dict(self.old,hubspot_contact_id='456',task_id='opp_new',lead_id='lea_new',contact_id='ctc_new')
         self.plan=dict(from_scope=self.old,to_scope=self.scope,call_id='existing-call',confirmed_contact=True)
-        self.store=Store(self.root/'public',self.capture_scope(self.old))
+        self.store=Store(self.root/'public',self.capture_scope(self.old),clock=lambda:self.now)
         self.original=Completion(self.store,self.old,clock=lambda:self.now-200)
         self.original.arm(lambda *_:self.evidence(self.old))
         self.private=PrivateClaim(self.root/'private',self.old,clock=lambda:self.now)

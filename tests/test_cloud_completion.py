@@ -40,7 +40,7 @@ class CloudCompletionTests(unittest.TestCase):
             transport=httpx.MockTransport(self.http),clock=lambda:self.now)
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.store=Store(Path(self.tmp.name)/'state',dict(workspace_id='workspace',prospect_id='123',
-            not_before=self.scope['starts_at'],expires_at=self.scope['expires_at']))
+            not_before=self.scope['starts_at'],expires_at=self.scope['expires_at']),clock=lambda:self.now)
         self.policy=DispositionPolicy(dict(workspace_id="workspace",nooks_rep_id="nooksrep",
             lemlist_rep_id="usr_test",dispositions={"disp1":"complete","dnc":"suppress","callback":"hold"}),self.scope)
         self.core=Completion(self.store,self.scope,policy=self.policy,clock=lambda:self.now)

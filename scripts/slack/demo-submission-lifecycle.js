@@ -123,7 +123,20 @@ class DemoSubmissionLifecycle {
     const booking = await this.saveBooking(payload, scheduledEvent, filter);
     if (!booking) return null;
     const linked = await this.findBookingSubmission(booking);
-    if (linked) return linked;
+    if (linked) {
+      if (linked.bookedState === 'sent' && linked.bookingUri !== booking.uri) {
+        const delivered = (await this.pool.query(`SELECT 1 FROM demo_submission_lifecycle
+          WHERE email = $1 AND booking_uri = $2 AND booked_state = 'sent' LIMIT 1`, [booking.email, booking.uri])).rows.length;
+        if (!delivered) {
+          // A second Calendly booking can arrive without another HubSpot form event.
+          await this.enqueue({ objectId: linked.contactId, propertyValue: String(booking.bookedAt) });
+          const followup = await this.findBookingSubmission(booking);
+          if (!followup) throw new Error('submission_booking_correlation_unavailable');
+          return followup;
+        }
+      }
+      return linked;
+    }
     // Calendly may arrive before the form webhook. Recover the form identity from HubSpot
     // so the old standalone booking alert is suppressed for this submission as well.
     const contacts = await this.hubspotRequest('/crm/v3/objects/contacts/search', {
@@ -141,9 +154,9 @@ class DemoSubmissionLifecycle {
   }
 
   async findBookingSubmission(booking) {
-    const result = await this.pool.query(`SELECT contact_id, submitted_at, thread_root_key FROM demo_submission_lifecycle
+    const result = await this.pool.query(`SELECT contact_id, submitted_at, thread_root_key, booked_state, booking_uri FROM demo_submission_lifecycle
       WHERE email = $1 AND submitted_at <= $2 ORDER BY submitted_at DESC LIMIT 1`, [booking.email, booking.bookedAt]);
-    if (result.rows[0]) return { ...booking, contactId: result.rows[0].contact_id, submittedAt: Number(result.rows[0].submitted_at), threadRootKey: result.rows[0].thread_root_key };
+    if (result.rows[0]) return { ...booking, contactId: result.rows[0].contact_id, submittedAt: Number(result.rows[0].submitted_at), threadRootKey: result.rows[0].thread_root_key, bookedState: result.rows[0].booked_state, bookingUri: result.rows[0].booking_uri };
     return null;
   }
 

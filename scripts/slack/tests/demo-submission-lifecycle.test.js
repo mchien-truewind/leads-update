@@ -506,3 +506,22 @@ test('later bookings and delayed old form webhooks keep one thread without repea
   assert.equal(posts.length, 2);
   assert.equal(posts.filter(m => !m.thread_ts).length, 1);
 });
+
+
+test('a second Calendly booking without another form webhook also replies to the original email thread', async () => {
+  await lifecycle.enqueue(formEvent);
+  const first = booking(100);
+  bookings.push(first);
+  time = submittedAt + 100000;
+  await lifecycle.observeBooking('invitee.created', first.payload, first.scheduledEvent, first.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 1);
+  const second = booking(601, '84547076', 'direct-repeat');
+  bookings.push(second);
+  time = submittedAt + 601000;
+  await lifecycle.observeBooking('invitee.created', second.payload, second.scheduledEvent, second.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].thread_ts, '1.001');
+  assert.equal(posts.filter(m => !m.thread_ts).length, 1);
+});

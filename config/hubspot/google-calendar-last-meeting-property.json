@@ -1,0 +1,8 @@
+{
+  "name": "truewind_last_meeting_date",
+  "label": "Last Meeting Date",
+  "type": "datetime",
+  "fieldType": "date",
+  "groupName": "dealinformation",
+  "description": "Start date/time of the most recent finished, non-canceled customer event on the current deal owner's Google Calendar, matched by associated contact email. Recorded no-shows and rescheduled activities are excluded. Calendar history does not confirm attendance. Populated by Truewind for open deals."
+}

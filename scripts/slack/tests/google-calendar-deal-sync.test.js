@@ -288,3 +288,36 @@ test('already linked meetings avoid repeated association writes on the one-minut
   await database(t, f.sync); await f.sync.tick();
   assert.ok(!f.calls.some(c => c.method === 'PUT')); assert.equal(f.sync.intervalMs, 60000);
 });
+test('enabled recent-date sync handles past events without creating historical meeting activities', async t => {
+  const { LastMeetingDates, LAST_MEETING_DATE } = require('../google-calendar-last-meeting');
+  const f = fixture(); await database(t, f.sync);
+  const original = f.sync.request, dates = [];
+  f.sync.request = async (path, options = {}) => {
+    if (path.startsWith('/crm/v3/objects/deals/10?')) return { id: '10', properties: { hubspot_owner_id: '42' } };
+    if (path === '/crm/v3/objects/deals/10' && options.method === 'PATCH') { dates.push(options.body.properties); return {}; }
+    return original(path, options);
+  };
+  f.sync.lastMeetings = new LastMeetingDates({ sync: f.sync }); f.s.from = NOW - 86400000;
+  f.s.deals = [{ id: '10', properties: { hubspot_owner_id: '42' } }];
+  const past = prepared({ start: { dateTime: '2026-10-30T10:00:00Z' }, end: { dateTime: '2026-10-30T10:30:00Z' } });
+  f.s.events = new Map([[past.key, past]]);
+  const stats = await f.sync.tick();
+  assert.equal(stats.synced, 0); assert.equal(stats.lastMeetingDates.updated, 1); assert.equal(f.records.size, 0);
+  assert.equal(dates[0][LAST_MEETING_DATE], '2026-10-30T10:00:00.000Z');
+});
+test('a custom-date failure cannot abort upcoming meeting synchronization', async t => {
+  const f = fixture(); await database(t, f.sync);
+  f.sync.lastMeetings = { update: async () => { throw Error('history unavailable'); } };
+  const stats = await f.sync.tick(); assert.equal(stats.synced, 1); assert.equal(stats.failed, 1);
+  assert.deepEqual(f.links.get('100'), ['10']);
+});
+test('a future meeting moved into the recent past still updates its existing activity and leaves the upcoming rollup', async t => {
+  const f = fixture(); const db = await database(t, f.sync); await f.sync.tick();
+  const past = prepared({ start: { dateTime: '2026-10-30T10:00:00Z' }, end: { dateTime: '2026-10-30T10:30:00Z' } });
+  f.s.from = NOW - 86400000; f.s.events.set(past.key, past);
+  f.sync.calendar.events.get = async () => ({ data: past });
+  await f.sync.tick();
+  assert.equal(f.records.get('100').properties.hs_meeting_start_time, past.start.dateTime);
+  assert.equal((await db.query('SELECT active FROM google_calendar_deal_meetings')).rows[0].active, false);
+  assert.equal(f.records.size, 1);
+});

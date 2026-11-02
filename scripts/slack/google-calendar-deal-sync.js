@@ -1,4 +1,5 @@
 const { createHash } = require('node:crypto');
+const { LastMeetingDates, LAST_MEETING_DATE } = require('./google-calendar-last-meeting');
 
 const EVENT_KEY = 'truewind_google_calendar_event_key';
 const DAY = 86400000;
@@ -50,9 +51,11 @@ class GoogleCalendarDealSync {
     Object.assign(this, { pool, request, calendar, logger, now, env });
     this.horizonDays = Math.min(730, Math.max(1, Number(env.GOOGLE_CALENDAR_DEAL_SYNC_HORIZON_DAYS) || 365));
     this.intervalMs = Math.max(60000, Number(env.GOOGLE_CALENDAR_DEAL_SYNC_INTERVAL_MS) || 60000);
+    if (env.GOOGLE_CALENDAR_LAST_MEETING_ENABLED === 'true') this.lastMeetings = new LastMeetingDates({ sync: this });
   }
 
   async initialize() {
+    if (this.lastMeetings) await this.lastMeetings.initialize();
     const property = await this.request(`/crm/v3/properties/meetings/${EVENT_KEY}`);
     if (property.type !== 'string' || property.hasUniqueValue !== true) throw new Error('calendar_unique_meeting_property_required');
     await this.pool.query(`CREATE TABLE IF NOT EXISTS google_calendar_deal_meetings (
@@ -144,9 +147,12 @@ class GoogleCalendarDealSync {
     return rows;
   }
 
-  async snapshot() {
-    const now = this.now(), until = now + this.horizonDays * DAY;
-    const deals = await this.search('deals', [{ propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' }], ['dealname', 'hubspot_owner_id', 'hs_next_meeting_start_time']);
+  async snapshot({ history = false } = {}) {
+    const now = this.now(), until = history ? now : now + this.horizonDays * DAY;
+    const from = history ? -Infinity : now - (this.lastMeetings ? DAY : 0);
+    const dealProperties = ['dealname', 'hubspot_owner_id', 'hs_next_meeting_start_time'];
+    if (this.lastMeetings) dealProperties.push(LAST_MEETING_DATE);
+    const deals = await this.search('deals', [{ propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' }], dealProperties);
     const owners = await this.pages('/crm/v3/owners?limit=100&archived=false');
     const ownerById = new Map(owners.filter(o => !o.archived && normalize(o.email).includes('@')).map(o => [String(o.id), normalize(o.email)]));
     const dealOwners = new Map(), roster = new Map();
@@ -162,8 +168,10 @@ class GoogleCalendarDealSync {
       const cursors = new Set(), copies = [];
       try {
         do {
-          const { data } = await this.calendar.events.list({ calendarId, timeMin: new Date(now).toISOString(),
-            timeMax: new Date(until).toISOString(), singleEvents: true, showDeleted: false, maxResults: 2500, pageToken }, { timeout: 20000 });
+          const { data } = await this.calendar.events.list({ calendarId, ...(Number.isFinite(from) ? { timeMin: new Date(from).toISOString() } : {}),
+            timeMax: new Date(until).toISOString(), singleEvents: true, showDeleted: false, maxResults: 2500, pageToken,
+            fields: 'accessRole,nextPageToken,items(id,iCalUID,summary,start,end,attendees(email,responseStatus,resource),attendeesOmitted,organizer(email),visibility,eventType,status,originalStartTime,updated,htmlLink)',
+          }, { timeout: 20000 });
           if (!['owner', 'writer', 'reader'].includes(data.accessRole) || (data.items != null && !Array.isArray(data.items))) throw new Error('calendar_event_details_unavailable');
           copies.push(...(data.items || []));
           pageToken = data.nextPageToken;
@@ -197,7 +205,7 @@ class GoogleCalendarDealSync {
       }
     }
     if (roster.size && !readable.size) throw new Error('calendar_no_readable_calendars');
-    for (const [key, event] of events) if (!eligible(event, now, until)) events.delete(key);
+    for (const [key, event] of events) if (!eligible(event, from, until)) events.delete(key);
     const contactDeals = new Map();
     const dealContacts = await this.associationIndex('deals', [...dealOwners.keys()], 'contacts');
     for (const deal of deals) {
@@ -214,22 +222,27 @@ class GoogleCalendarDealSync {
         emailContacts.get(email).add(String(contact.id));
       }
     }
-    const meetings = await this.search('meetings', [
-      { propertyName: 'hs_meeting_start_time', operator: 'GTE', value: String(now - DAY) },
-      { propertyName: 'hs_meeting_start_time', operator: 'LT', value: String(until) },
-    ], MEETING_PROPERTIES);
+    // Listing the complete history avoids CRM search's 10,000-result cap and
+    // keeps the large historical scan off its lower search-rate allowance.
+    const meetings = history
+      ? (await this.pages(`/crm/v3/objects/meetings?limit=100&properties=${MEETING_PROPERTIES.join(',')}`))
+        .filter(m => !m.archived && time(m.properties?.hs_meeting_start_time) !== null && time(m.properties.hs_meeting_start_time) < now)
+      : await this.search('meetings', [
+        { propertyName: 'hs_meeting_start_time', operator: 'GTE', value: String(now - DAY) },
+        { propertyName: 'hs_meeting_start_time', operator: 'LT', value: String(until) },
+      ], MEETING_PROPERTIES);
     const meetingIds = meetings.map(m => String(m.id));
     const [meetingDeals, meetingContacts] = await Promise.all([
       this.associationIndex('meetings', meetingIds, 'deals'), this.associationIndex('meetings', meetingIds, 'contacts'),
     ]);
-    return { now, until, events, readable, unavailable, deals, meetings, emailContacts, contactDeals, dealOwners, meetingDeals, meetingContacts };
+    return { now, from, until, events, readable, unavailable, deals, meetings, emailContacts, contactDeals, dealOwners, meetingDeals, meetingContacts };
   }
 
   async plan(snapshot, event) {
     const contacts = [...new Set(externalAttendees(event).flatMap(email => [...(snapshot.emailContacts.get(email) || [])]))];
     const ownedContact = (contactId, dealId) => {
       const owner = snapshot.dealOwners.get(dealId), copy = owner && event.calendarCopies?.get(owner.ownerId);
-      return copy && copy.calendarId === owner.calendarId && eligible(copy, snapshot.now, Infinity)
+      return copy && copy.calendarId === owner.calendarId && eligible(copy, snapshot.from ?? snapshot.now, Infinity)
         && externalAttendees(copy).some(email => snapshot.emailContacts.get(email)?.has(contactId));
     };
     const candidates = [...new Set(contacts.flatMap(id => [...(snapshot.contactDeals.get(id) || [])].filter(dealId => ownedContact(id, dealId))))];
@@ -249,15 +262,15 @@ class GoogleCalendarDealSync {
     const matchDeals = new Map();
     for (const meeting of matches) matchDeals.set(meeting.id, snapshot.meetingDeals?.get(String(meeting.id)) || await this.associations('meetings', meeting.id, 'deals'));
     const dealId = chooseDeal(candidates, [...matchDeals.values()].flat());
-    if (!dealId) return { reason: 'ambiguous_deal' };
+    if (!dealId) return { reason: 'ambiguous_deal', candidates };
     // A matching meeting already assigned elsewhere is not silently moved.
     const identityMatches = matches.length;
     matches = matches.filter(m => !(matchDeals.get(m.id) || []).length || matchDeals.get(m.id).includes(dealId));
-    if (identityMatches && !matches.length) return { reason: 'ambiguous_existing_association' };
+    if (identityMatches && !matches.length) return { reason: 'ambiguous_existing_association', candidates };
     if (matches.length > 1) {
       const linked = matches.filter(m => matchDeals.get(m.id).includes(dealId));
       if (linked.length === 1) matches = linked;
-      else return { reason: 'ambiguous_meeting' };
+      else return { reason: 'ambiguous_meeting', candidates };
     }
     const meeting = matches[0];
     const owner = snapshot.dealOwners.get(dealId), copy = event.calendarCopies.get(owner.ownerId);
@@ -352,10 +365,12 @@ class GoogleCalendarDealSync {
         stats.synced++;
       };
       for (const event of snapshot.events.values()) {
+        if (time(event.start?.dateTime) < snapshot.now) continue;
         try { await process(event); } catch (error) { stats.failed++; this.logger.error('Calendar deal event sync failed', { code: error.statusCode || error.code || error.name }); }
       }
       for (const row of tracked) {
-        if (blocked.has(row.event_key) || snapshot.events.has(row.event_key) || !snapshot.readable.has(row.calendar_id)) continue;
+        const listed = snapshot.events.get(row.event_key);
+        if (blocked.has(row.event_key) || (listed && time(listed.start?.dateTime) >= snapshot.now) || !snapshot.readable.has(row.calendar_id)) continue;
         const owner = snapshot.dealOwners.get(row.deal_id);
         // Reassigned, unassigned, or closed deals must never cause an event read
         // from the previous owner's calendar. A new owner's copy is required.
@@ -383,6 +398,10 @@ class GoogleCalendarDealSync {
           }
         } catch (error) { stats.failed++; this.logger.error('Calendar tracked meeting refresh failed', { code: error.statusCode || error.code || error.name }); }
       }
+      if (this.lastMeetings) {
+        try { stats.lastMeetingDates = await this.lastMeetings.update(snapshot, false); }
+        catch (error) { stats.failed++; this.logger.error('Recent last meeting dates failed', { code: error.statusCode || error.code || error.name }); }
+      }
       this.logger.info('Google Calendar deal sync', stats);
       return stats;
     } finally {
@@ -405,8 +424,9 @@ class GoogleCalendarDealSync {
     run();
     this.timer = setInterval(run, this.intervalMs);
     this.timer.unref?.();
+    this.lastMeetings?.start();
   }
-  stop() { clearInterval(this.timer); this.timer = null; }
+  stop() { clearInterval(this.timer); this.timer = null; this.lastMeetings?.stop(); }
 }
 
 module.exports = { GoogleCalendarDealSync, EVENT_KEY, occurrenceKey, externalAttendees, eligible, nativeIdentity, chooseDeal };

@@ -113,8 +113,19 @@ class DemoRequestDeals {
     return { id: String(created.id), name: created.properties.name || name || domain };
   }
 
+  async inboundSourceValue() {
+    // HubSpot option labels and internal values are separate. Resolve the live
+    // value so an administrator's option change cannot leave a stale code value.
+    const property = await this.request('/crm/v3/properties/deals/deal_source');
+    const matches = (property.options || []).filter(option =>
+      option.label === 'Inbound - Website' && option.hidden !== true && String(option.value || '').trim());
+    if (matches.length !== 1) throw new Error('demo_request_inbound_source_unavailable');
+    return matches[0].value;
+  }
+
   async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri }) {
     if (!/^https:\/\/api\.calendly\.com\/scheduled_events\/[\w-]+\/invitees\/[\w-]+$/.test(bookingUri || '')) throw new Error('demo_request_confirmed_booking_required');
+    const inboundSource = await this.inboundSourceValue();
     const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id`);
     if (String(contact.id) !== String(contactId) || contact.archived || normalize(contact.properties?.email) !== normalize(email)) throw new Error('demo_request_contact_identity_invalid');
     if (!String(contact.properties.company || '').trim() && String(companyName || '').trim()) {
@@ -130,7 +141,7 @@ class DemoRequestDeals {
       const properties = {
         dealname: `${name} - Demo Request${company.id ? '' : ' [Company missing]'}`,
         pipeline: PIPELINE_ID, dealstage: STAGE_ID,
-        deal_source: 'PR', calendly_invitee_uri: bookingUri,
+        deal_source: inboundSource, calendly_invitee_uri: bookingUri,
         [CONTACT_KEY_PROPERTY]: String(contactId),
         description: `Created from a confirmed website demo booking.${company.id ? '' : ` COMPANY MISSING: ${company.reason}. Associate the correct company when available.`}`,
       };
@@ -157,7 +168,7 @@ class DemoRequestDeals {
     // booking evidence that authorized this run. Preserve manually set sources.
     if (deal.properties?.[CONTACT_KEY_PROPERTY] === String(contactId)) {
       const properties = {
-        ...(!deal.properties.deal_source ? { deal_source: 'PR' } : {}),
+        ...(!deal.properties.deal_source ? { deal_source: inboundSource } : {}),
         ...(!deal.properties.calendly_invitee_uri ? { calendly_invitee_uri: bookingUri } : {}),
       };
       if (Object.keys(properties).length) {

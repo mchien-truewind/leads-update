@@ -2,12 +2,13 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { DemoRequestDeals, CONTACT_KEY_PROPERTY, COMPANY_KEY_PROPERTY, PIPELINE_ID, STAGE_ID } = require('../demo-request-deals');
 
-function fixture({ company = true, openDeal = false, timeout = false, companyLinkFailure = false } = {}) {
+function fixture({ company = true, openDeal = false, timeout = false, companyLinkFailure = false, sourceValue = 'inbound' } = {}) {
   const calls = [], saved = [], deals = new Map();
   if (openDeal) deals.set('90', { id: '90', properties: { pipeline: PIPELINE_ID, dealstage: STAGE_ID, hs_lastmodifieddate: '2026-10-30T00:00:00Z', hubspot_owner_id: 'existing-owner' } });
   let failLink = companyLinkFailure;
   const request = async (path, options = {}) => {
     calls.push({ path, ...options });
+    if (path === '/crm/v3/properties/deals/deal_source') return { options: [{ label: 'Inbound - Website', value: sourceValue }] };
     if (path.startsWith('/crm/v3/objects/contacts/1?')) return { id: '1', properties: { email: 'lead@gmail.com', firstname: 'Fixture', lastname: 'Lead' } };
     if (path === `/crm/v3/properties/companies/${COMPANY_KEY_PROPERTY}`) return { name: COMPANY_KEY_PROPERTY, type: 'string', hasUniqueValue: true };
     if (path === `/crm/v3/properties/deals/${CONTACT_KEY_PROPERTY}`) return { name: CONTACT_KEY_PROPERTY, type: 'string', hasUniqueValue: true };
@@ -196,7 +197,7 @@ test('creation requires confirmed booking evidence and records website attributi
   const create = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST');
   // Fixture records the parsed request body separately.
   const properties = create.body.properties;
-  assert.equal(properties.deal_source, 'PR');
+  assert.equal(properties.deal_source, 'inbound');
   assert.equal(properties.calendly_invitee_uri, 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture');
 });
 
@@ -204,8 +205,24 @@ test('verified booking repairs missing source only on the automation-owned deal'
   const f = fixture();
   f.deals.set('100', { id: '100', properties: { [CONTACT_KEY_PROPERTY]: '1' } });
   await f.ensure('100');
-  assert.equal(f.deals.get('100').properties.deal_source, 'PR');
+  assert.equal(f.deals.get('100').properties.deal_source, 'inbound');
   f.deals.get('100').properties.deal_source = 'Referral';
   await f.ensure('100');
   assert.equal(f.deals.get('100').properties.deal_source, 'Referral');
+});
+
+test('source uses the current HubSpot option value rather than a hard-coded legacy value', async () => {
+  const f = fixture({ sourceValue: 'Inbound' });
+  await f.ensure();
+  assert.equal(f.deals.get('100').properties.deal_source, 'Inbound');
+});
+
+test('missing or ambiguous inbound option prevents writes rather than guessing', async () => {
+  for (const options of [[], [{ label: 'Inbound - Website', value: 'inbound', hidden: true }],
+    [{ label: 'Inbound - Website', value: 'one' }, { label: 'Inbound - Website', value: 'two' }]]) {
+    const f = fixture(); const request = f.service.request;
+    f.service.request = (path, args) => path === '/crm/v3/properties/deals/deal_source' ? { options } : request(path, args);
+    await assert.rejects(f.ensure(), /inbound_source_unavailable/);
+    assert.ok(!f.calls.some(call => ['POST', 'PUT', 'PATCH'].includes(call.method)));
+  }
 });

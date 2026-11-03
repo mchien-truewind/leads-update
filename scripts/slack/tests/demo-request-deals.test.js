@@ -2,13 +2,19 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { DemoRequestDeals, CONTACT_KEY_PROPERTY, COMPANY_KEY_PROPERTY, PIPELINE_ID, STAGE_ID } = require('../demo-request-deals');
 
-function fixture({ company = true, openDeal = false, timeout = false, companyLinkFailure = false } = {}) {
+function fixture({ company = true, openDeal = false, timeout = false, companyLinkFailure = false, sourceValue = 'inbound', leadSource = '' } = {}) {
   const calls = [], saved = [], deals = new Map();
   if (openDeal) deals.set('90', { id: '90', properties: { pipeline: PIPELINE_ID, dealstage: STAGE_ID, hs_lastmodifieddate: '2026-10-30T00:00:00Z', hubspot_owner_id: 'existing-owner' } });
   let failLink = companyLinkFailure;
   const request = async (path, options = {}) => {
     calls.push({ path, ...options });
-    if (path.startsWith('/crm/v3/objects/contacts/1?')) return { id: '1', properties: { email: 'lead@gmail.com', firstname: 'Fixture', lastname: 'Lead' } };
+    if (path === '/crm/v3/properties/contacts/lead_source') return { options: [
+      { label: 'Inbound - Website (OLD)', value: 'PR', hidden: true },
+      { label: 'Inbound - Website', value: 'Website Form Submit', hidden: false },
+    ] };
+    if (path === '/crm/v3/objects/contacts/1' && options.method === 'PATCH') return {};
+    if (path === '/crm/v3/properties/deals/deal_source') return { options: [{ label: 'Inbound - Website', value: sourceValue }] };
+    if (path.startsWith('/crm/v3/objects/contacts/1?')) return { id: '1', properties: { email: 'lead@gmail.com', firstname: 'Fixture', lastname: 'Lead', lead_source: leadSource } };
     if (path === `/crm/v3/properties/companies/${COMPANY_KEY_PROPERTY}`) return { name: COMPANY_KEY_PROPERTY, type: 'string', hasUniqueValue: true };
     if (path === `/crm/v3/properties/deals/${CONTACT_KEY_PROPERTY}`) return { name: CONTACT_KEY_PROPERTY, type: 'string', hasUniqueValue: true };
     if (path === `/crm/v3/pipelines/deals/${PIPELINE_ID}`) return { stages: [{ id: STAGE_ID, metadata: { isClosed: 'false' } }] };
@@ -38,7 +44,7 @@ function fixture({ company = true, openDeal = false, timeout = false, companyLin
     throw new Error('Unexpected request ' + path);
   };
   const service = new DemoRequestDeals({ request });
-  return { service, calls, saved, deals, ensure: (dealId) => service.ensure({ contactId: '1', email: 'lead@gmail.com', dealId, saveDeal: async id => { saved.push(id); } }) };
+  return { service, calls, saved, deals, ensure: (dealId) => service.ensure({ bookingUri: 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture', contactId: '1', email: 'lead@gmail.com', dealId, saveDeal: async id => { saved.push(id); } }) };
 }
 
 test('new demo request creates Discovery deal with atomic contact/company links and a unique retry key', async () => {
@@ -167,7 +173,7 @@ test('newly created company is linked to both the contact and the newly created 
     if (path.startsWith('/crm/v4/objects/companies/200/associations/deals?')) return { results: [] };
     return request(path, options);
   };
-  const deal = await f.service.ensure({ contactId: '1', email: 'lead@example.business', saveDeal: async id => f.saved.push(id) });
+  const deal = await f.service.ensure({ bookingUri: 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture', contactId: '1', email: 'lead@example.business', saveDeal: async id => f.saved.push(id) });
   assert.deepEqual(deal.company, { id: '200', name: 'Example Business' });
   const create = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST');
   assert.deepEqual(create.body.associations.map(a => a.to.id), ['1', '200']);
@@ -181,9 +187,63 @@ test('linking a newly known company clears only the generated missing-company ti
   const f = fixture(); const request = f.service.request;
   f.deals.set('100', { id: '100', properties: {
     [CONTACT_KEY_PROPERTY]: '1', dealname: 'Fixture Lead - Demo Request [Company missing]',
-    description: 'Created from a demo request. COMPANY MISSING: no company.',
+    description: 'Created from a confirmed website demo booking. COMPANY MISSING: no company.',
   } });
   await f.ensure('100');
   assert.equal(f.deals.get('100').properties.dealname, 'Fixture Company - Demo Request');
-  assert.equal(f.deals.get('100').properties.description, 'Created from a demo request.');
+  assert.equal(f.deals.get('100').properties.description, 'Created from a confirmed website demo booking.');
+});
+
+test('creation requires confirmed booking evidence and records website attribution', async () => {
+  const f = fixture();
+  await assert.rejects(f.service.ensure({ contactId: '1', email: 'lead@gmail.com' }), /confirmed_booking_required/);
+  assert.equal(f.calls.length, 0);
+  await f.ensure();
+  const create = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST');
+  // Fixture records the parsed request body separately.
+  const properties = create.body.properties;
+  assert.equal(properties.deal_source, 'inbound');
+  assert.equal(properties.calendly_invitee_uri, 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture');
+});
+
+test('verified booking repairs missing source only on the automation-owned deal', async () => {
+  const f = fixture();
+  f.deals.set('100', { id: '100', properties: { [CONTACT_KEY_PROPERTY]: '1' } });
+  await f.ensure('100');
+  assert.equal(f.deals.get('100').properties.deal_source, 'inbound');
+  f.deals.get('100').properties.deal_source = 'Referral';
+  await f.ensure('100');
+  assert.equal(f.deals.get('100').properties.deal_source, 'Referral');
+});
+
+test('source uses the current HubSpot option value rather than a hard-coded legacy value', async () => {
+  const f = fixture({ sourceValue: 'Inbound' });
+  await f.ensure();
+  assert.equal(f.deals.get('100').properties.deal_source, 'Inbound');
+});
+
+test('missing or ambiguous inbound option prevents writes rather than guessing', async () => {
+  for (const options of [[], [{ label: 'Inbound - Website', value: 'inbound', hidden: true }],
+    [{ label: 'Inbound - Website', value: 'one' }, { label: 'Inbound - Website', value: 'two' }]]) {
+    const f = fixture(); const request = f.service.request;
+    f.service.request = (path, args) => path === '/crm/v3/properties/deals/deal_source' ? { options } : request(path, args);
+    await assert.rejects(f.ensure(), /inbound_source_unavailable/);
+    assert.ok(!f.calls.some(call => ['POST', 'PUT', 'PATCH'].includes(call.method)));
+  }
+});
+
+test('contact attribution uses Website Form Submit while deal attribution uses its own option', async () => {
+  for (const leadSource of ['', 'PR']) {
+    const f = fixture({ leadSource, sourceValue: 'deal-inbound' });
+    await f.ensure();
+    const update = f.calls.find(c => c.path === '/crm/v3/objects/contacts/1' && c.method === 'PATCH');
+    assert.equal(update.body.properties.lead_source, 'Website Form Submit');
+    assert.equal(f.deals.get('100').properties.deal_source, 'deal-inbound');
+  }
+});
+
+test('confirmed website booking preserves existing nonlegacy contact attribution', async () => {
+  const f = fixture({ leadSource: 'Referral' });
+  await f.ensure();
+  assert.ok(!f.calls.some(c => c.path === '/crm/v3/objects/contacts/1' && c.method === 'PATCH'));
 });

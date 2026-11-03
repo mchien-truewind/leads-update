@@ -8,8 +8,9 @@ const payload = { email: 'fixture@gmail.com', name: 'Fixture Lead', uri: 'https:
 const event = { name: 'Demo', start_time: '2026-11-01T12:00:00Z', end_time: '2026-11-01T12:30:00Z' };
 const filter = { ownerId: '89305622', hostUserUri: '', eventTypeUri: 'type' };
 
-function mockHubspot(t, { managed = true, cancellation = false, associationError = false, formCompany } = {}) {
+function mockHubspot(t, { managed = true, cancellation = false, associationError = false, lostCreateResponse = false, formCompany } = {}) {
   const calls = [], companyHints = [];
+  let createdDeal = null;
   const oldToken = process.env.HUBSPOT_PRIVATE_TOKEN;
   process.env.HUBSPOT_PRIVATE_TOKEN = 'fixture-only-token';
   t.after(() => { if (oldToken === undefined) delete process.env.HUBSPOT_PRIVATE_TOKEN; else process.env.HUBSPOT_PRIVATE_TOKEN = oldToken; });
@@ -32,12 +33,17 @@ function mockHubspot(t, { managed = true, cancellation = false, associationError
       else if (path.startsWith('/crm/v3/pipelines/deals/')) response = { stages: [{ id: CONFIG.newDealStageId, metadata: { isClosed: 'false' } }] };
       else if (path.endsWith('/deals/batch/read')) response = { results: [existingDeal] };
       else if (path === '/crm/v3/objects/meetings' && options.method === 'POST') response = { id: '30' };
-      else if (path === '/crm/v3/objects/deals' && options.method === 'POST') response = { id: '21' };
+      else if (path === '/crm/v3/objects/deals/1') response = createdDeal || {};
+      else if (path === '/crm/v3/objects/deals' && options.method === 'POST') {
+        createdDeal = { id: '21', properties: body.properties };
+        if (lostCreateResponse) { req.emit('error', new Error('response lost')); return; }
+        response = createdDeal;
+      }
       else if (!['PUT', 'PATCH'].includes(options.method)) {
         req.emit('error', new Error(`Unexpected request ${path}`)); return;
       }
       const res = new EventEmitter();
-      res.statusCode = associationError && path.endsWith('/associations/deals') ? 503 : 200;
+      res.statusCode = path === '/crm/v3/objects/deals/1' && !createdDeal ? 404 : associationError && path.endsWith('/associations/deals') ? 503 : 200;
       callback(res);
       res.emit('data', JSON.stringify(response)); res.emit('end');
     });
@@ -107,4 +113,20 @@ test('explicit Calendly company answers are passed into the durable form lifecyc
   const f = mockHubspot(t, { formCompany: { id: '200', name: 'Booking Company' } });
   await handleInviteeCreated({ ...payload, questions_and_answers: [{ question: 'Company name', answer: 'Booking Company' }] }, event, filter, f.options);
   assert.deepEqual(f.companyHints, ['Booking Company']);
+});
+
+test('standalone booking recovers a committed create after a lost response using the unique contact key', async t => {
+  const f = mockHubspot(t, { managed: false, lostCreateResponse: true });
+  assert.equal((await handleInviteeCreated(payload, event, filter, f.options)).dealId, '21');
+  const creates = f.calls.filter(c => c.method === 'POST' && c.path === '/crm/v3/objects/deals');
+  assert.equal(creates.length, 1);
+  assert.equal(creates[0].body.properties.truewind_demo_request_contact_id, '1');
+  assert.ok(creates[0].body.associations.some(a => a.to.id === '1'));
+});
+
+test('delayed creation for a canceled booking performs no CRM writes', async t => {
+  const f = mockHubspot(t, { managed: false });
+  const result = await handleInviteeCreated(payload, { ...event, status: 'canceled' }, filter, f.options);
+  assert.equal(result.action, 'ignored_canceled_booking');
+  assert.equal(f.calls.length, 0);
 });

@@ -8,7 +8,7 @@ const STAGE_ID = '1307720553';
 const normalize = value => String(value || '').trim().toLowerCase();
 
 class DemoRequestDeals {
-  constructor({ request }) { this.request = request; }
+  constructor({ request, logger = console }) { this.request = request; this.logger = logger; }
 
   async initialize() {
     const property = await this.request(`/crm/v3/properties/deals/${CONTACT_KEY_PROPERTY}`);
@@ -29,7 +29,7 @@ class DemoRequestDeals {
 
   async readDeal(id, unique = false) {
     try {
-      return await this.request(`/crm/v3/objects/deals/${encodeURIComponent(id)}?properties=${CONTACT_KEY_PROPERTY},hubspot_owner_id,dealname,description${unique ? `&idProperty=${CONTACT_KEY_PROPERTY}` : ''}`);
+      return await this.request(`/crm/v3/objects/deals/${encodeURIComponent(id)}?properties=${CONTACT_KEY_PROPERTY},hubspot_owner_id,dealname,description,deal_source,calendly_invitee_uri${unique ? `&idProperty=${CONTACT_KEY_PROPERTY}` : ''}`);
     } catch (error) {
       if (unique && error.statusCode === 404) return null;
       throw error;
@@ -113,22 +113,45 @@ class DemoRequestDeals {
     return { id: String(created.id), name: created.properties.name || name || domain };
   }
 
-  async ensure({ contactId, email, dealId, saveDeal, companyName }) {
-    const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id`);
+  async inboundSourceValue(objectType = 'deals', propertyName = 'deal_source') {
+    // HubSpot option labels and internal values are separate. Resolve the live
+    // value so an administrator's option change cannot leave a stale code value.
+    const property = await this.request(`/crm/v3/properties/${objectType}/${propertyName}`);
+    const matches = (property.options || []).filter(option =>
+      option.label === 'Inbound - Website' && option.hidden !== true && String(option.value || '').trim());
+    if (matches.length !== 1) throw new Error('demo_request_inbound_source_unavailable');
+    return matches[0].value;
+  }
+
+  async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri }) {
+    if (!/^https:\/\/api\.calendly\.com\/scheduled_events\/[\w-]+\/invitees\/[\w-]+$/.test(bookingUri || '')) throw new Error('demo_request_confirmed_booking_required');
+    const inboundSource = await this.inboundSourceValue();
+    const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id,lead_source`);
     if (String(contact.id) !== String(contactId) || contact.archived || normalize(contact.properties?.email) !== normalize(email)) throw new Error('demo_request_contact_identity_invalid');
     if (!String(contact.properties.company || '').trim() && String(companyName || '').trim()) {
       contact.properties = { ...contact.properties, company: String(companyName).trim() };
     }
+    // The contact and deal properties have different option values. Replace
+    // only blank/retired website attribution on this confirmed website booking.
+    if (!contact.properties.lead_source || contact.properties.lead_source === 'PR') {
+      const leadSource = await this.inboundSourceValue('contacts', 'lead_source');
+      await this.request(`/crm/v3/objects/contacts/${contactId}`, {
+        method: 'PATCH', body: { properties: { lead_source: leadSource } },
+      });
+    }
     const company = await this.company(contact);
     let deal = dealId ? await this.readDeal(dealId) : await this.readDeal(contactId, true);
     if (!deal) deal = await findOpenDemoDeal({ request: this.request, contactId, companyId: company.id, pipelineId: PIPELINE_ID });
+    let action = 'reused_existing_deal';
     if (!deal) {
+      action = 'created';
       const name = company.name || [contact.properties.firstname, contact.properties.lastname].filter(Boolean).join(' ') || email;
       const properties = {
         dealname: `${name} - Demo Request${company.id ? '' : ' [Company missing]'}`,
         pipeline: PIPELINE_ID, dealstage: STAGE_ID,
+        deal_source: inboundSource, calendly_invitee_uri: bookingUri,
         [CONTACT_KEY_PROPERTY]: String(contactId),
-        description: `Created from a demo request.${company.id ? '' : ` COMPANY MISSING: ${company.reason}. Associate the correct company when available.`}`,
+        description: `Created from a confirmed website demo booking.${company.id ? '' : ` COMPANY MISSING: ${company.reason}. Associate the correct company when available.`}`,
       };
       try {
         deal = await this.request('/crm/v3/objects/deals', {
@@ -143,18 +166,33 @@ class DemoRequestDeals {
         // unique-property lookup rather than a lagging search index.
         deal = await this.readDeal(contactId, true);
         if (!deal) throw error;
+        action = 'recovered_committed_create';
       }
     }
     if (!/^\d+$/.test(String(deal.id)) || deal.archived) throw new Error('demo_request_deal_unavailable');
+    this.logger.info?.('demo_deal_creation', { action, contactId: String(contactId), dealId: String(deal.id), bookingUri, reason: 'confirmed_website_booking' });
     await saveDeal(String(deal.id));
+    // Only repair attribution on this automation's own opportunity, with the
+    // booking evidence that authorized this run. Preserve manually set sources.
+    if (deal.properties?.[CONTACT_KEY_PROPERTY] === String(contactId)) {
+      const properties = {
+        ...(!deal.properties.deal_source ? { deal_source: inboundSource } : {}),
+        ...(!deal.properties.calendly_invitee_uri ? { calendly_invitee_uri: bookingUri } : {}),
+      };
+      if (Object.keys(properties).length) {
+        await this.request(`/crm/v3/objects/deals/${deal.id}`, { method: 'PATCH', body: { properties } });
+        deal.properties = { ...deal.properties, ...properties };
+      }
+    }
+
     await this.request(`/crm/v4/objects/deals/${deal.id}/associations/default/contacts/${contactId}`, { method: 'PUT' });
     if (company.id) {
       await this.request(`/crm/v4/objects/contacts/${contactId}/associations/default/companies/${company.id}`, { method: 'PUT' });
       await this.request(`/crm/v4/objects/deals/${deal.id}/associations/default/companies/${company.id}`, { method: 'PUT' });
       if (deal.properties?.[CONTACT_KEY_PROPERTY] === String(contactId)
         && deal.properties.dealname?.endsWith(' - Demo Request [Company missing]')
-        && deal.properties.description?.startsWith('Created from a demo request. COMPANY MISSING:')) {
-        const properties = { dealname: `${company.name} - Demo Request`, description: 'Created from a demo request.' };
+        && deal.properties.description?.startsWith('Created from a confirmed website demo booking. COMPANY MISSING:')) {
+        const properties = { dealname: `${company.name} - Demo Request`, description: 'Created from a confirmed website demo booking.' };
         await this.request(`/crm/v3/objects/deals/${deal.id}`, { method: 'PATCH', body: { properties } });
         deal.properties = { ...deal.properties, ...properties };
       }

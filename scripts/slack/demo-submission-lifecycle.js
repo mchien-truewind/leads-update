@@ -19,7 +19,7 @@ class DemoSubmissionLifecycle {
     if (env.DEMO_REQUEST_DEALS_ENABLED === 'true') {
       this.dealsActivatedAt = ms(env.DEMO_REQUEST_DEALS_ACTIVATED_AT);
       if (!Number.isFinite(this.dealsActivatedAt) || this.dealsActivatedAt <= 0) throw new Error('demo_request_deals_activation_required');
-      this.requestDeals = new DemoRequestDeals({ request: hubspotRequest });
+      this.requestDeals = new DemoRequestDeals({ request: hubspotRequest, logger });
       if (env.APOLLO_API_KEY?.trim()) this.apolloEnricher = new ApolloCompanyEnricher({
         request: hubspotRequest, apiKey: env.APOLLO_API_KEY.trim(), fetchImpl,
       });
@@ -196,10 +196,20 @@ class DemoSubmissionLifecycle {
     if (!initial || Number(initial.submitted_at) < this.dealsActivatedAt) return null;
     const result = await this.withContactLock(initial.email, async client => {
       const row = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
+      // A form is a lead, not an opportunity. Only a verified active booking
+      // persisted by saveBooking may authorize opportunity creation.
+      const booking = (await client.query(`SELECT * FROM demo_submission_bookings
+        WHERE email = $1 AND booked_at >= $2 AND canceled = false
+        ORDER BY booked_at, invitee_uri LIMIT 1`, [row.email, row.submitted_at])).rows[0];
+      if (!booking) {
+        await client.query('UPDATE demo_submission_lifecycle SET deal_next_check = $2 WHERE submission_key = $1', [key, this.now() + WINDOW_MS]);
+        this.logger.info?.('demo_deal_decision', { contactId: row.contact_id, reason: 'awaiting_qualifying_booking', included: false });
+        return null;
+      }
       const saved = row.deal_id || (await client.query(`SELECT deal_id FROM demo_submission_lifecycle
         WHERE contact_id = $1 AND deal_id IS NOT NULL ORDER BY submitted_at LIMIT 1`, [row.contact_id])).rows[0]?.deal_id;
       const deal = await this.requestDeals.ensure({ contactId: row.contact_id, email: row.email, dealId: saved,
-        companyName: row.company_name,
+        companyName: row.company_name, bookingUri: booking.invitee_uri,
         saveDeal: async id => client.query('UPDATE demo_submission_lifecycle SET deal_id = $2 WHERE submission_key = $1', [key, id]),
       });
       let ownerId = row.assigned_owner;
@@ -210,9 +220,9 @@ class DemoSubmissionLifecycle {
       if (ownerId) await this.requestDeals.syncOwner(deal.id, row.contact_id, ownerId);
       if (deal.company?.id) await this.enqueueCompanyEnrichment(client, deal.company.id);
       await client.query("UPDATE demo_submission_lifecycle SET deal_state = 'ready' WHERE submission_key = $1", [key]);
+      this.logger.info?.('demo_deal_decision', { contactId: row.contact_id, dealId: deal.id, bookingUri: booking.invitee_uri, reason: 'confirmed_booking' });
       return ownerId ? { ...await this.requestDeals.readDeal(deal.id), company: deal.company } : deal;
     });
-    if (!result) throw new Error('demo_request_deal_busy');
     return result;
   }
 
@@ -222,7 +232,10 @@ class DemoSubmissionLifecycle {
       WHERE contact_id = $1 AND submitted_at >= $2 ORDER BY submitted_at DESC LIMIT 1`, [String(contactId), this.dealsActivatedAt])).rows[0];
     if (row && String(companyName || '').trim()) await this.pool.query(`UPDATE demo_submission_lifecycle
       SET company_name = COALESCE(company_name, $2), deal_state = 'pending' WHERE submission_key = $1`, [row.submission_key, String(companyName).trim()]);
-    return row ? this.processDealRow(row.submission_key) : null;
+    if (!row) return null;
+    const deal = await this.processDealRow(row.submission_key);
+    if (!deal) throw new Error('demo_request_confirmed_booking_pending');
+    return deal;
   }
 
   async hasRequestDeal(dealId) {

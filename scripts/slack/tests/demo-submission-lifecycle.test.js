@@ -582,7 +582,12 @@ test('a fresh form in leads does not reuse an old slack-testing thread', async (
   assert.equal(rows[1].channel_id, 'C05MF0R662J');
 });
 
-function enableDealFixture({ fail = false } = {}) {
+async function enableDealFixture({ fail = false, booked = true } = {}) {
+  if (booked) {
+    const b = booking();
+    bookings.push(b);
+    await lifecycle.saveBooking(b.payload, b.scheduledEvent, b.filter);
+  }
   const ensured = [], owners = [];
   lifecycle.dealsActivatedAt = submittedAt;
   lifecycle.requestDeals = {
@@ -598,39 +603,39 @@ function enableDealFixture({ fail = false } = {}) {
   return { ensured, owners, recover() { fail = false; } };
 }
 
-test('new form deal is processed before five-minute Slack deadline and only once', async () => {
-  const f = enableDealFixture();
+test('confirmed booking creates one deal before the Slack deadline and retries reuse it', async () => {
+  const f = await enableDealFixture();
   await lifecycle.enqueue(formEvent);
   await lifecycle.tick();
   assert.equal(f.ensured.length, 1);
   assert.equal((await row()).deal_id, '900');
   assert.equal((await row()).deal_state, 'ready');
-  assert.equal(posts.length, 0);
+  assert.equal(posts.length, 1);
   await lifecycle.tick();
   assert.equal(f.ensured.length, 1);
   time += WINDOW_MS;
   await lifecycle.tick();
-  assert.equal(posts.length, 2);
-  assert.deepEqual(f.owners.at(-1), ['900', '123', '89305622']);
+  assert.equal(posts.length, 1);
+  assert.deepEqual(f.owners.at(-1), ['900', '123', '84547076']);
 });
 
-test('deal retry survives completed notification and does not block Slack delivery', async () => {
-  const f = enableDealFixture({ fail: true });
+test('confirmed booking deal retry survives completed notification', async () => {
+  const f = await enableDealFixture({ fail: true });
   await lifecycle.enqueue(formEvent);
   time += WINDOW_MS;
   await lifecycle.tick();
-  assert.equal(posts.length, 2);
+  assert.equal(posts.length, 1);
   assert.equal((await row()).deal_state, 'pending');
   await pool.query("UPDATE demo_submission_lifecycle SET booked_state = 'sent'");
   f.recover();
   time += 30000;
   await lifecycle.tick();
   assert.equal((await row()).deal_state, 'ready');
-  assert.equal(posts.length, 2);
+  assert.equal(posts.length, 1);
 });
 
 test('Calendly-first processing ensures the form deal synchronously before the worker tick', async () => {
-  const f = enableDealFixture();
+  const f = await enableDealFixture();
   await lifecycle.enqueue(formEvent);
   assert.equal((await lifecycle.ensureDealForBooking('123')).id, '900');
   await lifecycle.tick();
@@ -641,7 +646,7 @@ test('Calendly-first processing ensures the form deal synchronously before the w
 });
 
 test('deal activation does not backfill historical submissions', async () => {
-  const f = enableDealFixture();
+  const f = await enableDealFixture();
   lifecycle.dealsActivatedAt = submittedAt + 1;
   await lifecycle.enqueue(formEvent);
   await lifecycle.tick();
@@ -650,12 +655,14 @@ test('deal activation does not backfill historical submissions', async () => {
 });
 
 test('repeat form reuses the previously saved deal ID', async () => {
-  const f = enableDealFixture();
+  const f = await enableDealFixture();
   await lifecycle.enqueue(formEvent);
   time += WINDOW_MS;
   await lifecycle.tick();
   time += 1000;
   await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  const second = booking(400, '84547076', 'repeat');
+  await lifecycle.saveBooking(second.payload, second.scheduledEvent, second.filter);
   await lifecycle.tick();
   assert.equal(f.ensured.length, 2);
   assert.equal(f.ensured[1].dealId, '900');
@@ -667,24 +674,25 @@ test('enabling deal creation requires an explicit activation timestamp', () => {
 });
 
 test('deal owner sync failure retries independently without delaying Slack notifications', async () => {
-  enableDealFixture();
+  await enableDealFixture();
   await lifecycle.enqueue(formEvent);
   await lifecycle.tick();
   lifecycle.requestDeals.syncOwner = async () => { throw new Error('deal write unavailable'); };
+  await lifecycle.syncDealOwner(pool, '123', '84547076');
   time += WINDOW_MS;
   await lifecycle.tick();
-  assert.equal(posts.length, 2);
+  assert.equal(posts.length, 1);
   assert.equal((await row()).deal_state, 'pending');
   lifecycle.requestDeals.syncOwner = async () => {};
   time += 30000;
   await lifecycle.tick();
   assert.equal((await row()).deal_state, 'ready');
-  assert.equal(posts.length, 2);
+  assert.equal(posts.length, 1);
 });
 
 
 test('booking company name is persisted before company work so background retries retain it', async () => {
-  const f = enableDealFixture({ fail: true });
+  const f = await enableDealFixture({ fail: true });
   await lifecycle.enqueue(formEvent);
   await assert.rejects(lifecycle.ensureDealForBooking('123', 'Booking Company'), /CRM unavailable/);
   assert.equal((await row()).company_name, 'Booking Company');
@@ -727,7 +735,7 @@ test('company enrichment cache survives write failures and avoids repeated looku
 });
 
 test('Apollo rate limits do not delay deal creation or five-minute Slack notifications', async () => {
-  enableDealFixture();
+  await enableDealFixture();
   lifecycle.apolloEnricher = { async enrich() { throw Object.assign(new Error('apollo_company_http_429'), { retryAfterMs: 120000 }); } };
   await lifecycle.enqueue(formEvent);
   await lifecycle.enqueueCompanyEnrichment(pool, '200');
@@ -737,7 +745,7 @@ test('Apollo rate limits do not delay deal creation or five-minute Slack notific
   time += WINDOW_MS;
   await lifecycle.tick();
   assert.equal((await row()).deal_state, 'ready');
-  assert.equal(posts.length, 2);
+  assert.equal(posts.length, 1);
 });
 
 test('changed company identity discards stale enrichment cache for a fresh retry', async () => {
@@ -751,7 +759,7 @@ test('changed company identity discards stale enrichment cache for a fresh retry
 });
 
 test('company metadata survives the owner refresh and enqueues only one enrichment job', async () => {
-  enableDealFixture();
+  await enableDealFixture();
   const ensure = lifecycle.requestDeals.ensure;
   lifecycle.requestDeals.ensure = async input => ({ ...await ensure(input), company: { id: '200', name: 'Example' } });
   await lifecycle.enqueue(formEvent);
@@ -760,4 +768,38 @@ test('company metadata survives the owner refresh and enqueues only one enrichme
   const deal = await lifecycle.ensureDealForBooking('123');
   assert.deepEqual(deal.company, { id: '200', name: 'Example' });
   assert.equal((await pool.query('SELECT count(*)::int AS count FROM demo_company_enrichment')).rows[0].count, 1);
+});
+
+for (const email of ['test@trytruewind.com', 'prospect@example.com']) {
+  test(`form without a booking never creates a deal: ${email}`, async () => {
+    const f = await enableDealFixture({ booked: false });
+    await lifecycle.enqueue(formEvent);
+    await pool.query('UPDATE demo_submission_lifecycle SET email = $1', [email]);
+    await lifecycle.tick();
+    time += WINDOW_MS;
+    await lifecycle.tick();
+    assert.equal(f.ensured.length, 0);
+    assert.equal((await row()).deal_id, null);
+  });
+}
+
+test('canceled booking cannot authorize creation', async () => {
+  const f = await enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  await pool.query('UPDATE demo_submission_bookings SET canceled = true');
+  bookings = [];
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 0);
+});
+
+test('booking delivery retries persist the same booking and deal', async () => {
+  const f = await enableDealFixture({ booked: false });
+  await lifecycle.enqueue(formEvent);
+  const b = booking();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+    assert.equal((await lifecycle.ensureDealForBooking('123')).id, '900');
+  }
+  assert.deepEqual((await pool.query('SELECT count(*)::int AS count FROM demo_submission_bookings')).rows, [{ count: 1 }]);
+  assert.ok(f.ensured.slice(1).every(input => input.dealId === '900'));
 });

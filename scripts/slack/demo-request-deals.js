@@ -8,7 +8,7 @@ const STAGE_ID = '1307720553';
 const normalize = value => String(value || '').trim().toLowerCase();
 
 class DemoRequestDeals {
-  constructor({ request }) { this.request = request; }
+  constructor({ request, logger = console }) { this.request = request; this.logger = logger; }
 
   async initialize() {
     const property = await this.request(`/crm/v3/properties/deals/${CONTACT_KEY_PROPERTY}`);
@@ -113,7 +113,8 @@ class DemoRequestDeals {
     return { id: String(created.id), name: created.properties.name || name || domain };
   }
 
-  async ensure({ contactId, email, dealId, saveDeal, companyName }) {
+  async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri }) {
+    if (!/^https:\/\/api\.calendly\.com\/scheduled_events\/[\w-]+\/invitees\/[\w-]+$/.test(bookingUri || '')) throw new Error('demo_request_confirmed_booking_required');
     const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id`);
     if (String(contact.id) !== String(contactId) || contact.archived || normalize(contact.properties?.email) !== normalize(email)) throw new Error('demo_request_contact_identity_invalid');
     if (!String(contact.properties.company || '').trim() && String(companyName || '').trim()) {
@@ -122,13 +123,16 @@ class DemoRequestDeals {
     const company = await this.company(contact);
     let deal = dealId ? await this.readDeal(dealId) : await this.readDeal(contactId, true);
     if (!deal) deal = await findOpenDemoDeal({ request: this.request, contactId, companyId: company.id, pipelineId: PIPELINE_ID });
+    let action = 'reused_existing_deal';
     if (!deal) {
+      action = 'created';
       const name = company.name || [contact.properties.firstname, contact.properties.lastname].filter(Boolean).join(' ') || email;
       const properties = {
         dealname: `${name} - Demo Request${company.id ? '' : ' [Company missing]'}`,
         pipeline: PIPELINE_ID, dealstage: STAGE_ID,
+        deal_source: 'PR', calendly_invitee_uri: bookingUri,
         [CONTACT_KEY_PROPERTY]: String(contactId),
-        description: `Created from a demo request.${company.id ? '' : ` COMPANY MISSING: ${company.reason}. Associate the correct company when available.`}`,
+        description: `Created from a confirmed website demo booking.${company.id ? '' : ` COMPANY MISSING: ${company.reason}. Associate the correct company when available.`}`,
       };
       try {
         deal = await this.request('/crm/v3/objects/deals', {
@@ -143,9 +147,11 @@ class DemoRequestDeals {
         // unique-property lookup rather than a lagging search index.
         deal = await this.readDeal(contactId, true);
         if (!deal) throw error;
+        action = 'recovered_committed_create';
       }
     }
     if (!/^\d+$/.test(String(deal.id)) || deal.archived) throw new Error('demo_request_deal_unavailable');
+    this.logger.info?.('demo_deal_creation', { action, contactId: String(contactId), dealId: String(deal.id), bookingUri, reason: 'confirmed_website_booking' });
     await saveDeal(String(deal.id));
     await this.request(`/crm/v4/objects/deals/${deal.id}/associations/default/contacts/${contactId}`, { method: 'PUT' });
     if (company.id) {
@@ -153,8 +159,8 @@ class DemoRequestDeals {
       await this.request(`/crm/v4/objects/deals/${deal.id}/associations/default/companies/${company.id}`, { method: 'PUT' });
       if (deal.properties?.[CONTACT_KEY_PROPERTY] === String(contactId)
         && deal.properties.dealname?.endsWith(' - Demo Request [Company missing]')
-        && deal.properties.description?.startsWith('Created from a demo request. COMPANY MISSING:')) {
-        const properties = { dealname: `${company.name} - Demo Request`, description: 'Created from a demo request.' };
+        && deal.properties.description?.startsWith('Created from a confirmed website demo booking. COMPANY MISSING:')) {
+        const properties = { dealname: `${company.name} - Demo Request`, description: 'Created from a confirmed website demo booking.' };
         await this.request(`/crm/v3/objects/deals/${deal.id}`, { method: 'PATCH', body: { properties } });
         deal.properties = { ...deal.properties, ...properties };
       }

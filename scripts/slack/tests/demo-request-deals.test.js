@@ -38,7 +38,7 @@ function fixture({ company = true, openDeal = false, timeout = false, companyLin
     throw new Error('Unexpected request ' + path);
   };
   const service = new DemoRequestDeals({ request });
-  return { service, calls, saved, deals, ensure: (dealId) => service.ensure({ contactId: '1', email: 'lead@gmail.com', dealId, saveDeal: async id => { saved.push(id); } }) };
+  return { service, calls, saved, deals, ensure: (dealId) => service.ensure({ bookingUri: 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture', contactId: '1', email: 'lead@gmail.com', dealId, saveDeal: async id => { saved.push(id); } }) };
 }
 
 test('new demo request creates Discovery deal with atomic contact/company links and a unique retry key', async () => {
@@ -167,7 +167,7 @@ test('newly created company is linked to both the contact and the newly created 
     if (path.startsWith('/crm/v4/objects/companies/200/associations/deals?')) return { results: [] };
     return request(path, options);
   };
-  const deal = await f.service.ensure({ contactId: '1', email: 'lead@example.business', saveDeal: async id => f.saved.push(id) });
+  const deal = await f.service.ensure({ bookingUri: 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture', contactId: '1', email: 'lead@example.business', saveDeal: async id => f.saved.push(id) });
   assert.deepEqual(deal.company, { id: '200', name: 'Example Business' });
   const create = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST');
   assert.deepEqual(create.body.associations.map(a => a.to.id), ['1', '200']);
@@ -181,9 +181,21 @@ test('linking a newly known company clears only the generated missing-company ti
   const f = fixture(); const request = f.service.request;
   f.deals.set('100', { id: '100', properties: {
     [CONTACT_KEY_PROPERTY]: '1', dealname: 'Fixture Lead - Demo Request [Company missing]',
-    description: 'Created from a demo request. COMPANY MISSING: no company.',
+    description: 'Created from a confirmed website demo booking. COMPANY MISSING: no company.',
   } });
   await f.ensure('100');
   assert.equal(f.deals.get('100').properties.dealname, 'Fixture Company - Demo Request');
-  assert.equal(f.deals.get('100').properties.description, 'Created from a demo request.');
+  assert.equal(f.deals.get('100').properties.description, 'Created from a confirmed website demo booking.');
+});
+
+test('creation requires confirmed booking evidence and records website attribution', async () => {
+  const f = fixture();
+  await assert.rejects(f.service.ensure({ contactId: '1', email: 'lead@gmail.com' }), /confirmed_booking_required/);
+  assert.equal(f.calls.length, 0);
+  await f.ensure();
+  const create = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST');
+  // Fixture records the parsed request body separately.
+  const properties = create.body.properties;
+  assert.equal(properties.deal_source, 'PR');
+  assert.equal(properties.calendly_invitee_uri, 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture');
 });

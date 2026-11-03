@@ -808,26 +808,50 @@ async function createDeal({ payload, scheduledEvent, contactId, companyId, compa
   const eventUri = getScheduledEventUri(payload);
   const inviteeUri = getInviteeUri(payload);
   const startTime = getEventStart(scheduledEvent);
-  const deal = await hubspotRequest('/crm/v3/objects/deals', {
-    method: 'POST',
-    body: {
-      properties: {
-        dealname: buildDealName({
-          companyName,
-          organizerName: getOrganizerName(hostUserUri, scheduledEvent),
-          startTime,
-        }),
-        pipeline: CONFIG.pipelineId,
-        dealstage: CONFIG.newDealStageId,
-        hubspot_owner_id: ownerId,
-        calendly_event_uri: eventUri,
-        calendly_invitee_uri: inviteeUri,
-        calendly_event_uuid: lastUriPart(eventUri),
-        calendly_event_type_uri: eventTypeUri,
-        calendly_host_user_uri: hostUserUri,
-      },
-    },
-  });
+  // Share the same HubSpot unique key as the form worker. A committed POST
+  // remains recoverable before search indexing, even after a lost response.
+  const lookup = async () => {
+    try {
+      return await hubspotRequest(`/crm/v3/objects/deals/${contactId}?idProperty=truewind_demo_request_contact_id&properties=hubspot_owner_id,calendly_invitee_uri`);
+    } catch (error) {
+      if (error.statusCode === 404) return null;
+      throw error;
+    }
+  };
+  let deal = await lookup();
+  if (!deal) {
+    try {
+      deal = await hubspotRequest('/crm/v3/objects/deals', {
+        method: 'POST',
+        body: {
+          properties: {
+            dealname: buildDealName({
+              companyName,
+              organizerName: getOrganizerName(hostUserUri, scheduledEvent),
+              startTime,
+            }),
+            truewind_demo_request_contact_id: String(contactId),
+            pipeline: CONFIG.pipelineId,
+            dealstage: CONFIG.newDealStageId,
+            hubspot_owner_id: ownerId,
+            calendly_event_uri: eventUri,
+            calendly_invitee_uri: inviteeUri,
+            calendly_event_uuid: lastUriPart(eventUri),
+            calendly_event_type_uri: eventTypeUri,
+            calendly_host_user_uri: hostUserUri,
+          },
+          associations: [
+            { to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 3 }] },
+            ...(companyId ? [{ to: { id: String(companyId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 341 }] }] : []),
+          ],
+        },
+      });
+    } catch (error) {
+      deal = await lookup();
+      if (!deal) throw error;
+    }
+  }
+  console.info('calendly_deal_decision', { contactId: String(contactId), dealId: deal.id, reason: 'confirmed_booking', inviteeUri });
   await Promise.all([
     associate('deals', deal.id, 'contacts', contactId),
     companyId ? associate('deals', deal.id, 'companies', companyId) : null,

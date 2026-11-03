@@ -637,7 +637,7 @@ test('confirmed booking deal retry survives completed notification', async () =>
 test('Calendly-first processing ensures the form deal synchronously before the worker tick', async () => {
   const f = await enableDealFixture();
   await lifecycle.enqueue(formEvent);
-  assert.equal((await lifecycle.ensureDealForBooking('123')).id, '900');
+  assert.equal((await lifecycle.ensureDealForBooking('123', undefined, booking().payload.uri)).id, '900');
   await lifecycle.tick();
   assert.equal(f.ensured.length, 1);
   assert.equal(await lifecycle.hasRequestDeal('900'), true);
@@ -651,7 +651,7 @@ test('deal activation does not backfill historical submissions', async () => {
   await lifecycle.enqueue(formEvent);
   await lifecycle.tick();
   assert.equal(f.ensured.length, 0);
-  assert.equal(await lifecycle.ensureDealForBooking('123'), null);
+  assert.equal(await lifecycle.ensureDealForBooking('123', undefined, booking().payload.uri), null);
 });
 
 test('repeat form reuses the previously saved deal ID', async () => {
@@ -694,7 +694,7 @@ test('deal owner sync failure retries independently without delaying Slack notif
 test('booking company name is persisted before company work so background retries retain it', async () => {
   const f = await enableDealFixture({ fail: true });
   await lifecycle.enqueue(formEvent);
-  await assert.rejects(lifecycle.ensureDealForBooking('123', 'Booking Company'), /CRM unavailable/);
+  await assert.rejects(lifecycle.ensureDealForBooking('123', 'Booking Company', booking().payload.uri), /CRM unavailable/);
   assert.equal((await row()).company_name, 'Booking Company');
   f.recover();
   await lifecycle.tick();
@@ -765,7 +765,7 @@ test('company metadata survives the owner refresh and enqueues only one enrichme
   await lifecycle.enqueue(formEvent);
   time += WINDOW_MS;
   await lifecycle.tick();
-  const deal = await lifecycle.ensureDealForBooking('123');
+  const deal = await lifecycle.ensureDealForBooking('123', undefined, booking().payload.uri);
   assert.deepEqual(deal.company, { id: '200', name: 'Example' });
   assert.equal((await pool.query('SELECT count(*)::int AS count FROM demo_company_enrichment')).rows[0].count, 1);
 });
@@ -798,8 +798,26 @@ test('booking delivery retries persist the same booking and deal', async () => {
   const b = booking();
   for (let attempt = 0; attempt < 3; attempt++) {
     await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
-    assert.equal((await lifecycle.ensureDealForBooking('123')).id, '900');
+    assert.equal((await lifecycle.ensureDealForBooking('123', undefined, booking().payload.uri)).id, '900');
   }
   assert.deepEqual((await pool.query('SELECT count(*)::int AS count FROM demo_submission_bookings')).rows, [{ count: 1 }]);
   assert.ok(f.ensured.slice(1).every(input => input.dealId === '900'));
+});
+
+test('late booking delivery selects its preceding form rather than a newer unbooked submission', async () => {
+  const f = await enableDealFixture({ booked: false });
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  time += 1000;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  const b = booking(100);
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  assert.equal((await lifecycle.ensureDealForBooking('123', 'Booked Company', b.payload.uri)).id, '900');
+  const submissions = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
+  assert.equal(submissions.length, 2);
+  assert.equal(submissions[0].deal_id, '900');
+  assert.equal(submissions[0].company_name, 'Booked Company');
+  assert.equal(submissions[1].deal_id, null);
+  assert.equal(f.ensured.length, 1);
 });

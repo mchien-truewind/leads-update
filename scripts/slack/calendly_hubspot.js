@@ -903,6 +903,10 @@ async function ensureContact({ payload, ownerId = '' }) {
 }
 
 async function handleInviteeCreated(payload, scheduledEvent, filter, options = {}) {
+  // A delayed creation notification can arrive after Calendly canceled it.
+  if ((scheduledEvent.resource || scheduledEvent).status === 'canceled' || payload.status === 'canceled') {
+    return { action: 'ignored_canceled_booking' };
+  }
   const contact = await ensureContact({ payload, ownerId: filter.ownerId });
   const eventUri = getScheduledEventUri(payload);
   const inviteeUri = getInviteeUri(payload);
@@ -920,7 +924,7 @@ async function handleInviteeCreated(payload, scheduledEvent, filter, options = {
   // Keep the same deal and attach this meeting rather than creating another.
   let formDeal;
   if (options.demoLifecycle?.requestDeals && (!deal || await options.demoLifecycle.hasRequestDeal(deal.id))) {
-    formDeal = await options.demoLifecycle.ensureDealForBooking(contact.id, getCompanyNameFromPayload(payload));
+    formDeal = await options.demoLifecycle.ensureDealForBooking(contact.id, getCompanyNameFromPayload(payload), inviteeUri);
     deal = deal || formDeal;
   }
   // The form lifecycle owns company creation for managed submissions. Its

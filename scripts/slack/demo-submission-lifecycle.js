@@ -226,10 +226,15 @@ class DemoSubmissionLifecycle {
     return result;
   }
 
-  async ensureDealForBooking(contactId, companyName) {
+  async ensureDealForBooking(contactId, companyName, bookingUri) {
     if (!this.requestDeals) return null;
-    const row = (await this.pool.query(`SELECT submission_key FROM demo_submission_lifecycle
-      WHERE contact_id = $1 AND submitted_at >= $2 ORDER BY submitted_at DESC LIMIT 1`, [String(contactId), this.dealsActivatedAt])).rows[0];
+    // Correlate this delivery to its booking time. A later, unbooked form
+    // must not take over an older confirmed booking when webhooks arrive late.
+    const row = (await this.pool.query(`SELECT s.submission_key FROM demo_submission_lifecycle s
+      JOIN demo_submission_bookings b ON b.email = s.email
+      WHERE s.contact_id = $1 AND s.submitted_at >= $2
+        AND b.invitee_uri = $3 AND b.canceled = false AND s.submitted_at <= b.booked_at
+      ORDER BY s.submitted_at DESC LIMIT 1`, [String(contactId), this.dealsActivatedAt, bookingUri])).rows[0];
     if (row && String(companyName || '').trim()) await this.pool.query(`UPDATE demo_submission_lifecycle
       SET company_name = COALESCE(company_name, $2), deal_state = 'pending' WHERE submission_key = $1`, [row.submission_key, String(companyName).trim()]);
     if (!row) return null;

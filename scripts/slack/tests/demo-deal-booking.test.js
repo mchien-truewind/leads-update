@@ -123,3 +123,10 @@ test('standalone booking recovers a committed create after a lost response using
   assert.equal(creates[0].body.properties.truewind_demo_request_contact_id, '1');
   assert.ok(creates[0].body.associations.some(a => a.to.id === '1'));
 });
+
+test('delayed creation for a canceled booking performs no CRM writes', async t => {
+  const f = mockHubspot(t, { managed: false });
+  const result = await handleInviteeCreated(payload, { ...event, status: 'canceled' }, filter, f.options);
+  assert.equal(result.action, 'ignored_canceled_booking');
+  assert.equal(f.calls.length, 0);
+});

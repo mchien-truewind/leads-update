@@ -2,14 +2,19 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { DemoRequestDeals, CONTACT_KEY_PROPERTY, COMPANY_KEY_PROPERTY, PIPELINE_ID, STAGE_ID } = require('../demo-request-deals');
 
-function fixture({ company = true, openDeal = false, timeout = false, companyLinkFailure = false, sourceValue = 'inbound' } = {}) {
+function fixture({ company = true, openDeal = false, timeout = false, companyLinkFailure = false, sourceValue = 'inbound', leadSource = '' } = {}) {
   const calls = [], saved = [], deals = new Map();
   if (openDeal) deals.set('90', { id: '90', properties: { pipeline: PIPELINE_ID, dealstage: STAGE_ID, hs_lastmodifieddate: '2026-10-30T00:00:00Z', hubspot_owner_id: 'existing-owner' } });
   let failLink = companyLinkFailure;
   const request = async (path, options = {}) => {
     calls.push({ path, ...options });
+    if (path === '/crm/v3/properties/contacts/lead_source') return { options: [
+      { label: 'Inbound - Website (OLD)', value: 'PR', hidden: true },
+      { label: 'Inbound - Website', value: 'Website Form Submit', hidden: false },
+    ] };
+    if (path === '/crm/v3/objects/contacts/1' && options.method === 'PATCH') return {};
     if (path === '/crm/v3/properties/deals/deal_source') return { options: [{ label: 'Inbound - Website', value: sourceValue }] };
-    if (path.startsWith('/crm/v3/objects/contacts/1?')) return { id: '1', properties: { email: 'lead@gmail.com', firstname: 'Fixture', lastname: 'Lead' } };
+    if (path.startsWith('/crm/v3/objects/contacts/1?')) return { id: '1', properties: { email: 'lead@gmail.com', firstname: 'Fixture', lastname: 'Lead', lead_source: leadSource } };
     if (path === `/crm/v3/properties/companies/${COMPANY_KEY_PROPERTY}`) return { name: COMPANY_KEY_PROPERTY, type: 'string', hasUniqueValue: true };
     if (path === `/crm/v3/properties/deals/${CONTACT_KEY_PROPERTY}`) return { name: CONTACT_KEY_PROPERTY, type: 'string', hasUniqueValue: true };
     if (path === `/crm/v3/pipelines/deals/${PIPELINE_ID}`) return { stages: [{ id: STAGE_ID, metadata: { isClosed: 'false' } }] };
@@ -225,4 +230,20 @@ test('missing or ambiguous inbound option prevents writes rather than guessing',
     await assert.rejects(f.ensure(), /inbound_source_unavailable/);
     assert.ok(!f.calls.some(call => ['POST', 'PUT', 'PATCH'].includes(call.method)));
   }
+});
+
+test('contact attribution uses Website Form Submit while deal attribution uses its own option', async () => {
+  for (const leadSource of ['', 'PR']) {
+    const f = fixture({ leadSource, sourceValue: 'deal-inbound' });
+    await f.ensure();
+    const update = f.calls.find(c => c.path === '/crm/v3/objects/contacts/1' && c.method === 'PATCH');
+    assert.equal(update.body.properties.lead_source, 'Website Form Submit');
+    assert.equal(f.deals.get('100').properties.deal_source, 'deal-inbound');
+  }
+});
+
+test('confirmed website booking preserves existing nonlegacy contact attribution', async () => {
+  const f = fixture({ leadSource: 'Referral' });
+  await f.ensure();
+  assert.ok(!f.calls.some(c => c.path === '/crm/v3/objects/contacts/1' && c.method === 'PATCH'));
 });

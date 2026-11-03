@@ -113,10 +113,10 @@ class DemoRequestDeals {
     return { id: String(created.id), name: created.properties.name || name || domain };
   }
 
-  async inboundSourceValue() {
+  async inboundSourceValue(objectType = 'deals', propertyName = 'deal_source') {
     // HubSpot option labels and internal values are separate. Resolve the live
     // value so an administrator's option change cannot leave a stale code value.
-    const property = await this.request('/crm/v3/properties/deals/deal_source');
+    const property = await this.request(`/crm/v3/properties/${objectType}/${propertyName}`);
     const matches = (property.options || []).filter(option =>
       option.label === 'Inbound - Website' && option.hidden !== true && String(option.value || '').trim());
     if (matches.length !== 1) throw new Error('demo_request_inbound_source_unavailable');
@@ -126,10 +126,18 @@ class DemoRequestDeals {
   async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri }) {
     if (!/^https:\/\/api\.calendly\.com\/scheduled_events\/[\w-]+\/invitees\/[\w-]+$/.test(bookingUri || '')) throw new Error('demo_request_confirmed_booking_required');
     const inboundSource = await this.inboundSourceValue();
-    const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id`);
+    const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id,lead_source`);
     if (String(contact.id) !== String(contactId) || contact.archived || normalize(contact.properties?.email) !== normalize(email)) throw new Error('demo_request_contact_identity_invalid');
     if (!String(contact.properties.company || '').trim() && String(companyName || '').trim()) {
       contact.properties = { ...contact.properties, company: String(companyName).trim() };
+    }
+    // The contact and deal properties have different option values. Replace
+    // only blank/retired website attribution on this confirmed website booking.
+    if (!contact.properties.lead_source || contact.properties.lead_source === 'PR') {
+      const leadSource = await this.inboundSourceValue('contacts', 'lead_source');
+      await this.request(`/crm/v3/objects/contacts/${contactId}`, {
+        method: 'PATCH', body: { properties: { lead_source: leadSource } },
+      });
     }
     const company = await this.company(contact);
     let deal = dealId ? await this.readDeal(dealId) : await this.readDeal(contactId, true);

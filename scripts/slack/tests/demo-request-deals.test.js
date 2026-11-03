@@ -199,3 +199,13 @@ test('creation requires confirmed booking evidence and records website attributi
   assert.equal(properties.deal_source, 'PR');
   assert.equal(properties.calendly_invitee_uri, 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture');
 });
+
+test('verified booking repairs missing source only on the automation-owned deal', async () => {
+  const f = fixture();
+  f.deals.set('100', { id: '100', properties: { [CONTACT_KEY_PROPERTY]: '1' } });
+  await f.ensure('100');
+  assert.equal(f.deals.get('100').properties.deal_source, 'PR');
+  f.deals.get('100').properties.deal_source = 'Referral';
+  await f.ensure('100');
+  assert.equal(f.deals.get('100').properties.deal_source, 'Referral');
+});

@@ -29,7 +29,7 @@ class DemoRequestDeals {
 
   async readDeal(id, unique = false) {
     try {
-      return await this.request(`/crm/v3/objects/deals/${encodeURIComponent(id)}?properties=${CONTACT_KEY_PROPERTY},hubspot_owner_id,dealname,description${unique ? `&idProperty=${CONTACT_KEY_PROPERTY}` : ''}`);
+      return await this.request(`/crm/v3/objects/deals/${encodeURIComponent(id)}?properties=${CONTACT_KEY_PROPERTY},hubspot_owner_id,dealname,description,deal_source,calendly_invitee_uri${unique ? `&idProperty=${CONTACT_KEY_PROPERTY}` : ''}`);
     } catch (error) {
       if (unique && error.statusCode === 404) return null;
       throw error;
@@ -153,6 +153,19 @@ class DemoRequestDeals {
     if (!/^\d+$/.test(String(deal.id)) || deal.archived) throw new Error('demo_request_deal_unavailable');
     this.logger.info?.('demo_deal_creation', { action, contactId: String(contactId), dealId: String(deal.id), bookingUri, reason: 'confirmed_website_booking' });
     await saveDeal(String(deal.id));
+    // Only repair attribution on this automation's own opportunity, with the
+    // booking evidence that authorized this run. Preserve manually set sources.
+    if (deal.properties?.[CONTACT_KEY_PROPERTY] === String(contactId)) {
+      const properties = {
+        ...(!deal.properties.deal_source ? { deal_source: 'PR' } : {}),
+        ...(!deal.properties.calendly_invitee_uri ? { calendly_invitee_uri: bookingUri } : {}),
+      };
+      if (Object.keys(properties).length) {
+        await this.request(`/crm/v3/objects/deals/${deal.id}`, { method: 'PATCH', body: { properties } });
+        deal.properties = { ...deal.properties, ...properties };
+      }
+    }
+
     await this.request(`/crm/v4/objects/deals/${deal.id}/associations/default/contacts/${contactId}`, { method: 'PUT' });
     if (company.id) {
       await this.request(`/crm/v4/objects/contacts/${contactId}/associations/default/companies/${company.id}`, { method: 'PUT' });

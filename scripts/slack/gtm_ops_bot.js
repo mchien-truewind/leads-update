@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Dedicated GTM-ops reconciler worker (consolidated from the retired gtm-ops repo).
 // Backstop to the leads-update Calendly webhook:
-//   Symptom #2: Active Pipeline deal owner = booked meeting host.
+//   Existing deals are read only; no meeting-based ownership reconciliation.
 //   Symptom #1: round-robin ownerless non-booker demo-form contacts to the AE roster.
 //
 // Runs as its OWN Railway service from this repo (process-isolated from the Slack bots so

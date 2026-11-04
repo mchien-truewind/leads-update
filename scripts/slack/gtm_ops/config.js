@@ -24,16 +24,13 @@ const AE_ROSTER = (process.env.AE_ROSTER_JSON
       { id: "93961770", name: "Andrew Moyer" },
     ]);
 
-// Former round-robin members. Open deals and demo contacts they still own are
-// reassigned onto AE_ROSTER. Other existing owners are left alone.
+// Former round-robin members. Only demo contacts they still own are reassigned.
 const REMOVED_ROUND_ROBIN_OWNER_IDS = ["93961773", "559564379"];
-const CLOSED_DEAL_STAGE_IDS = ["1166230571", "190380587"];
 
 // Don't round-robin internal/test submissions (own domain).
 const INTERNAL_EMAIL_RE = /@trytruewind\.com$/i;
 
 // How far back the reconciler looks each run.
-const MEETING_LOOKBACK_MIN = Number(process.env.MEETING_LOOKBACK_MIN || 180); // symptom #2: meetings modified in last N min
 const CONTACT_MIN_AGE_MIN = Number(process.env.CONTACT_MIN_AGE_MIN || 30);    // symptom #1: grace period before round-robin
 const CONTACT_MAX_AGE_DAYS = Number(process.env.CONTACT_MAX_AGE_DAYS || 7);   // symptom #1: don't reach back forever
 
@@ -45,9 +42,7 @@ module.exports = {
   DEMO_FORM_TOKEN,
   AE_ROSTER,
   REMOVED_ROUND_ROBIN_OWNER_IDS,
-  CLOSED_DEAL_STAGE_IDS,
   INTERNAL_EMAIL_RE,
-  MEETING_LOOKBACK_MIN,
   CONTACT_MIN_AGE_MIN,
   CONTACT_MAX_AGE_DAYS,
   DRY_RUN,

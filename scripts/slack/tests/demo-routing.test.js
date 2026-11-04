@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const { Readable } = require('node:stream');
 const { createDemoRouter, appliesToSubmission, readRegistry } = require('../demo-routing');
 const { handleDemoRoutingRequest } = require('../demo-routing-http');
-const { protectContact, protectDeal, reconcileRoutedSubmissions } = require('../demo-routing-assignment');
+const { protectContact, reconcileRoutedSubmissions } = require('../demo-routing-assignment');
 
 const registry = [{ ownerId: '40', calendlyUrl: 'https://calendly.com/account-owner/intro', slackUserId: 'UOWNER',
   hostUris: ['https://api.calendly.com/users/host'], eventTypeUris: ['https://api.calendly.com/event_types/intro'] }];
@@ -168,11 +168,6 @@ test('future submission on an old contact is protected; historical submissions a
   const contacts = [];
   await reconcileRoutedSubmissions(f.router, { async searchAll(type, body) { contacts.push(body); return []; } });
   assert.equal(contacts[0].filterGroups[0].filters[0].propertyName, 'demo_form_submission_datetime');
-});
-
-test('removed-roster cleanup cannot change a deal used by a future submission', async () => {
-  const f = fixture();
-  assert.ok(await protectDeal('30', f.router, { async batchRead() { return new Map([['10', f.state.contact.properties]]); } }));
 });
 
 test('coverage blocks activation when any open-deal owner lacks a verified mapping', async () => {

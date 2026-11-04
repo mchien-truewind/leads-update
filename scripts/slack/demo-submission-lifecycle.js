@@ -63,6 +63,9 @@ class DemoSubmissionLifecycle {
       attempts INTEGER NOT NULL DEFAULT 0, cached_properties JSONB, last_status TEXT
     )`);
     await this.pool.query("CREATE INDEX IF NOT EXISTS demo_company_enrichment_due ON demo_company_enrichment(next_check) WHERE state = 'pending'");
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_company_assignment (
+      company_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL
+    )`);
     if (this.requestDeals) await this.requestDeals.initialize();
     if (this.apolloEnricher) await this.apolloEnricher.initialize();
   }
@@ -134,7 +137,7 @@ class DemoSubmissionLifecycle {
     await this.pool.query(`INSERT INTO demo_submission_bookings (invitee_uri,email,booked_at,owner_id,details)
       VALUES ($1,$2,$3,$4,$5::jsonb) ON CONFLICT (invitee_uri) DO UPDATE SET details = EXCLUDED.details, owner_id = EXCLUDED.owner_id`,
     [payload.uri, email, bookedAt, String(filter.ownerId), JSON.stringify(details)]);
-    await this.pool.query(`UPDATE demo_submission_lifecycle SET next_check = $2
+    await this.pool.query(`UPDATE demo_submission_lifecycle SET next_check = $2, deal_next_check = 0
       WHERE email = $1 AND submitted_at <= $3 AND booked_state = 'pending'`, [email, this.now(), bookedAt]);
     return { email, bookedAt, ownerId: String(filter.ownerId), uri: payload.uri };
   }
@@ -190,30 +193,80 @@ class DemoSubmissionLifecycle {
     return (await this.pool.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 LIMIT 1', [String(contactId)])).rows.length > 0;
   }
 
+  async prepareCompany(client, row) {
+    const contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}?properties=email,company,contact_type,lifecyclestage`);
+    if (String(contact.id) !== String(row.contact_id) || contact.archived || normalizeEmail(contact.properties?.email) !== row.email) throw new Error('submission_contact_identity_invalid');
+    contact.properties.company ||= row.company_name;
+    const company = await this.requestDeals.company(contact);
+    if (!company.id) throw new Error('submission_company_required');
+    await this.hubspotRequest(`/crm/v4/objects/contacts/${row.contact_id}/associations/default/companies/${company.id}`, { method: 'PUT' });
+    if (contact.properties.lifecyclestage !== 'customer' && contact.properties.contact_type !== 'Customer') {
+      await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}`, { method: 'PATCH', body: { properties: { contact_type: 'Prospective Customer' } } });
+    }
+    await this.enqueueCompanyEnrichment(client, company.id);
+    return company;
+  }
+
+  async assignCompany(client, row, companyId, booking) {
+    const lockKey = `demo-company:${companyId}`;
+    const locked = (await client.query('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [lockKey])).rows[0]?.locked;
+    if (!locked) throw new Error('submission_company_busy');
+    try {
+      const path = `/crm/v3/objects/companies/${companyId}`;
+      const company = await this.hubspotRequest(`${path}?properties=hubspot_owner_id`);
+      if (company.archived || String(company.id) !== String(companyId)) throw new Error('submission_company_unavailable');
+      // An existing or manually selected company owner is authoritative.
+      if (company.properties?.hubspot_owner_id) return String(company.properties.hubspot_owner_id);
+      const early = booking && Number(booking.booked_at) <= Number(row.submitted_at) + WINDOW_MS;
+      if (!early && this.now() < Number(row.submitted_at) + WINDOW_MS) return null;
+      let choice = (await client.query('SELECT owner_id FROM demo_company_assignment WHERE company_id = $1', [String(companyId)])).rows[0]?.owner_id;
+      if (!choice) {
+        choice = early ? String(booking.owner_id) : RANDOM_OWNER_IDS[this.randomInt(RANDOM_OWNER_IDS.length)];
+        await client.query('INSERT INTO demo_company_assignment(company_id,owner_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [String(companyId), choice]);
+      }
+      const owner = await this.hubspotRequest(`/crm/v3/owners/${choice}`);
+      if (owner.archived !== false || String(owner.id) !== choice) throw new Error('company_owner_inactive_or_unverified');
+      await this.hubspotRequest(path, { method: 'PATCH', body: { properties: { hubspot_owner_id: choice } } });
+      const verified = await this.hubspotRequest(`${path}?properties=hubspot_owner_id`);
+      if (String(verified.properties?.hubspot_owner_id || '') !== choice) throw new Error('company_owner_verification_failed');
+      return choice;
+    } finally {
+      await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [lockKey]);
+    }
+  }
+
   async processDealRow(key) {
     if (!this.requestDeals) return null;
     const initial = (await this.pool.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
     if (!initial || Number(initial.submitted_at) < this.dealsActivatedAt) return null;
     const result = await this.withContactLock(initial.email, async client => {
       const row = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
-      // Persist a random choice before CRM writes so retries never reroll it.
-      let ownerId = row.assigned_owner;
-      if (!ownerId) {
-        ownerId = RANDOM_OWNER_IDS[this.randomInt(RANDOM_OWNER_IDS.length)];
-        await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, ownerId]);
+      // Prepare CRM identities immediately; no meeting means no opportunity.
+      const company = await this.prepareCompany(client, row);
+      const scoped = Object.create(this);
+      scoped.pool = client;
+      if (this.now() >= Number(row.submitted_at) + WINDOW_MS) await scoped.discoverBookings(row);
+      const booking = (await client.query(`SELECT b.* FROM demo_submission_bookings b
+        WHERE b.email = $1 AND b.booked_at >= $2 AND b.canceled = false
+        AND NOT EXISTS (SELECT 1 FROM demo_submission_lifecycle s WHERE s.email = $1
+          AND s.submitted_at > $2 AND s.submitted_at <= b.booked_at)
+        ORDER BY b.booked_at, b.invitee_uri LIMIT 1`, [row.email, row.submitted_at])).rows[0];
+      const ownerId = await this.assignCompany(client, row, company.id, booking);
+      if (ownerId) await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, ownerId]);
+      if (!booking) {
+        await client.query('UPDATE demo_submission_lifecycle SET deal_next_check = $2 WHERE submission_key = $1',
+          [key, Math.max(this.now() + 30000, Number(row.submitted_at) + WINDOW_MS)]);
+        return null;
       }
       const saved = row.deal_id || (await client.query(`SELECT deal_id FROM demo_submission_lifecycle
         WHERE contact_id = $1 AND deal_id IS NOT NULL ORDER BY submitted_at LIMIT 1`, [row.contact_id])).rows[0]?.deal_id;
       const deal = await this.requestDeals.ensure({ contactId: row.contact_id, email: row.email, dealId: saved,
-        companyName: row.company_name, ownerId,
+        companyName: row.company_name, ownerId: booking.owner_id, bookingUri: booking.invitee_uri,
         saveDeal: async id => client.query('UPDATE demo_submission_lifecycle SET deal_id = $2 WHERE submission_key = $1', [key, id]),
       });
-      if (deal.properties?.hubspot_owner_id && String(deal.properties.hubspot_owner_id) !== ownerId) {
-        await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, String(deal.properties.hubspot_owner_id)]);
-      }
       if (deal.company?.id) await this.enqueueCompanyEnrichment(client, deal.company.id);
       await client.query("UPDATE demo_submission_lifecycle SET deal_state = 'ready' WHERE submission_key = $1", [key]);
-      this.logger.info?.('demo_deal_decision', { contactId: row.contact_id, dealId: deal.id, reason: 'website_form_submission' });
+      this.logger.info?.('demo_deal_decision', { contactId: row.contact_id, dealId: deal.id, reason: 'confirmed_website_booking' });
       return deal;
     });
     return result;
@@ -429,21 +482,31 @@ class DemoSubmissionLifecycle {
       const early = !repeat && booking && Number(booking.booked_at) <= Number(row.submitted_at) + WINDOW_MS;
       if (!booking && this.now() < Number(row.submitted_at) + WINDOW_MS) return;
       const newer = (await client.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 AND submitted_at > $2 AND thread_root_key IS NULL LIMIT 1', [row.contact_id, row.submitted_at])).rows.length > 0;
-      let ownerId = row.assigned_owner || (!this.requestDeals && early ? booking.owner_id : null);
-      if (!ownerId) {
-        ownerId = RANDOM_OWNER_IDS[this.randomInt(RANDOM_OWNER_IDS.length)];
+      let ownerId, contact;
+      if (this.requestDeals) {
+        const company = await this.prepareCompany(client, row);
+        ownerId = await this.assignCompany(client, row, company.id, booking);
+        if (!ownerId) return;
         await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, ownerId]);
-      }
-      let contact;
-      if (newer || (row.parent_ts && !early)) {
+        // HubSpot's company-to-contact workflow owns contact inheritance.
         contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}?properties=${PROPERTIES.join(',')}`);
-        ownerId = String(contact.properties?.hubspot_owner_id || '');
-        if (!this.ownerSlackMap[ownerId] && !RANDOM_OWNER_IDS.includes(ownerId)) throw new Error('contact_owner_slack_mapping_missing');
       } else {
-        contact = await this.assignOwner(row.contact_id, ownerId);
-      }
+        ownerId = row.assigned_owner || (early ? booking.owner_id : null);
+        if (!ownerId) {
+          ownerId = RANDOM_OWNER_IDS[this.randomInt(RANDOM_OWNER_IDS.length)];
+          await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, ownerId]);
+        }
 
-      const mention = this.ownerSlackMap[ownerId] ? `<@${this.ownerSlackMap[ownerId]}>` : (ownerId === '84547076' ? 'Sarah Elix' : 'Xavier Marco');
+        if (newer || (row.parent_ts && !early)) {
+          contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}?properties=${PROPERTIES.join(',')}`);
+          ownerId = String(contact.properties?.hubspot_owner_id || '');
+          if (!this.ownerSlackMap[ownerId] && !RANDOM_OWNER_IDS.includes(ownerId)) throw new Error('contact_owner_slack_mapping_missing');
+        } else {
+          contact = await this.assignOwner(row.contact_id, ownerId);
+        }
+
+      }
+      const mention = this.ownerSlackMap[ownerId] ? `<@${this.ownerSlackMap[ownerId]}>` : (ownerId === '84547076' ? 'Sarah Elix' : ownerId === '89305622' ? 'Xavier Marco' : `HubSpot owner ${ownerId}`);
       let parentTs = row.parent_ts;
       if (row.parent_state === 'pending' || (early && row.parent_ts)) {
         const message = buildMessage(contact, { slackUserId: this.ownerSlackMap[ownerId] });

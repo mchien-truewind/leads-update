@@ -195,13 +195,10 @@ test('linking a newly known company clears only the generated missing-company ti
   assert.equal(f.deals.get('100').properties.description, 'Created from a confirmed website demo booking.');
 });
 
-test('form creation does not require a booking and sets owner atomically', async () => {
+test('form alone cannot create a deal even with an owner', async () => {
   const f = fixture();
-  await f.service.ensure({ contactId:'1', email:'lead@gmail.com', ownerId:'102500864', saveDeal: async()=>{} });
-  const properties = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST').body.properties;
-  assert.equal(properties.deal_source,'inbound');
-  assert.equal(properties.hubspot_owner_id,'102500864');
-  assert.equal(properties.calendly_invitee_uri,undefined);
+  await assert.rejects(f.service.ensure({ contactId:'1', email:'lead@gmail.com', ownerId:'89305622', saveDeal: async()=>{} }), /confirmed_booking_required/);
+  assert.equal(f.calls.length,0);
 });
 
 test('verified booking repairs missing source only on the automation-owned deal', async () => {

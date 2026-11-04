@@ -26,7 +26,7 @@ _REJECTION_REASONS = {
 }
 
 
-def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provider=None, approval=None, private_claim=None, disposition_policy=None, notes_enabled=False):
+def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provider=None, approval=None, private_claim=None, disposition_policy=None, notes_enabled=False, permanent=False):
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     auth = Authenticate(public_key, clock)
     reported_rejections = set()
@@ -70,6 +70,27 @@ def create_app(*, signing_key, public_key, scope, clock=time.time, lemlist_provi
             if reason not in reported_rejections:
                 reported_rejections.add(reason)
                 print(json.dumps({'event': 'nooks_verification_rejected', 'reason': reason}), flush=True)
+            raise HTTPException(403, 'Event rejected.') from None
+
+    @app.post('/v1/ingress/ready')
+    async def ingress_ready(request: Request):
+        raw = await body(request)
+        await authenticated(request, raw)
+        return {'ready': permanent and bool(signing_key) and not raw}
+
+    @app.post('/v1/ingress/verify')
+    async def ingress_verify(request: Request):
+        raw = await body(request)
+        try:
+            signature = header(request, 'x-webhook-signature', 200)
+        except ValueError:
+            raise HTTPException(403, 'Request rejected.') from None
+        await authenticated(request, raw, signature)
+        if not permanent or not signing_key:
+            raise HTTPException(503, 'Ingress unavailable.')
+        try:
+            return {'event': verify_nooks(raw, signature, signing_key, scope, clock(), permanent=True)}
+        except Exception:
             raise HTTPException(403, 'Event rejected.') from None
 
     completion_lock=threading.Lock()
@@ -173,7 +194,7 @@ def from_environment():
     from .task_notes import enabled
     app = create_app(signing_key=os.environ.get('NOOKS_SIGNING_KEY', ''),
         public_key=os.environ.get('RECEIVER_PUBLIC_KEY', ''), scope=scope,
-        lemlist_provider=provider,approval=approval,private_claim=claim,disposition_policy=policy,notes_enabled=enabled(os.environ))
+        lemlist_provider=provider,approval=approval,private_claim=claim,disposition_policy=policy,notes_enabled=enabled(os.environ), permanent=os.environ.get('NOOKS_PERMANENT_INGRESS') == 'true')
     from .secondary import configured as secondary_configured, open_secondary, settings
     from .retarget import configured as retarget_configured, capture_scope
     secondary = secondary_configured(os.environ, retarget_configured(os.environ), provider.scope if provider else None)

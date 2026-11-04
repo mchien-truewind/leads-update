@@ -45,7 +45,7 @@ class DemoRequestDeals {
       if (!Array.isArray(page.results)) throw new Error('demo_request_company_associations_invalid');
       for (const row of page.results) {
         if (!/^\d+$/.test(String(row.toObjectId))) throw new Error('demo_request_company_id_invalid');
-        companies.set(String(row.toObjectId), companies.get(String(row.toObjectId)) || row.associationTypes?.some(t => t.category === 'HUBSPOT_DEFINED' && t.typeId === 279) || false);
+        companies.set(String(row.toObjectId), companies.get(String(row.toObjectId)) || row.associationTypes?.some(t => t.category === 'HUBSPOT_DEFINED' && t.typeId === 1) || false);
       }
       after = page.paging?.next?.after;
       if (after != null && seen.has(String(after))) throw new Error('demo_request_company_cursor_repeated');

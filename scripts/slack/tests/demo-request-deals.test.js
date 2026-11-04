@@ -258,3 +258,51 @@ test('existing customers retain their classifications', async () => {
   await service.classify({id:'1',properties:{lifecyclestage:'customer',contact_type:'Customer'}},'2');
   assert.ok(calls.every(c=>c.options?.method !== 'PATCH'));
 });
+
+for (const reverse of [false, true]) {
+  test(`company resolution selects the primary among ordinary associations (reverse=${reverse})`, async () => {
+    const rows = [
+      { toObjectId: '2', associationTypes: [{ category: 'HUBSPOT_DEFINED', typeId: 279 }] },
+      { toObjectId: '3', associationTypes: [{ category: 'HUBSPOT_DEFINED', typeId: 279 }, { category: 'HUBSPOT_DEFINED', typeId: 1 }] },
+    ];
+    if (reverse) rows.reverse();
+    const calls = [];
+    const service = new DemoRequestDeals({ request: async path => {
+      calls.push(path);
+      if (path.includes('/associations/companies?')) return { results: rows };
+      assert.equal(path, '/crm/v3/objects/companies/3?properties=name,domain');
+      return { id: '3', properties: { name: 'Primary Company' } };
+    } });
+    assert.deepEqual(await service.company({ id: '1', properties: {} }), { id: '3', name: 'Primary Company' });
+    assert.equal(calls.length, 2);
+  });
+}
+
+for (const primaryCount of [0, 2]) {
+  test(`company resolution leaves ambiguous associations for review (${primaryCount} primaries)`, async () => {
+    const service = new DemoRequestDeals({ request: async path => {
+      assert.ok(path.includes('/associations/companies?'), 'must not search, create, or pick a company');
+      return { results: ['2', '3'].map(toObjectId => ({ toObjectId, associationTypes: [
+        { category: 'HUBSPOT_DEFINED', typeId: 279 },
+        ...(primaryCount ? [{ category: 'HUBSPOT_DEFINED', typeId: 1 }] : []),
+      ] })) };
+    } });
+    assert.deepEqual(await service.company({ id: '1', properties: { email: 'lead@example.com' } }),
+      { reason: 'multiple companies; primary company needs review' });
+  });
+}
+
+test('company resolution retains a primary label across paginated duplicate associations', async () => {
+  const service = new DemoRequestDeals({ request: async path => {
+    if (path.includes('after=next')) return { results: [
+      { toObjectId: '3', associationTypes: [{ category: 'HUBSPOT_DEFINED', typeId: 279 }] },
+      { toObjectId: '2', associationTypes: [{ category: 'HUBSPOT_DEFINED', typeId: 279 }] },
+    ] };
+    if (path.includes('/associations/companies?')) return { results: [
+      { toObjectId: '3', associationTypes: [{ category: 'HUBSPOT_DEFINED', typeId: 1 }] },
+    ], paging: { next: { after: 'next' } } };
+    assert.equal(path, '/crm/v3/objects/companies/3?properties=name,domain');
+    return { id: '3', properties: { name: 'Primary Company' } };
+  } });
+  assert.equal((await service.company({ id: '1', properties: {} })).id, '3');
+});

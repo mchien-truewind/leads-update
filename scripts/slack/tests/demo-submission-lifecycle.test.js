@@ -31,7 +31,7 @@ before(async () => {
     return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length };
   };
   pool = { query, async connect() { return { query, release() {} }; } };
-  lifecycle = new DemoSubmissionLifecycle({ pool, refreshOwners: async () => {}, env: { SLACK_BOT_TOKEN: 'test', SLACK_TO_HUBSPOT_OWNER_JSON: JSON.stringify({ UOCEAN: { id: '102500864' }, USUDARSHAN: { id: '102500801' } }) }, now: () => time, randomInt: () => 1,
+  lifecycle = new DemoSubmissionLifecycle({ pool, refreshOwners: async () => {}, env: { SLACK_BOT_TOKEN: 'test', SLACK_TO_HUBSPOT_OWNER_JSON: JSON.stringify({ U0AKMHVCJMA: { id: '89305622' }, U09QC3B292R: { id: '84547076' } }) }, now: () => time, randomInt: () => 1,
     logger: { error() {} },
     async hubspotRequest(path, options) {
       if (path.startsWith('/crm/v3/owners/')) return { id: path.split('/').pop(), archived: false };
@@ -93,14 +93,14 @@ test('five-minute deadline persists; random owner is assigned before parent and 
   assert.equal(posts.length, 0);
   time++;
   await lifecycle.tick();
-  assert.equal(contactOwner, '102500864');
-  assert.deepEqual(assignments, ['102500864']);
+  assert.equal(contactOwner, '89305622');
+  assert.deepEqual(assignments, ['89305622']);
   assert.equal(posts.length, 2);
-  assert.ok(posts[0].text.startsWith('<@UOCEAN>\nNew DEMO Submission\nNikhil Goel'));
+  assert.ok(posts[0].text.startsWith('<@U0AKMHVCJMA>\nNew DEMO Submission\nNikhil Goel'));
   for (const field of ['ERP: QBO', 'Job Title: Head of Operations', 'How did you hear about us?', 'Finance team size:', 'Phone:', 'Date Created: 10/30/26']) assert.ok(posts[0].text.includes(field));
   assert.equal(posts[0].channel, CHANNEL_ID);
   assert.equal(posts[1].thread_ts, '1.001');
-  assert.match(posts[1].text, /<@UOCEAN>.*did NOT book/);
+  assert.match(posts[1].text, /<@U0AKMHVCJMA>.*did NOT book/);
   await lifecycle.enqueue({ ...formEvent, occurredAt: time });
   time += WINDOW_MS;
   await lifecycle.tick();
@@ -135,8 +135,8 @@ test('late booking replies on original thread with meeting details and verified 
   await lifecycle.tick();
   assert.equal(posts.length, 3);
   assert.equal(posts[2].thread_ts, posts[1].thread_ts);
-  assert.match(posts[2].text, /<@UOCEAN>.*after the first five minutes/);
-  assert.equal(contactOwner, '102500864');
+  assert.match(posts[2].text, /<@U0AKMHVCJMA>.*after the first five minutes/);
+  assert.equal(contactOwner, '89305622');
   for (const detail of ['Truewind Demo', 'Sarah Elix', '2026-11-04T15:00:00.000Z', '2026-11-04T15:30:00.000Z', 'https://zoom.us/j/demo']) assert.ok(posts[2].text.includes(detail));
   await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
   await lifecycle.tick();
@@ -170,10 +170,10 @@ test('restart recovers queued deadline and delayed late webhook retains random a
   await lifecycle.initialize();
   await lifecycle.tick();
   assert.equal(posts.length, 3);
-  assert.match(posts[0].text, /^<@UOCEAN>/);
-  assert.match(posts[1].text, /^<@UOCEAN>.*did NOT book/);
-  assert.match(posts[2].text, /^<@UOCEAN>.*booked a meeting/);
-  assert.equal(contactOwner, '102500864');
+  assert.match(posts[0].text, /^<@U0AKMHVCJMA>/);
+  assert.match(posts[1].text, /^<@U0AKMHVCJMA>.*did NOT book/);
+  assert.match(posts[2].text, /^<@U0AKMHVCJMA>.*booked a meeting/);
+  assert.equal(contactOwner, '89305622');
 });
 
 test('provider errors never become a false no-booking alert', async () => {
@@ -252,16 +252,16 @@ test('Calendly lookup filters invitee email and creation time and follows pagina
   }
 });
 
-test('Sudarshan is also an eligible random owner', async () => {
+test('Sarah is also an eligible random owner', async () => {
   const pick = lifecycle.randomInt;
   lifecycle.randomInt = () => 0;
   try {
     await lifecycle.enqueue(formEvent);
     time += WINDOW_MS;
     await lifecycle.tick();
-    assert.equal(contactOwner, '102500801');
-    assert.match(posts[0].text, /^<@USUDARSHAN>/);
-    assert.match(posts[1].text, /^<@USUDARSHAN>/);
+    assert.equal(contactOwner, '84547076');
+    assert.match(posts[0].text, /^<@U09QC3B292R>/);
+    assert.match(posts[1].text, /^<@U09QC3B292R>/);
   } finally { lifecycle.randomInt = pick; }
 });
 
@@ -311,7 +311,7 @@ test('a delayed early booking corrects the existing thread rather than creating 
   assert.match(posts[2].text, /within the first five minutes \(booking confirmation arrived later\)/);
   assert.equal(updates.length, 1);
   assert.equal(updates[0].ts, '1.001');
-  assert.match(updates[0].text, /^<@UOCEAN>/);
+  assert.match(updates[0].text, /^<@U0AKMHVCJMA>/);
   assert.match(updates[0].text, /within five minutes/);
 });
 
@@ -334,7 +334,7 @@ test('definite Slack rejection retries without reassigning the random owner or r
     await lifecycle.tick();
     assert.equal(posts.length, 2);
     assert.equal(posts[1].thread_ts, '1.001');
-    assert.deepEqual(assignments, ['102500864']);
+    assert.deepEqual(assignments, ['89305622']);
   } finally { lifecycle.fetchImpl = send; }
 });
 
@@ -447,7 +447,7 @@ test('re-entering the same email to book replies in the original thread instead 
   assert.match(posts[2].text, /This lead booked a meeting\./);
   assert.match(posts[2].text, /Sarah Elix/);
   assert.equal(posts.filter(m => !m.thread_ts).length, 1);
-  assert.equal(contactOwner, '102500864');
+  assert.equal(contactOwner, '89305622');
   const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
   assert.equal(rows[1].thread_root_key, rows[0].submission_key);
   assert.equal(rows[1].parent_ts, rows[0].parent_ts);
@@ -616,7 +616,7 @@ test('confirmed booking creates one deal before the Slack deadline and retries r
   time += WINDOW_MS;
   await lifecycle.tick();
   assert.equal(posts.length, 1);
-  assert.equal(f.ensured[0].ownerId, '102500864');
+  assert.equal(f.ensured[0].ownerId, '89305622');
   assert.equal(f.owners.length, 0);
 });
 
@@ -681,7 +681,7 @@ test('booking reconciliation never changes a form deal owner', async () => {
   const b = booking();
   await lifecycle.reconcileBooking({ email:b.payload.email, contactId:'123', submittedAt, bookedAt:submittedAt+1000, ownerId:'84547076' });
   assert.equal(f.owners.length,0);
-  assert.equal((await row()).assigned_owner,'102500864');
+  assert.equal((await row()).assigned_owner,'89305622');
 });
 
 

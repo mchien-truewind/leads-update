@@ -6,7 +6,7 @@ const { DemoRequestDeals } = require('./demo-request-deals');
 const { ApolloCompanyEnricher } = require('./apollo-company-enrichment');
 
 const WINDOW_MS = 5 * 60 * 1000;
-const RANDOM_OWNER_IDS = ['102500801', '102500864']; // Sudarshan Sundar, Ocean Marquez
+const RANDOM_OWNER_IDS = ['84547076', '89305622']; // Sarah Elix, Xavier Marco
 const PROPERTIES = ['firstname', 'lastname', 'email', 'erp', 'jobtitle', 'how_did_you_hear_about_us', 'finance_team_size', 'phone', 'createdate', 'hubspot_owner_id'];
 const ms = value => /^\d+$/.test(String(value)) ? Number(value) : Date.parse(value);
 const normalizeEmail = value => String(value || '').trim().toLowerCase();
@@ -443,7 +443,7 @@ class DemoSubmissionLifecycle {
         contact = await this.assignOwner(row.contact_id, ownerId);
       }
 
-      const mention = this.ownerSlackMap[ownerId] ? `<@${this.ownerSlackMap[ownerId]}>` : (ownerId === '102500801' ? 'Sudarshan Sundar' : 'Ocean Marquez');
+      const mention = this.ownerSlackMap[ownerId] ? `<@${this.ownerSlackMap[ownerId]}>` : (ownerId === '84547076' ? 'Sarah Elix' : 'Xavier Marco');
       let parentTs = row.parent_ts;
       if (row.parent_state === 'pending' || (early && row.parent_ts)) {
         const message = buildMessage(contact, { slackUserId: this.ownerSlackMap[ownerId] });

@@ -169,6 +169,7 @@ async function testReadOnlyDealPropertiesAreRejectedBeforeWrite() {
 
 async function testLowLevelHubSpotWritesRequireAuthorization() {
   const result = await executeTool('hubspot_create_deal', {
+      contact_id: '1001', company_id: '2001',
     dealname: 'Unauthorized Deal',
     dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
   });
@@ -454,6 +455,7 @@ async function testCreateDealToolDefaultsOwnerToRequester() {
   const calls = [];
   __setHubSpotRequestOverrideForTests(async (endpoint, method = 'GET', body = null) => {
     calls.push({ endpoint, method, body });
+    if (endpoint.includes('/associations/')) return { results: [] };
     if (endpoint.includes('/properties/')) {
       return { name: endpoint.split('/').pop(), type: 'string', fieldType: 'text', modificationMetadata: { readOnlyValue: false, readOnlyDefinition: false } };
     }
@@ -465,6 +467,7 @@ async function testCreateDealToolDefaultsOwnerToRequester() {
   try {
     // Free-form create by Alex Lee (U04BPMPR29G) with no explicit owner.
     await executeTool('hubspot_create_deal', {
+      contact_id: '1001', company_id: '2001',
       dealname: 'Acme Expansion',
       dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
       deal_source: 'Referral',
@@ -476,6 +479,7 @@ async function testCreateDealToolDefaultsOwnerToRequester() {
     // An explicitly provided owner is respected (not overwritten by the requester).
     calls.length = 0;
     await executeTool('hubspot_create_deal', {
+      contact_id: '1001', company_id: '2001',
       dealname: 'Acme Expansion 2',
       dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
       deal_source: 'Referral',
@@ -524,6 +528,7 @@ async function testCreateDealToolBlocksOpenDuplicate() {
   try {
     // Open duplicate exists → blocked, no deal created.
     const blocked = await executeTool('hubspot_create_deal', {
+      contact_id: '1001', company_id: '2001',
       dealname: 'Acme New Deal', dealstage: TRUEWIND_HUBSPOT.mqlDealStage, deal_source: 'Referral', company_name: 'Acme',
     }, { slack_user_id: 'U04BPMPR29G', channel_id: 'C_TEST' });
     const parsed = JSON.parse(blocked);
@@ -534,6 +539,7 @@ async function testCreateDealToolBlocksOpenDuplicate() {
     // "override" in the context bypasses the guard → deal is created.
     calls.length = 0;
     const created = await executeTool('hubspot_create_deal', {
+      contact_id: '1001', company_id: '2001',
       dealname: 'Acme New Deal', dealstage: TRUEWIND_HUBSPOT.mqlDealStage, deal_source: 'Referral',
       company_name: 'Acme', context: 'create it anyway, override',
     }, { slack_user_id: 'U04BPMPR29G', channel_id: 'C_TEST' });

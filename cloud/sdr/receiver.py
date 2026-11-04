@@ -150,6 +150,10 @@ class Store:
                     'held': bool(db.execute('SELECT held FROM scope WHERE singleton=1').fetchone()[0])}
 
 
+class RejectedEvent(ValueError):
+    pass
+
+
 class Broker:
     def __init__(self, url, key, *, transport=None, clock=time.time, contact_id=None):
         u = urlsplit(url)
@@ -162,7 +166,7 @@ class Broker:
         self.url, self.key, self.transport, self.clock = url.rstrip('/'), key, transport, clock
 
     async def call(self, path, raw=b'', nooks_signature=''):
-        if path not in ('/v1/ready', '/v1/nooks/verify', '/v1/lemlist/inspect', '/v1/lemlist/complete', '/v1/lemlist/note'):
+        if path not in ('/v1/ingress/ready', '/v1/ingress/verify', '/v1/ready', '/v1/nooks/verify', '/v1/lemlist/inspect', '/v1/lemlist/complete', '/v1/lemlist/note'):
             raise ValueError('unknown broker operation')
         is_completion = path.startswith('/v1/lemlist/')
         path = self.prefix+path
@@ -173,21 +177,30 @@ class Broker:
         async def exchange():
             async with httpx.AsyncClient(transport=self.transport, timeout=55 if is_completion else 5, follow_redirects=False, trust_env=False) as client:
                 async with client.stream('POST', self.url+path, content=raw, headers=headers) as response:
+                    if response.status_code == 403 and path == '/v1/ingress/verify':
+                        raise RejectedEvent('Event rejected.')
                     if response.status_code != 200:
                         raise ValueError('broker unavailable or rejected')
                     result = bytearray()
                     async for chunk in response.aiter_bytes():
                         result.extend(chunk)
-                        if len(result) > 4096: raise ValueError('oversize broker result')
+                        if len(result) > 65536: raise ValueError('oversize broker result')
             return json.loads(result)
         return await asyncio.wait_for(exchange(), 60 if is_completion else 6)
 
 
-def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time, worker=None, secondary=None):
-    store.configure_registration(registration_id, deadline, clock())
+def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time, worker=None, secondary=None, permanent=False, forward_url='', forward_token=''):
+    if not permanent:
+        store.configure_registration(registration_id, deadline, clock())
+    else:
+        from .inbox import Inbox
+        inbox = Inbox(store)
     setup_diagnostics=set()
     ingress_diagnostics=set()
-    workers=[w for w in (worker, secondary[2] if secondary else None) if w is not None]
+    workers=[] if permanent else [w for w in (worker, secondary[2] if secondary else None) if w is not None]
+    if permanent and (forward_url or forward_token):
+        from .inbox import Forwarder
+        workers.append(Forwarder(inbox, forward_url, forward_token))
     @asynccontextmanager
     async def lifespan(app):
         tasks=[asyncio.create_task(w.run()) for w in workers]
@@ -200,7 +213,7 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
 
     @app.get('/healthz')
     async def health():
-        return {'ok': True, 'role': 'sdr-test' if worker else 'capture-only', 'revision': os.environ.get('RAILWAY_GIT_COMMIT_SHA', 'unknown')}
+        return {'ok': True, 'role': 'permanent-ingress' if permanent else ('sdr-test' if worker else 'capture-only'), 'revision': os.environ.get('RAILWAY_GIT_COMMIT_SHA', 'unknown')}
 
     @app.get('/identity')
     async def identity():
@@ -208,6 +221,14 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
 
     @app.get('/ready')
     async def ready():
+        if permanent:
+            try:
+                verified = (await broker.call('/v1/ingress/ready')).get('ready') is True
+                summary = await asyncio.to_thread(inbox.summary)
+                if verified: return {'ready': True, 'mode': 'permanent', **summary}
+            except Exception:
+                pass
+            raise HTTPException(503, 'Ingress unavailable.')
         try: verified = (await broker.call('/v1/ready')).get('ready') is True
         except Exception: verified = False
         extra={}
@@ -225,6 +246,19 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
     @app.post('/api/sdr/webhooks/nooks')
     async def webhook(request: Request):
         raw = await body(request)
+        if permanent:
+            try:
+                signature = header(request, 'x-webhook-signature', 200)
+            except ValueError:
+                raise HTTPException(401, 'Signature required.') from None
+            try:
+                verified = await broker.call('/v1/ingress/verify', raw, signature)
+                outcome = await asyncio.to_thread(inbox.capture, verified['event'], clock())
+                return {'status': outcome}
+            except RejectedEvent:
+                raise HTTPException(403, 'Event rejected.') from None
+            except Exception:
+                raise HTTPException(503, 'Receipt unavailable; retry.') from None
         stage = 'signature_header'
         selected_store, selected_broker = store, broker
         try:
@@ -345,7 +379,8 @@ def from_environment():
             bind_window(store, selected, reopen)
             bind_window(child_store, secondary_scope, reopen)
         app = create_app(store, broker, worker=worker, secondary=secondary, registration_id=os.environ.get('REGISTRATION_ID', ''),
-            deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')))
+            deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')), permanent=os.environ.get('NOOKS_PERMANENT_INGRESS') == 'true',
+            forward_url=os.environ.get('NOOKS_FORWARD_URL', ''), forward_token=os.environ.get('NOOKS_FORWARD_TOKEN', ''))
         app.state.owner_lock = lock  # Single owner for the lifetime of this process.
         return app
     except BaseException:

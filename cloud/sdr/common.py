@@ -95,9 +95,9 @@ def timestamp(value):
     return dt.timestamp()
 
 
-def verify_nooks(raw, signature, key, scope, now, *, window=None):
+def verify_nooks(raw, signature, key, scope, now, *, window=None, permanent=False):
     allowed = window.allows(scope,now) if window is not None else scope['not_before'] <= now < scope['expires_at']
-    if not key or not allowed:
+    if not key or (not permanent and not allowed):
         raise ValueError('capture not enabled')
     parts = {}
     for item in signature.split(','):
@@ -114,6 +114,13 @@ def verify_nooks(raw, signature, key, scope, now, *, window=None):
         raise ValueError('signature mismatch')
     event = json.loads(raw, object_pairs_hook=unique)
     call = event['callData']
+    if permanent:
+        if event['event'] != 'call.logged' or call['workspaceId'] != scope['workspace_id']:
+            raise ValueError('workspace mismatch or unsupported event')
+        call_id = call['callId']
+        if not isinstance(call_id, str) or not 1 <= len(call_id) <= 200:
+            raise ValueError('invalid call identity')
+        return {'workspace_id': scope['workspace_id'], 'call_id': call_id, 'payload': event}
     # Fixed failures distinguish a valid signature on a different contact from
     # signature failures. No request values are included in these exceptions.
     for actual, expected, reason in (

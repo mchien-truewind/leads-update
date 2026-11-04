@@ -16,24 +16,6 @@ async function protectContact(contact, router, { dryRun = false, isContactManage
   }
 }
 
-async function protectDeal(dealId, router, crm) {
-  if (!router) return false;
-  const contactIds = await router.associations('deals', dealId, 'contacts');
-  const contacts = await crm.batchRead('contacts', contactIds, ['email', SUBMISSION_PROPERTY]);
-  for (const contactId of contactIds) {
-    const properties = contacts.get(String(contactId));
-    if (!properties) throw new Error('assignment_contact_read_incomplete');
-    if (!appliesToSubmission(properties[SUBMISSION_PROPERTY], router.env)) continue;
-    const route = await router.resolve({ email: properties.email, contactId: String(contactId) });
-    if (route.status === 'unresolved') {
-      console.error('assignment_routing_unresolved', { contactId: String(contactId), dealId: String(dealId) });
-      return true;
-    }
-    if (route.status === 'existing_deal' && route.dealId === String(dealId)) return true;
-  }
-  return false;
-}
-
 async function reconcileRoutedSubmissions(router, crm, { dryRun = false, isContactManaged = async () => false } = {}) {
   if (!router) return { checked: 0, protected: 0 };
   const contacts = await crm.searchAll('contacts', {
@@ -45,4 +27,4 @@ async function reconcileRoutedSubmissions(router, crm, { dryRun = false, isConta
   return { checked: contacts.length, protected: protectedCount };
 }
 
-module.exports = { protectContact, protectDeal, reconcileRoutedSubmissions };
+module.exports = { protectContact, reconcileRoutedSubmissions };

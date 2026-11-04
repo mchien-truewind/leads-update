@@ -805,6 +805,7 @@ async function createNote({ body, dealId, contactId }) {
 }
 
 async function createDeal({ payload, scheduledEvent, contactId, companyId, companyName, ownerId, hostUserUri, eventTypeUri }) {
+  if (!contactId || !companyId || !ownerId) throw new Error('deal_contact_company_owner_required');
   const eventUri = getScheduledEventUri(payload);
   const inviteeUri = getInviteeUri(payload);
   const startTime = getEventStart(scheduledEvent);
@@ -819,6 +820,10 @@ async function createDeal({ payload, scheduledEvent, contactId, companyId, compa
     }
   };
   let deal = await lookup();
+  if (!deal) {
+    const { findOpenDemoDeal } = require('./demo-open-deal');
+    deal = await findOpenDemoDeal({ request: hubspotRequest, contactId, companyId, pipelineId: CONFIG.pipelineId });
+  }
   if (!deal) {
     try {
       deal = await hubspotRequest('/crm/v3/objects/deals', {
@@ -929,7 +934,20 @@ async function handleInviteeCreated(payload, scheduledEvent, filter, options = {
   }
   // The form lifecycle owns company creation for managed submissions. Its
   // direct unique-key lookup also works before a new company is searchable.
-  const company = formDeal ? (formDeal.company ? { id: formDeal.company.id, properties: { name: formDeal.company.name } } : null) : await ensureCompany({ payload });
+  let company = formDeal ? (formDeal.company ? { id: formDeal.company.id, properties: { name: formDeal.company.name } } : null) : await ensureCompany({ payload });
+  const { DemoRequestDeals } = require('./demo-request-deals');
+  const records = new DemoRequestDeals({ request: hubspotRequest });
+  if (!company) {
+    const fullContact = await hubspotRequest(`/crm/v3/objects/contacts/${contact.id}?properties=email,company`);
+    fullContact.properties.company ||= getCompanyNameFromPayload(payload);
+    const resolved = await records.company(fullContact);
+    if (!resolved.id) throw new Error('calendly_company_required: ' + resolved.reason);
+    company = { id: resolved.id, properties: { name: resolved.name } };
+  }
+  if (!deal) {
+    const fullContact = await hubspotRequest(`/crm/v3/objects/contacts/${contact.id}?properties=contact_type,lifecyclestage`);
+    await records.classify(fullContact, company.id);
+  }
   const companyName = company?.properties?.name || getCompanyIdentityFromPayload(payload).name;
   if (company) await associate('companies', company.id, 'contacts', contact.id);
 
@@ -941,7 +959,6 @@ async function handleInviteeCreated(payload, scheduledEvent, filter, options = {
       calendly_event_type_uri: filter.eventTypeUri,
       calendly_host_user_uri: filter.hostUserUri,
     };
-    if (!hasOwner(deal) && clean(filter.ownerId)) properties.hubspot_owner_id = filter.ownerId;
     if (foundByOldInvitee && !await options.demoLifecycle?.hasRequestDeal?.(deal.id)) properties.dealstage = CONFIG.newDealStageId;
     await hubspotRequest(`/crm/v3/objects/deals/${deal.id}`, {
       method: 'PATCH',

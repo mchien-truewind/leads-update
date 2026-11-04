@@ -9,7 +9,7 @@ const submittedAt = Date.parse('2026-10-30T12:00:00Z');
 const formEvent = { objectId: 123, propertyValue: String(submittedAt), occurredAt: submittedAt };
 const hostUri = 'https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01';
 const eventType = [...CONFIG.allowedEventTypeUris][0];
-let db, pool, lifecycle, time, posts, updates, assignments, contactOwner, bookings, discoverCalls, failDiscovery, failPost;
+let db, pool, lifecycle, time, posts, updates, assignments, contactOwner, bookings, discoverCalls, failDiscovery, failPost, companyOwner, companyAssignments;
 
 function booking(seconds = 100, ownerId = '84547076', id = 'one') {
   return {
@@ -31,14 +31,18 @@ before(async () => {
     return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length };
   };
   pool = { query, async connect() { return { query, release() {} }; } };
-  lifecycle = new DemoSubmissionLifecycle({ pool, refreshOwners: async () => {}, env: { SLACK_BOT_TOKEN: 'test' }, now: () => time, randomInt: () => 1,
+  lifecycle = new DemoSubmissionLifecycle({ pool, refreshOwners: async () => {}, env: { SLACK_BOT_TOKEN: 'test', SLACK_TO_HUBSPOT_OWNER_JSON: JSON.stringify({ U0AKMHVCJMA: { id: '89305622' }, U09QC3B292R: { id: '84547076' } }) }, now: () => time, randomInt: () => 1,
     logger: { error() {} },
     async hubspotRequest(path, options) {
       if (path.startsWith('/crm/v3/owners/')) return { id: path.split('/').pop(), archived: false };
+      if (path.startsWith('/crm/v3/objects/companies/200')) {
+        if (options?.method === 'PATCH') { companyOwner = options.body.properties.hubspot_owner_id; companyAssignments.push(companyOwner); }
+        return { id:'200', properties:{hubspot_owner_id:companyOwner} };
+      }
+      if (options?.method === 'PUT') return {};
       if (path.endsWith('/search')) return { results: [] };
       if (options?.method === 'PATCH') {
-        contactOwner = options.body.properties.hubspot_owner_id;
-        assignments.push(contactOwner);
+        if ('hubspot_owner_id' in options.body.properties) { contactOwner = options.body.properties.hubspot_owner_id; assignments.push(contactOwner); }
         return {};
       }
       return { id: '123', properties: { email: 'nik@squadtalent.xyz', firstname: 'Nikhil', lastname: 'Goel',
@@ -68,9 +72,10 @@ before(async () => {
   await lifecycle.initialize();
 });
 beforeEach(async () => {
-  await db.exec('TRUNCATE demo_submission_lifecycle, demo_submission_bookings, demo_company_enrichment');
+  await db.exec('TRUNCATE demo_submission_lifecycle, demo_submission_bookings, demo_company_enrichment, demo_company_assignment');
   time = submittedAt;
   posts = []; updates = []; assignments = []; bookings = []; discoverCalls = [];
+  companyOwner = ''; companyAssignments = [];
   contactOwner = '91143842'; failDiscovery = false; failPost = false;
   delete lifecycle.requestDeals;
   delete lifecycle.dealsActivatedAt;
@@ -311,7 +316,7 @@ test('a delayed early booking corrects the existing thread rather than creating 
   assert.match(posts[2].text, /within the first five minutes \(booking confirmation arrived later\)/);
   assert.equal(updates.length, 1);
   assert.equal(updates[0].ts, '1.001');
-  assert.match(updates[0].text, /^<@U09QC3B292R>/);
+  assert.match(updates[0].text, /^<@U0AKMHVCJMA>/);
   assert.match(updates[0].text, /within five minutes/);
 });
 
@@ -591,6 +596,7 @@ async function enableDealFixture({ fail = false, booked = true } = {}) {
   const ensured = [], owners = [];
   lifecycle.dealsActivatedAt = submittedAt;
   lifecycle.requestDeals = {
+    async company() { return {id:'200',name:'Example'}; },
     async ensure(input) {
       ensured.push(input);
       if (fail) throw new Error('CRM unavailable');
@@ -616,7 +622,10 @@ test('confirmed booking creates one deal before the Slack deadline and retries r
   time += WINDOW_MS;
   await lifecycle.tick();
   assert.equal(posts.length, 1);
-  assert.deepEqual(f.owners.at(-1), ['900', '123', '84547076']);
+  assert.equal(f.ensured[0].ownerId, '84547076');
+  assert.equal(companyOwner, '84547076');
+  assert.deepEqual(assignments, []);
+  assert.equal(f.owners.length, 0);
 });
 
 test('confirmed booking deal retry survives completed notification', async () => {
@@ -673,21 +682,14 @@ test('enabling deal creation requires an explicit activation timestamp', () => {
   assert.throws(() => new DemoSubmissionLifecycle({ pool, env: { DEMO_REQUEST_DEALS_ENABLED: 'true' } }), /activation_required/);
 });
 
-test('deal owner sync failure retries independently without delaying Slack notifications', async () => {
-  await enableDealFixture();
+test('booking reconciliation never changes a form deal owner', async () => {
+  const f = await enableDealFixture();
   await lifecycle.enqueue(formEvent);
   await lifecycle.tick();
-  lifecycle.requestDeals.syncOwner = async () => { throw new Error('deal write unavailable'); };
-  await lifecycle.syncDealOwner(pool, '123', '84547076');
-  time += WINDOW_MS;
-  await lifecycle.tick();
-  assert.equal(posts.length, 1);
-  assert.equal((await row()).deal_state, 'pending');
-  lifecycle.requestDeals.syncOwner = async () => {};
-  time += 30000;
-  await lifecycle.tick();
-  assert.equal((await row()).deal_state, 'ready');
-  assert.equal(posts.length, 1);
+  const b = booking();
+  await lifecycle.reconcileBooking({ email:b.payload.email, contactId:'123', submittedAt, bookedAt:submittedAt+1000, ownerId:'84547076' });
+  assert.equal(f.owners.length,0);
+  assert.equal((await row()).assigned_owner,'84547076');
 });
 
 
@@ -783,7 +785,7 @@ for (const email of ['test@trytruewind.com', 'prospect@example.com']) {
   });
 }
 
-test('canceled booking cannot authorize creation', async () => {
+test('canceled booking does not authorize deal creation', async () => {
   const f = await enableDealFixture();
   await lifecycle.enqueue(formEvent);
   await pool.query('UPDATE demo_submission_bookings SET canceled = true');
@@ -820,4 +822,77 @@ test('late booking delivery selects its preceding form rather than a newer unboo
   assert.equal(submissions[0].company_name, 'Booked Company');
   assert.equal(submissions[1].deal_id, null);
   assert.equal(f.ensured.length, 1);
+});
+
+test('form prepares company immediately, waits five minutes, then assigns company without creating a deal', async () => {
+  const f = await enableDealFixture({booked:false});
+  let companyLookups=0;
+  lifecycle.requestDeals.company = async () => { companyLookups++; return {id:'200',name:'Example'}; };
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  assert.equal(companyLookups,1);
+  assert.equal(companyOwner,'');
+  assert.equal(f.ensured.length,0);
+  assert.deepEqual(assignments,[]);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(companyOwner,'89305622');
+  assert.deepEqual(companyAssignments,['89305622']);
+  assert.equal(f.ensured.length,0);
+  assert.equal((await row()).deal_id,null);
+  assert.deepEqual(assignments,[], 'contact ownership is inherited by HubSpot workflow');
+});
+
+test('multiple contacts at a company reuse its owner rather than rerolling', async () => {
+  await enableDealFixture({booked:false});
+  time += WINDOW_MS;
+  const first={submitted_at:submittedAt};
+  assert.equal(await lifecycle.assignCompany(pool,first,'200',null),'89305622');
+  const random=lifecycle.randomInt;
+  lifecycle.randomInt=()=>{throw new Error('must not reroll');};
+  try {
+    assert.equal(await lifecycle.assignCompany(pool,{...first,contact_id:'another'},'200',null),'89305622');
+    assert.deepEqual(companyAssignments,['89305622']);
+  } finally {lifecycle.randomInt=random;}
+});
+
+test('manual company owner remains authoritative even for an immediate booking', async () => {
+  const f=await enableDealFixture();
+  companyOwner='559564379';
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  assert.equal(companyOwner,'559564379');
+  assert.deepEqual(companyAssignments,[]);
+  assert.equal(f.ensured[0].ownerId,'84547076', 'new deal belongs to the booked host');
+  assert.equal((await row()).assigned_owner,'559564379');
+});
+
+test('late meeting creates a deal but does not change the previously assigned company owner', async () => {
+  const f=await enableDealFixture({booked:false});
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b=booking(600,'84547076','late');
+  time=submittedAt+600000;
+  await lifecycle.observeBooking('invitee.created',b.payload,b.scheduledEvent,b.filter);
+  await lifecycle.ensureDealForBooking('123',undefined,b.payload.uri);
+  assert.equal(f.ensured.length,1);
+  assert.equal(f.ensured[0].ownerId,'84547076');
+  assert.equal(companyOwner,'89305622');
+  assert.deepEqual(companyAssignments,['89305622']);
+});
+
+test('failed company write retries the saved choice without rerolling', async () => {
+  await enableDealFixture({booked:false});
+  time += WINDOW_MS;
+  const original=lifecycle.hubspotRequest, random=lifecycle.randomInt;
+  lifecycle.hubspotRequest=async(path,options)=>{
+    if(path==='/crm/v3/objects/companies/200' && options?.method==='PATCH') throw new Error('CRM unavailable');
+    return original(path,options);
+  };
+  try {await assert.rejects(lifecycle.assignCompany(pool,{submitted_at:submittedAt},'200',null),/CRM unavailable/);}
+  finally {lifecycle.hubspotRequest=original;}
+  lifecycle.randomInt=()=>{throw new Error('must not reroll');};
+  try {assert.equal(await lifecycle.assignCompany(pool,{submitted_at:submittedAt},'200',null),'89305622');}
+  finally {lifecycle.randomInt=random;}
 });

@@ -189,7 +189,7 @@ class Broker:
         return await asyncio.wait_for(exchange(), 60 if is_completion else 6)
 
 
-def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time, worker=None, secondary=None, permanent=False):
+def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time, worker=None, secondary=None, permanent=False, forward_url='', forward_token=''):
     if not permanent:
         store.configure_registration(registration_id, deadline, clock())
     else:
@@ -198,6 +198,9 @@ def create_app(store, broker, *, registration_id='', deadline=0, clock=time.time
     setup_diagnostics=set()
     ingress_diagnostics=set()
     workers=[] if permanent else [w for w in (worker, secondary[2] if secondary else None) if w is not None]
+    if permanent and (forward_url or forward_token):
+        from .inbox import Forwarder
+        workers.append(Forwarder(inbox, forward_url, forward_token))
     @asynccontextmanager
     async def lifespan(app):
         tasks=[asyncio.create_task(w.run()) for w in workers]
@@ -376,7 +379,8 @@ def from_environment():
             bind_window(store, selected, reopen)
             bind_window(child_store, secondary_scope, reopen)
         app = create_app(store, broker, worker=worker, secondary=secondary, registration_id=os.environ.get('REGISTRATION_ID', ''),
-            deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')), permanent=os.environ.get('NOOKS_PERMANENT_INGRESS') == 'true')
+            deadline=int(os.environ.get('REGISTRATION_DEADLINE', '0')), permanent=os.environ.get('NOOKS_PERMANENT_INGRESS') == 'true',
+            forward_url=os.environ.get('NOOKS_FORWARD_URL', ''), forward_token=os.environ.get('NOOKS_FORWARD_TOKEN', ''))
         app.state.owner_lock = lock  # Single owner for the lifetime of this process.
         return app
     except BaseException:

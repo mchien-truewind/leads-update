@@ -36,6 +36,7 @@ function fixture({ company = true, openDeal = false, timeout = false, companyLin
       if (!deal) throw Object.assign(new Error('not found'), { statusCode: 404 });
       return structuredClone(deal);
     }
+    if (path === '/crm/v3/objects/companies/2' && options.method === 'PATCH') return {};
     if (options.method === 'PATCH') { Object.assign(deals.get(path.split('/').pop()).properties, options.body.properties); return {}; }
     if (options.method === 'PUT') {
       if (failLink && path.endsWith('/companies/2')) { failLink = false; throw new Error('temporary association failure'); }
@@ -44,7 +45,7 @@ function fixture({ company = true, openDeal = false, timeout = false, companyLin
     throw new Error('Unexpected request ' + path);
   };
   const service = new DemoRequestDeals({ request });
-  return { service, calls, saved, deals, ensure: (dealId) => service.ensure({ bookingUri: 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture', contactId: '1', email: 'lead@gmail.com', dealId, saveDeal: async id => { saved.push(id); } }) };
+  return { service, calls, saved, deals, ensure: (dealId) => service.ensure({ ownerId: '102500801', bookingUri: 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture', contactId: '1', email: 'lead@gmail.com', dealId, saveDeal: async id => { saved.push(id); } }) };
 }
 
 test('new demo request creates Discovery deal with atomic contact/company links and a unique retry key', async () => {
@@ -58,12 +59,10 @@ test('new demo request creates Discovery deal with atomic contact/company links 
   assert.deepEqual(f.saved, ['100']);
 });
 
-test('personal email with no company still creates a deal and visibly flags missing company', async () => {
-  const f = fixture({ company: false }); const deal = await f.ensure();
-  assert.match(deal.properties.dealname, /Company missing/);
-  assert.match(deal.properties.description, /COMPANY MISSING/);
-  assert.equal(f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST').body.associations.length, 1);
-  assert.ok(!f.calls.some(c => c.path === '/crm/v3/objects/companies' && c.method === 'POST'));
+test('missing company identity leaves creation pending instead of creating an orphan deal', async () => {
+  const f = fixture({ company: false });
+  await assert.rejects(f.ensure(), /company_required/);
+  assert.ok(!f.calls.some(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST'));
 });
 
 test('repeated requests and an ambiguous successful create reuse the same deal', async () => {
@@ -84,18 +83,18 @@ test('association failure saves the deal first and recovers without another crea
 test('existing open company opportunity is associated with the contact and its owner is preserved', async () => {
   const f = fixture({ openDeal: true });
   assert.equal((await f.ensure()).id, '90');
-  await f.service.syncOwner('90', '1', 'new-owner');
+
   assert.equal(f.deals.get('90').properties.hubspot_owner_id, 'existing-owner');
   assert.ok(!f.calls.some(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST'));
   assert.ok(f.calls.some(c => c.path === '/crm/v4/objects/deals/90/associations/default/contacts/1'));
 });
 
-test('created deal receives the assigned contact owner, but later manual owner edits are preserved', async () => {
+test('owner is set at creation and never patched on retries, even after manual removal', async () => {
   const f = fixture(); await f.ensure();
-  await f.service.syncOwner('100', '1', 'assigned-owner');
-  assert.equal(f.deals.get('100').properties.hubspot_owner_id, 'assigned-owner');
-  await f.service.syncOwner('100', '1', 'other-owner');
-  assert.equal(f.deals.get('100').properties.hubspot_owner_id, 'assigned-owner');
+  assert.equal(f.deals.get('100').properties.hubspot_owner_id, '102500801');
+  f.deals.get('100').properties.hubspot_owner_id = '';
+  await f.ensure();
+  assert.equal(f.deals.get('100').properties.hubspot_owner_id, '');
 });
 
 test('saved deal remains authoritative after sales closes it; resubmission does not reopen or duplicate it', async () => {
@@ -170,10 +169,12 @@ test('newly created company is linked to both the contact and the newly created 
     if (path === '/crm/v3/objects/companies' && options.method === 'POST') {
       company = { id: '200', properties: { ...options.body.properties } }; return company;
     }
+    if (path.startsWith('/crm/v3/objects/companies/200?')) return company;
+    if (path === '/crm/v3/objects/companies/200' && options.method === 'PATCH') return {};
     if (path.startsWith('/crm/v4/objects/companies/200/associations/deals?')) return { results: [] };
     return request(path, options);
   };
-  const deal = await f.service.ensure({ bookingUri: 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture', contactId: '1', email: 'lead@example.business', saveDeal: async id => f.saved.push(id) });
+  const deal = await f.service.ensure({ ownerId: '102500801', bookingUri: 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture', contactId: '1', email: 'lead@example.business', saveDeal: async id => f.saved.push(id) });
   assert.deepEqual(deal.company, { id: '200', name: 'Example Business' });
   const create = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST');
   assert.deepEqual(create.body.associations.map(a => a.to.id), ['1', '200']);
@@ -194,16 +195,13 @@ test('linking a newly known company clears only the generated missing-company ti
   assert.equal(f.deals.get('100').properties.description, 'Created from a confirmed website demo booking.');
 });
 
-test('creation requires confirmed booking evidence and records website attribution', async () => {
+test('form creation does not require a booking and sets owner atomically', async () => {
   const f = fixture();
-  await assert.rejects(f.service.ensure({ contactId: '1', email: 'lead@gmail.com' }), /confirmed_booking_required/);
-  assert.equal(f.calls.length, 0);
-  await f.ensure();
-  const create = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST');
-  // Fixture records the parsed request body separately.
-  const properties = create.body.properties;
-  assert.equal(properties.deal_source, 'inbound');
-  assert.equal(properties.calendly_invitee_uri, 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture');
+  await f.service.ensure({ contactId:'1', email:'lead@gmail.com', ownerId:'102500864', saveDeal: async()=>{} });
+  const properties = f.calls.find(c => c.path === '/crm/v3/objects/deals' && c.method === 'POST').body.properties;
+  assert.equal(properties.deal_source,'inbound');
+  assert.equal(properties.hubspot_owner_id,'102500864');
+  assert.equal(properties.calendly_invitee_uri,undefined);
 });
 
 test('verified booking repairs missing source only on the automation-owned deal', async () => {
@@ -245,5 +243,21 @@ test('contact attribution uses Website Form Submit while deal attribution uses i
 test('confirmed website booking preserves existing nonlegacy contact attribution', async () => {
   const f = fixture({ leadSource: 'Referral' });
   await f.ensure();
-  assert.ok(!f.calls.some(c => c.path === '/crm/v3/objects/contacts/1' && c.method === 'PATCH'));
+  assert.ok(!f.calls.some(c => c.path === '/crm/v3/objects/contacts/1' && c.method === 'PATCH' && c.body.properties.lead_source));
+});
+
+test('prospect classification uses the verified internal HubSpot values', async () => {
+  const f=fixture(); await f.ensure();
+  assert.ok(f.calls.some(c => c.path === '/crm/v3/objects/contacts/1' && c.body?.properties.contact_type === 'Prospective Customer' && c.body.properties.hs_lead_status === 'MQL'));
+  assert.ok(f.calls.some(c => c.path === '/crm/v3/objects/companies/2' && c.body?.properties.type === 'Company' && c.body.properties.hs_lead_status === 'OPEN_DEAL'));
+});
+
+test('existing customers retain their classifications', async () => {
+  const calls=[];
+  const service=new DemoRequestDeals({request:async(path,options)=>{
+    calls.push({path,options});
+    return {id:'2',properties:{lifecyclestage:'customer',type:'Company'}};
+  }});
+  await service.classify({id:'1',properties:{lifecyclestage:'customer',contact_type:'Customer'}},'2');
+  assert.ok(calls.every(c=>c.options?.method !== 'PATCH'));
 });

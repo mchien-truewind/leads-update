@@ -31,7 +31,7 @@ before(async () => {
     return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length };
   };
   pool = { query, async connect() { return { query, release() {} }; } };
-  lifecycle = new DemoSubmissionLifecycle({ pool, refreshOwners: async () => {}, env: { SLACK_BOT_TOKEN: 'test' }, now: () => time, randomInt: () => 1,
+  lifecycle = new DemoSubmissionLifecycle({ pool, refreshOwners: async () => {}, env: { SLACK_BOT_TOKEN: 'test', SLACK_TO_HUBSPOT_OWNER_JSON: JSON.stringify({ UOCEAN: { id: '102500864' }, USUDARSHAN: { id: '102500801' } }) }, now: () => time, randomInt: () => 1,
     logger: { error() {} },
     async hubspotRequest(path, options) {
       if (path.startsWith('/crm/v3/owners/')) return { id: path.split('/').pop(), archived: false };
@@ -93,14 +93,14 @@ test('five-minute deadline persists; random owner is assigned before parent and 
   assert.equal(posts.length, 0);
   time++;
   await lifecycle.tick();
-  assert.equal(contactOwner, '89305622');
-  assert.deepEqual(assignments, ['89305622']);
+  assert.equal(contactOwner, '102500864');
+  assert.deepEqual(assignments, ['102500864']);
   assert.equal(posts.length, 2);
-  assert.ok(posts[0].text.startsWith('<@U0AKMHVCJMA>\nNew DEMO Submission\nNikhil Goel'));
+  assert.ok(posts[0].text.startsWith('<@UOCEAN>\nNew DEMO Submission\nNikhil Goel'));
   for (const field of ['ERP: QBO', 'Job Title: Head of Operations', 'How did you hear about us?', 'Finance team size:', 'Phone:', 'Date Created: 10/30/26']) assert.ok(posts[0].text.includes(field));
   assert.equal(posts[0].channel, CHANNEL_ID);
   assert.equal(posts[1].thread_ts, '1.001');
-  assert.match(posts[1].text, /<@U0AKMHVCJMA>.*did NOT book/);
+  assert.match(posts[1].text, /<@UOCEAN>.*did NOT book/);
   await lifecycle.enqueue({ ...formEvent, occurredAt: time });
   time += WINDOW_MS;
   await lifecycle.tick();
@@ -135,8 +135,8 @@ test('late booking replies on original thread with meeting details and verified 
   await lifecycle.tick();
   assert.equal(posts.length, 3);
   assert.equal(posts[2].thread_ts, posts[1].thread_ts);
-  assert.match(posts[2].text, /<@U0AKMHVCJMA>.*after the first five minutes/);
-  assert.equal(contactOwner, '89305622');
+  assert.match(posts[2].text, /<@UOCEAN>.*after the first five minutes/);
+  assert.equal(contactOwner, '102500864');
   for (const detail of ['Truewind Demo', 'Sarah Elix', '2026-11-04T15:00:00.000Z', '2026-11-04T15:30:00.000Z', 'https://zoom.us/j/demo']) assert.ok(posts[2].text.includes(detail));
   await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
   await lifecycle.tick();
@@ -170,10 +170,10 @@ test('restart recovers queued deadline and delayed late webhook retains random a
   await lifecycle.initialize();
   await lifecycle.tick();
   assert.equal(posts.length, 3);
-  assert.match(posts[0].text, /^<@U0AKMHVCJMA>/);
-  assert.match(posts[1].text, /^<@U0AKMHVCJMA>.*did NOT book/);
-  assert.match(posts[2].text, /^<@U0AKMHVCJMA>.*booked a meeting/);
-  assert.equal(contactOwner, '89305622');
+  assert.match(posts[0].text, /^<@UOCEAN>/);
+  assert.match(posts[1].text, /^<@UOCEAN>.*did NOT book/);
+  assert.match(posts[2].text, /^<@UOCEAN>.*booked a meeting/);
+  assert.equal(contactOwner, '102500864');
 });
 
 test('provider errors never become a false no-booking alert', async () => {
@@ -252,16 +252,16 @@ test('Calendly lookup filters invitee email and creation time and follows pagina
   }
 });
 
-test('Sarah is also an eligible random owner', async () => {
+test('Sudarshan is also an eligible random owner', async () => {
   const pick = lifecycle.randomInt;
   lifecycle.randomInt = () => 0;
   try {
     await lifecycle.enqueue(formEvent);
     time += WINDOW_MS;
     await lifecycle.tick();
-    assert.equal(contactOwner, '84547076');
-    assert.match(posts[0].text, /^<@U09QC3B292R>/);
-    assert.match(posts[1].text, /^<@U09QC3B292R>/);
+    assert.equal(contactOwner, '102500801');
+    assert.match(posts[0].text, /^<@USUDARSHAN>/);
+    assert.match(posts[1].text, /^<@USUDARSHAN>/);
   } finally { lifecycle.randomInt = pick; }
 });
 
@@ -311,7 +311,7 @@ test('a delayed early booking corrects the existing thread rather than creating 
   assert.match(posts[2].text, /within the first five minutes \(booking confirmation arrived later\)/);
   assert.equal(updates.length, 1);
   assert.equal(updates[0].ts, '1.001');
-  assert.match(updates[0].text, /^<@U09QC3B292R>/);
+  assert.match(updates[0].text, /^<@UOCEAN>/);
   assert.match(updates[0].text, /within five minutes/);
 });
 
@@ -334,7 +334,7 @@ test('definite Slack rejection retries without reassigning the random owner or r
     await lifecycle.tick();
     assert.equal(posts.length, 2);
     assert.equal(posts[1].thread_ts, '1.001');
-    assert.deepEqual(assignments, ['89305622']);
+    assert.deepEqual(assignments, ['102500864']);
   } finally { lifecycle.fetchImpl = send; }
 });
 
@@ -447,7 +447,7 @@ test('re-entering the same email to book replies in the original thread instead 
   assert.match(posts[2].text, /This lead booked a meeting\./);
   assert.match(posts[2].text, /Sarah Elix/);
   assert.equal(posts.filter(m => !m.thread_ts).length, 1);
-  assert.equal(contactOwner, '89305622');
+  assert.equal(contactOwner, '102500864');
   const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
   assert.equal(rows[1].thread_root_key, rows[0].submission_key);
   assert.equal(rows[1].parent_ts, rows[0].parent_ts);
@@ -616,7 +616,8 @@ test('confirmed booking creates one deal before the Slack deadline and retries r
   time += WINDOW_MS;
   await lifecycle.tick();
   assert.equal(posts.length, 1);
-  assert.deepEqual(f.owners.at(-1), ['900', '123', '84547076']);
+  assert.equal(f.ensured[0].ownerId, '102500864');
+  assert.equal(f.owners.length, 0);
 });
 
 test('confirmed booking deal retry survives completed notification', async () => {
@@ -673,21 +674,14 @@ test('enabling deal creation requires an explicit activation timestamp', () => {
   assert.throws(() => new DemoSubmissionLifecycle({ pool, env: { DEMO_REQUEST_DEALS_ENABLED: 'true' } }), /activation_required/);
 });
 
-test('deal owner sync failure retries independently without delaying Slack notifications', async () => {
-  await enableDealFixture();
+test('booking reconciliation never changes a form deal owner', async () => {
+  const f = await enableDealFixture();
   await lifecycle.enqueue(formEvent);
   await lifecycle.tick();
-  lifecycle.requestDeals.syncOwner = async () => { throw new Error('deal write unavailable'); };
-  await lifecycle.syncDealOwner(pool, '123', '84547076');
-  time += WINDOW_MS;
-  await lifecycle.tick();
-  assert.equal(posts.length, 1);
-  assert.equal((await row()).deal_state, 'pending');
-  lifecycle.requestDeals.syncOwner = async () => {};
-  time += 30000;
-  await lifecycle.tick();
-  assert.equal((await row()).deal_state, 'ready');
-  assert.equal(posts.length, 1);
+  const b = booking();
+  await lifecycle.reconcileBooking({ email:b.payload.email, contactId:'123', submittedAt, bookedAt:submittedAt+1000, ownerId:'84547076' });
+  assert.equal(f.owners.length,0);
+  assert.equal((await row()).assigned_owner,'102500864');
 });
 
 
@@ -771,25 +765,25 @@ test('company metadata survives the owner refresh and enqueues only one enrichme
 });
 
 for (const email of ['test@trytruewind.com', 'prospect@example.com']) {
-  test(`form without a booking never creates a deal: ${email}`, async () => {
+  test(`form without a booking creates a deal immediately: ${email}`, async () => {
     const f = await enableDealFixture({ booked: false });
     await lifecycle.enqueue(formEvent);
     await pool.query('UPDATE demo_submission_lifecycle SET email = $1', [email]);
     await lifecycle.tick();
     time += WINDOW_MS;
     await lifecycle.tick();
-    assert.equal(f.ensured.length, 0);
-    assert.equal((await row()).deal_id, null);
+    assert.equal(f.ensured.length, 1);
+    assert.equal((await row()).deal_id, '900');
   });
 }
 
-test('canceled booking cannot authorize creation', async () => {
+test('canceled booking does not block form creation', async () => {
   const f = await enableDealFixture();
   await lifecycle.enqueue(formEvent);
   await pool.query('UPDATE demo_submission_bookings SET canceled = true');
   bookings = [];
   await lifecycle.tick();
-  assert.equal(f.ensured.length, 0);
+  assert.equal(f.ensured.length, 1);
 });
 
 test('booking delivery retries persist the same booking and deal', async () => {
@@ -819,5 +813,5 @@ test('late booking delivery selects its preceding form rather than a newer unboo
   assert.equal(submissions[0].deal_id, '900');
   assert.equal(submissions[0].company_name, 'Booked Company');
   assert.equal(submissions[1].deal_id, null);
-  assert.equal(f.ensured.length, 1);
+  assert.equal(f.ensured.length, 2);
 });

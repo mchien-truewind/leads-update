@@ -59,3 +59,23 @@ class PermanentTests(CloudTests):
         with patch.object(receiver.Broker,'call',side_effect=TimeoutError):
             self.assertEqual(self.post(client=client).status_code,503)
             self.assertEqual(client.get('/ready').status_code,503)
+
+    def test_forwarding_failure_retries_durable_event_and_success_marks_delivered(self):
+        import asyncio
+        from cloud.sdr.inbox import Forwarder
+        client=self.production()
+        self.post(client=client)
+        inbox=Inbox(self.store)
+        responses=[503,200]
+        requests=[]
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(responses.pop(0),json={'status':'processed'})
+        worker=Forwarder(inbox,'https://backend.example.test/internal/nooks/deals','dummy-token',transport=httpx.MockTransport(respond))
+        asyncio.run(worker.tick(self.now))
+        self.assertEqual(inbox.summary()['pending_events'],1)
+        asyncio.run(worker.tick(self.now+1))
+        self.assertEqual(len(requests),1)
+        asyncio.run(worker.tick(self.now+5))
+        self.assertEqual(inbox.summary()['pending_events'],0)
+        self.assertEqual(requests[0].headers['authorization'],'Bearer dummy-token')

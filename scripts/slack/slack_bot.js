@@ -262,6 +262,8 @@ let slackStateStore = createPostgresSlackStateStore({
 });
 let demoNotificationStore = null;
 let demoLifecycle = null;
+let nooksDeals = null;
+const { NooksDeals, handleNooksDealRequest } = require('./nooks-deals');
 let demoRouter = null;
 let demoBookingStore = null;
 let slackBotUserIdPromise = null;
@@ -2739,6 +2741,14 @@ async function createStructuredDealNote({ dealId, contactId, companyId, body }) 
   return note;
 }
 
+function dealAssociations(contactId, companyId) {
+  if (!/^\d+$/.test(String(contactId || '')) || !/^\d+$/.test(String(companyId || ''))) throw new Error('Deal creation requires one contact_id and one company_id');
+  return [
+    { to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 3 }] },
+    { to: { id: String(companyId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 341 }] },
+  ];
+}
+
 async function runStructuredDealCreateWorkflow(input) {
   const email = normalizeEmail(input.email);
   if (!isValidEmail(email)) {
@@ -2797,7 +2807,7 @@ async function runStructuredDealCreateWorkflow(input) {
       hubspot_owner_id: dealOwner.id,
       deal_source: leadSource,
     }));
-    const dealRes = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: dealProps });
+    const dealRes = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: dealProps, associations: dealAssociations(contactId, companyId) });
     const dealId = requireHubSpotObjectId(dealRes, 'HubSpot deal create');
     partial.dealId = dealId;
 
@@ -3014,7 +3024,7 @@ async function runTruewindHubSpotProspectWorkflow(input) {
       if (duplicateDeal) return JSON.stringify(formatDuplicateDealError(duplicateDeal));
     }
     const existingDeal = await findExistingDeal(dealName);
-    const dealRes = existingDeal || await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedDealProps });
+    const dealRes = existingDeal || await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedDealProps, associations: dealAssociations(contactId, companyId) });
     const dealId = requireHubSpotObjectId(dealRes, 'HubSpot deal create');
     partial.dealId = dealId;
 
@@ -3333,7 +3343,7 @@ const TOOLS = [
   },
   {
     name: 'hubspot_create_deal',
-    description: 'Create a new deal in HubSpot. Requires explicit deal_source from the user. If the user did not provide a source, ask for it before calling this tool. Active Pipeline ID is 105321581. Stages: MQL=1307720553, SQL=190380582, Full Product Demo=190380583, POC=190380586, Proposal=190380584, Won=1166230571, Closed/Lost=190380587. The backend BLOCKS creation if an open deal already exists for the company in the active pipeline (stages MQL..Proposal); always pass company_name (and email/company_id/contact_id when known). If the result is duplicate_deal_exists, relay its message to the user and do NOT create the deal unless they reply with "override".',
+    description: 'Create a new deal in HubSpot with one required contact_id and one required company_id associated atomically. Resolve or create both records first. Requires explicit deal_source from the user. If the user did not provide a source, ask for it before calling this tool. Active Pipeline ID is 105321581. Stages: MQL=1307720553, SQL=190380582, Full Product Demo=190380583, POC=190380586, Proposal=190380584, Won=1166230571, Closed/Lost=190380587. The backend BLOCKS creation if an open deal already exists for the company in the active pipeline (stages MQL..Proposal); always pass company_name (and email/company_id/contact_id when known). If the result is duplicate_deal_exists, relay its message to the user and do NOT create the deal unless they reply with "override".',
     input_schema: {
       type: 'object',
       properties: {
@@ -3355,7 +3365,7 @@ const TOOLS = [
           description: 'Writable deal properties (e.g. hubspot_owner_id, closedate). Do not include deal_source here; pass it as the top-level required deal_source field. Do not include HubSpot read-only/system fields such as hs_deal_stage_probability_shadow, notes_last_updated, or hs_object_source_detail_1.',
         },
       },
-      required: ['dealname', 'dealstage', 'deal_source'],
+      required: ['dealname', 'dealstage', 'deal_source', 'contact_id', 'company_id'],
     },
   },
   {
@@ -3700,8 +3710,9 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
         const dealOwner = resolveDealHubSpotOwner({ ...input }, requesterOwner);
         if (dealOwner?.id) props.hubspot_owner_id = dealOwner.id;
       }
+      const associations = dealAssociations(input.contact_id, input.company_id);
       const validatedProps = await validateHubSpotProperties('deals', props);
-      const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedProps });
+      const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedProps, associations });
       return JSON.stringify(formatHubSpotObjectResponse(res, 'deals'));
     }
     if (name === 'hubspot_update_deal') {
@@ -6199,6 +6210,10 @@ function startHttpServer() {
       await handleDemoRoutingRequest(req, res, { router: demoRouter });
       return;
     }
+    if (req.url.split('?')[0] === '/internal/nooks/deals') {
+      await handleNooksDealRequest(req, res, { service: nooksDeals, token: process.env.NOOKS_FORWARD_TOKEN, readBody: readRawRequestBody });
+      return;
+    }
     if (req.url.split('?')[0] === '/api/webhooks/hubspot') {
       await handleHubSpotDemoWebhook(req, res, {
         env: process.env, store: demoNotificationStore, hubspotRequest, logger: console, demoRouter, demoLifecycle,
@@ -6554,6 +6569,11 @@ async function startSlackBot() {
     console.log('Slack durable interaction state: ready');
   }
 
+  if (process.env.NOOKS_DEALS_ENABLED === 'true') {
+    if (!slackStateStore?.pool || !process.env.NOOKS_FORWARD_TOKEN || !process.env.NOOKS_WORKSPACE_ID || !process.env.NOOKS_MEETING_DISPOSITION_IDS) throw new Error('Nooks deals require durable state, forwarding token, workspace and disposition IDs');
+    nooksDeals = new NooksDeals({ request: hubspotRequestFromFetchOptions, pool: slackStateStore.pool });
+    await nooksDeals.deals.initialize();
+  }
   if (process.env.HUBSPOT_DEMO_SLACK_ENABLED === 'true') {
     if (!slackStateStore?.pool || !HUBSPOT_TOKEN || !process.env.HUBSPOT_CLIENT_SECRET || !process.env.SLACK_BOT_TOKEN) {
       throw new Error('Demo webhooks require the Slack state database, HubSpot token and app secret, and Slack bot token');

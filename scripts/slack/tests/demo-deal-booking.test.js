@@ -8,7 +8,7 @@ const payload = { email: 'fixture@gmail.com', name: 'Fixture Lead', uri: 'https:
 const event = { name: 'Demo', start_time: '2026-11-01T12:00:00Z', end_time: '2026-11-01T12:30:00Z' };
 const filter = { ownerId: '89305622', hostUserUri: '', eventTypeUri: 'type' };
 
-function mockHubspot(t, { managed = true, cancellation = false, associationError = false, lostCreateResponse = false, formCompany } = {}) {
+function mockHubspot(t, { managed = true, cancellation = false, associationError = false, lostCreateResponse = false, formCompany = { id: '2', name: 'Fixture Company' } } = {}) {
   const calls = [], companyHints = [];
   let createdDeal = null;
   const oldToken = process.env.HUBSPOT_PRIVATE_TOKEN;
@@ -28,8 +28,11 @@ function mockHubspot(t, { managed = true, cancellation = false, associationError
       if (path.endsWith('/contacts/search')) response = { results: [{ id: '1', properties: { email: payload.email, hubspot_owner_id: '84547076' } }] };
       else if (path.endsWith('/deals/search')) response = { results: cancellation ? [existingDeal] : [] };
       else if (path.endsWith('/meetings/search')) response = { results: cancellation ? [{ id: '30' }] : [] };
-      else if (path === '/crm/v4/objects/contacts/1/associations/deals') response = { results: [{ toObjectId: '20' }] };
-      else if (path === '/crm/v4/objects/contacts/1/associations/companies') response = { results: [] };
+      else if (path === '/crm/v4/objects/contacts/1/associations/deals') response = { results: managed ? [{ toObjectId: '20' }] : [] };
+      else if (path === '/crm/v4/objects/contacts/1/associations/companies') response = { results: [{ toObjectId:'2', associationTypes:[] }] };
+      else if (path === '/crm/v3/objects/contacts/1' && options.method === 'GET') response = { id:'1', properties:{email:payload.email} };
+      else if (path === '/crm/v3/objects/companies/2' && options.method === 'GET') response = { id:'2', properties:{name:'Fixture Company'} };
+      else if (path === '/crm/v4/objects/companies/2/associations/deals') response = { results: [] };
       else if (path.startsWith('/crm/v3/pipelines/deals/')) response = { stages: [{ id: CONFIG.newDealStageId, metadata: { isClosed: 'false' } }] };
       else if (path.endsWith('/deals/batch/read')) response = { results: [existingDeal] };
       else if (path === '/crm/v3/objects/meetings' && options.method === 'POST') response = { id: '30' };

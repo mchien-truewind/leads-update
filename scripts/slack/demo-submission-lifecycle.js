@@ -6,7 +6,7 @@ const { DemoRequestDeals } = require('./demo-request-deals');
 const { ApolloCompanyEnricher } = require('./apollo-company-enrichment');
 
 const WINDOW_MS = 5 * 60 * 1000;
-const RANDOM_OWNER_IDS = ['84547076', '89305622']; // Sarah Elix, Xavier Marco
+const RANDOM_OWNER_IDS = ['102500801', '102500864']; // Sudarshan Sundar, Ocean Marquez
 const PROPERTIES = ['firstname', 'lastname', 'email', 'erp', 'jobtitle', 'how_did_you_hear_about_us', 'finance_team_size', 'phone', 'createdate', 'hubspot_owner_id'];
 const ms = value => /^\d+$/.test(String(value)) ? Number(value) : Date.parse(value);
 const normalizeEmail = value => String(value || '').trim().toLowerCase();
@@ -196,32 +196,25 @@ class DemoSubmissionLifecycle {
     if (!initial || Number(initial.submitted_at) < this.dealsActivatedAt) return null;
     const result = await this.withContactLock(initial.email, async client => {
       const row = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
-      // A form is a lead, not an opportunity. Only a verified active booking
-      // persisted by saveBooking may authorize opportunity creation.
-      const booking = (await client.query(`SELECT * FROM demo_submission_bookings
-        WHERE email = $1 AND booked_at >= $2 AND canceled = false
-        ORDER BY booked_at, invitee_uri LIMIT 1`, [row.email, row.submitted_at])).rows[0];
-      if (!booking) {
-        await client.query('UPDATE demo_submission_lifecycle SET deal_next_check = $2 WHERE submission_key = $1', [key, this.now() + WINDOW_MS]);
-        this.logger.info?.('demo_deal_decision', { contactId: row.contact_id, reason: 'awaiting_qualifying_booking', included: false });
-        return null;
+      // Persist a random choice before CRM writes so retries never reroll it.
+      let ownerId = row.assigned_owner;
+      if (!ownerId) {
+        ownerId = RANDOM_OWNER_IDS[this.randomInt(RANDOM_OWNER_IDS.length)];
+        await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, ownerId]);
       }
       const saved = row.deal_id || (await client.query(`SELECT deal_id FROM demo_submission_lifecycle
         WHERE contact_id = $1 AND deal_id IS NOT NULL ORDER BY submitted_at LIMIT 1`, [row.contact_id])).rows[0]?.deal_id;
       const deal = await this.requestDeals.ensure({ contactId: row.contact_id, email: row.email, dealId: saved,
-        companyName: row.company_name, bookingUri: booking.invitee_uri,
+        companyName: row.company_name, ownerId,
         saveDeal: async id => client.query('UPDATE demo_submission_lifecycle SET deal_id = $2 WHERE submission_key = $1', [key, id]),
       });
-      let ownerId = row.assigned_owner;
-      if (!ownerId && row.parent_state === 'sent') {
-        const contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}?properties=hubspot_owner_id`);
-        ownerId = contact.properties?.hubspot_owner_id;
+      if (deal.properties?.hubspot_owner_id && String(deal.properties.hubspot_owner_id) !== ownerId) {
+        await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, String(deal.properties.hubspot_owner_id)]);
       }
-      if (ownerId) await this.requestDeals.syncOwner(deal.id, row.contact_id, ownerId);
       if (deal.company?.id) await this.enqueueCompanyEnrichment(client, deal.company.id);
       await client.query("UPDATE demo_submission_lifecycle SET deal_state = 'ready' WHERE submission_key = $1", [key]);
-      this.logger.info?.('demo_deal_decision', { contactId: row.contact_id, dealId: deal.id, bookingUri: booking.invitee_uri, reason: 'confirmed_booking' });
-      return ownerId ? { ...await this.requestDeals.readDeal(deal.id), company: deal.company } : deal;
+      this.logger.info?.('demo_deal_decision', { contactId: row.contact_id, dealId: deal.id, reason: 'website_form_submission' });
+      return deal;
     });
     return result;
   }
@@ -283,26 +276,13 @@ class DemoSubmissionLifecycle {
     }
   }
 
-  async syncDealOwner(client, contactId, ownerId) {
-    if (!this.requestDeals) return;
-    const row = (await client.query('SELECT deal_id FROM demo_submission_lifecycle WHERE contact_id = $1 AND deal_id IS NOT NULL ORDER BY submitted_at DESC LIMIT 1', [String(contactId)])).rows[0];
-    if (row) {
-      try { await this.requestDeals.syncOwner(row.deal_id, contactId, ownerId); }
-      catch {
-        await client.query(`UPDATE demo_submission_lifecycle SET deal_state = 'pending', deal_next_check = $2
-          WHERE contact_id = $1 AND deal_id = $3`, [String(contactId), this.now() + 30000, row.deal_id]);
-        this.logger.error('demo_request_deal_owner_retry_pending', { contactId: String(contactId) });
-      }
-    }
-  }
-
   async reconcileBooking(booking) {
-    if (!booking || booking.threadRootKey || booking.bookedAt > booking.submittedAt + WINDOW_MS) return;
+    if (this.requestDeals || !booking || booking.threadRootKey || booking.bookedAt > booking.submittedAt + WINDOW_MS) return;
     await this.withContactLock(booking.email, async client => {
       const newer = (await client.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 AND submitted_at > $2 LIMIT 1', [booking.contactId, booking.bookedAt])).rows.length;
       if (newer) return;
       await this.assignOwner(booking.contactId, booking.ownerId);
-      await this.syncDealOwner(client, booking.contactId, booking.ownerId);
+
     });
   }
 
@@ -345,7 +325,7 @@ class DemoSubmissionLifecycle {
   }
 
   async assignOwner(contactId, ownerId) {
-    if (!this.ownerSlackMap[ownerId]) throw new Error('contact_owner_slack_mapping_missing');
+    if (!this.ownerSlackMap[ownerId] && !RANDOM_OWNER_IDS.includes(ownerId)) throw new Error('contact_owner_slack_mapping_missing');
     const owner = await this.hubspotRequest(`/crm/v3/owners/${ownerId}`);
     if (owner.archived !== false || String(owner.id) !== ownerId) throw new Error('contact_owner_inactive_or_unverified');
     await this.hubspotRequest(`/crm/v3/objects/contacts/${contactId}`, {
@@ -449,7 +429,7 @@ class DemoSubmissionLifecycle {
       const early = !repeat && booking && Number(booking.booked_at) <= Number(row.submitted_at) + WINDOW_MS;
       if (!booking && this.now() < Number(row.submitted_at) + WINDOW_MS) return;
       const newer = (await client.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 AND submitted_at > $2 AND thread_root_key IS NULL LIMIT 1', [row.contact_id, row.submitted_at])).rows.length > 0;
-      let ownerId = early ? booking.owner_id : row.assigned_owner;
+      let ownerId = row.assigned_owner || (!this.requestDeals && early ? booking.owner_id : null);
       if (!ownerId) {
         ownerId = RANDOM_OWNER_IDS[this.randomInt(RANDOM_OWNER_IDS.length)];
         await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, ownerId]);
@@ -458,15 +438,19 @@ class DemoSubmissionLifecycle {
       if (newer || (row.parent_ts && !early)) {
         contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}?properties=${PROPERTIES.join(',')}`);
         ownerId = String(contact.properties?.hubspot_owner_id || '');
-        if (!this.ownerSlackMap[ownerId]) throw new Error('contact_owner_slack_mapping_missing');
+        if (!this.ownerSlackMap[ownerId] && !RANDOM_OWNER_IDS.includes(ownerId)) throw new Error('contact_owner_slack_mapping_missing');
       } else {
         contact = await this.assignOwner(row.contact_id, ownerId);
       }
-      await this.syncDealOwner(client, row.contact_id, ownerId);
-      const mention = `<@${this.ownerSlackMap[ownerId]}>`;
+
+      const mention = this.ownerSlackMap[ownerId] ? `<@${this.ownerSlackMap[ownerId]}>` : (ownerId === '102500801' ? 'Sudarshan Sundar' : 'Ocean Marquez');
       let parentTs = row.parent_ts;
       if (row.parent_state === 'pending' || (early && row.parent_ts)) {
         const message = buildMessage(contact, { slackUserId: this.ownerSlackMap[ownerId] });
+        if (!this.ownerSlackMap[ownerId]) {
+          message.text = `${mention}\n${message.text}`;
+          message.blocks[0].text.text = message.text;
+        }
         if (early) {
           message.text += `\n- Booked a meeting within five minutes.\n${this.meetingText(booking)}`;
           message.blocks[0].text.text = message.text;

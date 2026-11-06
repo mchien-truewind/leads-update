@@ -1,6 +1,5 @@
 // Inbound deal-flow reconciler (backstop to the leads-update Calendly webhook).
-//   Symptom #2: for ownerless Active Pipeline deals with a booked meeting, set deal owner = meeting host.
-//   An existing deal/contact owner is never replaced, except by an explicit Slack deal-owner override.
+//   Existing deals are read only: ownership changes require an explicit human request.
 //   Symptom #1: round-robin ownerless, non-booker demo-form contacts to the AE roster.
 // Idempotent + guarded: re-reads each record immediately before writing; only writes when needed.
 // DRY_RUN (default true) logs intended changes without writing.
@@ -8,8 +7,16 @@
 // Ported from the retired gtm-ops repo. The run loop now lives in ../gtm_ops_bot.js (the
 // worker entrypoint); this module only exports the reconcile logic so it stays testable.
 
-const { hub, getOwners, searchAll, associations, batchRead, sleep } = require("./hubspot");
+const { hub, getOwners, searchAll, associations, sleep } = require("./hubspot");
 const cfg = require("./config");
+const { createDemoRouter, routingEnabled, SUBMISSION_PROPERTY } = require('../demo-routing');
+const { protectContact, reconcileRoutedSubmissions } = require('../demo-routing-assignment');
+let sharedRouter;
+function getDemoRouter() {
+  if (!routingEnabled()) return null;
+  if (!sharedRouter) sharedRouter = createDemoRouter({ request: (path, options = {}) => hub(options.method || 'GET', path, options.body) });
+  return sharedRouter;
+}
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 
@@ -20,204 +27,29 @@ function pickAE(contactId) {
   return cfg.AE_ROSTER[h % cfg.AE_ROSTER.length];
 }
 
-function meetingTimestampMs(properties = {}) {
-  const raw = properties.hs_meeting_start_time || properties.hs_timestamp || '';
-  const numeric = Number(raw);
-  if (String(raw).trim() && Number.isFinite(numeric)) return numeric;
-  const parsed = Date.parse(String(raw));
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function latestMeetingHostDetails(meetingIds, meetingProps) {
-  const sorted = meetingIds
-    .map((id) => ({ id, p: meetingProps.get(id) || {} }))
-    .sort((a, b) => meetingTimestampMs(b.p) - meetingTimestampMs(a.p));
-  const top = sorted[0];
-  return top && top.p.hubspot_owner_id ? { meetingId: String(top.id), host: String(top.p.hubspot_owner_id) } : null;
-}
-
-function latestMeetingHost(meetingIds, meetingProps) {
-  return latestMeetingHostDetails(meetingIds, meetingProps)?.host || null;
-}
-
-function isBookedDemoContact(contactProps = {}) {
-  const conversion = String(contactProps.recent_conversion_event_name || "").toLowerCase();
-  return String(contactProps.calendly_meeting_booked || "").toLowerCase() === "true"
-    || conversion.includes(String(cfg.DEMO_FORM_TOKEN || "").toLowerCase());
-}
-
-function bookedContactOwnerUpdates(dealIds, dealToHost, dealToContacts, contactProps) {
-  const updates = [];
-  const seen = new Set();
-  for (const dealId of dealIds) {
-    const host = dealToHost.get(String(dealId));
-    if (!host) continue;
-    for (const contactId of dealToContacts.get(String(dealId)) || []) {
-      const key = String(contactId);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const props = contactProps.get(String(contactId)) || {};
-      if (!isBookedDemoContact(props)) continue;
-      if (props.hubspot_owner_id) continue;
-      updates.push({ contactId: String(contactId), from: null, to: host, email: props.email || "", dealId: String(dealId) });
-    }
-  }
-  return updates;
-}
-
-// ---------- Symptom #2: deal owner = meeting host ----------
-async function reconcileDealOwners(owners, { overrideStore = null, api = null, dryRun = cfg.DRY_RUN } = {}) {
-  const crm = api || { hub, searchAll, associations, batchRead, sleep };
-  const cutoff = Date.now() - cfg.MEETING_LOOKBACK_MIN * 60000;
-  const recentMeetings = await crm.searchAll("meetings", {
-    filterGroups: [{ filters: [{ propertyName: "hs_lastmodifieddate", operator: "GTE", value: String(cutoff) }] }],
-    sorts: [{ propertyName: "hs_lastmodifieddate", direction: "DESCENDING" }],
-    properties: ["hubspot_owner_id", "hs_meeting_start_time", "hs_timestamp"],
-    limit: 100,
-  });
-  if (!recentMeetings.length) { log("symptom#2: no meetings modified in window"); return { checked: 0, fixed: 0 }; }
-
-  // recent meetings -> candidate deals (Active Pipeline only)
-  const meetingIds = recentMeetings.map((m) => String(m.id));
-  const mToDeals = await crm.associations("meetings", meetingIds, "deals");
-  const candidateDealIds = [...new Set([...mToDeals.values()].flat())];
-  if (!candidateDealIds.length) { log("symptom#2: no deals on recent meetings"); return { checked: 0, fixed: 0 }; }
-
-  const dealProps = await crm.batchRead("deals", candidateDealIds, ["dealname", "hubspot_owner_id", "pipeline"]);
-  const activeDealIds = candidateDealIds.filter((id) => (dealProps.get(id) || {}).pipeline === cfg.ACTIVE_PIPELINE);
-  const ownerOverrides = overrideStore
-    ? await overrideStore.getDealOwnerOverrides(activeDealIds)
-    : new Map();
-
-  // for each candidate deal, fetch ALL its meetings to pick the *latest* host (not just the one that fired)
-  const dToMeetings = await crm.associations("deals", activeDealIds, "meetings");
-  const allMeetingIds = [...new Set([...dToMeetings.values()].flat())];
-  const meetingProps = await crm.batchRead("meetings", allMeetingIds, ["hubspot_owner_id", "hs_meeting_start_time", "hs_timestamp"]);
-
-  let fixed = 0;
-  const dealToHost = new Map();
-  const dealToLatestMeeting = new Map();
-  for (const dealId of activeDealIds) {
-    const p = dealProps.get(dealId) || {};
-    const ownerId = p.hubspot_owner_id ? String(p.hubspot_owner_id) : null;
-    const latest = latestMeetingHostDetails(dToMeetings.get(dealId) || [], meetingProps);
-    if (!latest) continue;
-    const { meetingId, host } = latest;
-    if (owners.has(host)) {
-      dealToHost.set(String(dealId), host);
-      dealToLatestMeeting.set(String(dealId), meetingId);
-    }
-
-    const override = ownerOverrides.get(String(dealId));
-    if (!override && ownerId) continue;
-    const desiredOwnerId = override?.ownerId || host;
-    if (!owners.has(desiredOwnerId)) {
-      const source = override ? "manual override" : "meeting host";
-      log(`symptom#2: skip deal ${dealId} (${p.dealname}) ${source} ${desiredOwnerId} inactive/unknown`);
-      continue;
-    }
-    if (ownerId === desiredOwnerId) continue;
-
-    const reason = override ? "manual override" : `meeting ${meetingId} host`;
-    log(`symptom#2: deal ${dealId} (${p.dealname}) owner ${ownerId ? owners.get(ownerId)?.name : "(none)"} -> ${owners.get(desiredOwnerId).name} (${reason})`);
-    if (!dryRun) {
-      const cur = await crm.hub("GET", `/crm/v3/objects/deals/${dealId}?properties=hubspot_owner_id`);
-      const currentOwnerId = String(cur.properties.hubspot_owner_id || "");
-      if (currentOwnerId === desiredOwnerId) continue;
-      if (currentOwnerId !== String(ownerId || "")) {
-        log(`symptom#2: skip deal ${dealId} concurrent owner change ${String(ownerId || "(none)")} -> ${currentOwnerId || "(none)"}`);
-        continue;
-      }
-      if (overrideStore) {
-        const latestOverrides = await overrideStore.getDealOwnerOverrides([dealId]);
-        const latestDesiredOwnerId = latestOverrides.get(String(dealId))?.ownerId || host;
-        if (latestDesiredOwnerId !== desiredOwnerId) {
-          log(`symptom#2: skip deal ${dealId} concurrent override change ${desiredOwnerId} -> ${latestDesiredOwnerId}`);
-          continue;
-        }
-      }
-      await crm.hub("PATCH", `/crm/v3/objects/deals/${dealId}`, { properties: { hubspot_owner_id: desiredOwnerId } });
-      await crm.sleep(150);
-    }
-    fixed++;
-  }
-
-  const latestMeetingIds = [...new Set([...dealToLatestMeeting.values()])];
-  const latestMeetingToContacts = await crm.associations("meetings", latestMeetingIds, "contacts");
-  const dToContacts = new Map(activeDealIds.map((dealId) => [
-    String(dealId),
-    latestMeetingToContacts.get(dealToLatestMeeting.get(String(dealId))) || [],
-  ]));
-  const contactIds = [...new Set([...dToContacts.values()].flat())];
-  const contactProps = await crm.batchRead("contacts", contactIds, ["email", "hubspot_owner_id", "recent_conversion_event_name", "calendly_meeting_booked"]);
-  const contactUpdates = bookedContactOwnerUpdates(activeDealIds, dealToHost, dToContacts, contactProps);
-  let contactFixed = 0;
-  for (const update of contactUpdates) {
-    if (!owners.has(update.to)) { log(`symptom#2: skip contact ${update.contactId} (${update.email}) host ${update.to} inactive/unknown`); continue; }
-    log(`symptom#2: contact ${update.contactId} (${update.email}) owner (none) -> ${owners.get(update.to).name}`);
-    if (!dryRun) {
-      const cur = await crm.hub("GET", `/crm/v3/objects/contacts/${update.contactId}?properties=hubspot_owner_id,recent_conversion_event_name,calendly_meeting_booked`);
-      if (!isBookedDemoContact(cur.properties || {})) continue;
-      if (cur.properties.hubspot_owner_id) continue;
-      await crm.hub("PATCH", `/crm/v3/objects/contacts/${update.contactId}`, { properties: { hubspot_owner_id: update.to } });
-      await crm.sleep(150);
-    }
-    contactFixed++;
-  }
-
-  return { checked: activeDealIds.length, fixed, contactChecked: contactIds.length, contactFixed };
-}
-
 function isRemovedRoundRobinOwner(ownerId) {
   return cfg.REMOVED_ROUND_ROBIN_OWNER_IDS.includes(String(ownerId || ""));
 }
 
-// Existing deals and demo contacts still owned by someone removed from the roster
-// are moved onto the current roster. Every other existing owner stays put.
-async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cfg.DRY_RUN } = {}) {
+// Demo contacts owned by removed roster members move onto the current roster.
+// Existing deals are never reassigned.
+async function reassignRemovedContactOwners(owners, { api = null, dryRun = cfg.DRY_RUN, isContactManaged = async () => false, demoRouter = getDemoRouter() } = {}) {
   const crm = api || { hub, searchAll, sleep };
   const removed = cfg.REMOVED_ROUND_ROBIN_OWNER_IDS;
   if (!removed.length) return { checked: 0, reassigned: 0 };
 
-  const deals = await crm.searchAll("deals", {
-    filterGroups: removed.map((id) => ({ filters: [
-      { propertyName: "pipeline", operator: "EQ", value: cfg.ACTIVE_PIPELINE },
-      { propertyName: "hubspot_owner_id", operator: "EQ", value: id },
-    ] })),
-    properties: ["dealname", "hubspot_owner_id", "dealstage", "pipeline"],
-    limit: 100,
-  });
   const contacts = await crm.searchAll("contacts", {
     filterGroups: removed.map((id) => ({ filters: [
       { propertyName: "recent_conversion_event_name", operator: "CONTAINS_TOKEN", value: cfg.DEMO_FORM_TOKEN },
       { propertyName: "hubspot_owner_id", operator: "EQ", value: id },
     ] })),
-    properties: ["email", "hubspot_owner_id"],
+    properties: ["email", "hubspot_owner_id", SUBMISSION_PROPERTY],
     limit: 100,
   });
 
   let reassigned = 0;
-  for (const deal of deals) {
-    const from = String(deal.properties.hubspot_owner_id || "");
-    if (!isRemovedRoundRobinOwner(from)) continue;
-    if (cfg.CLOSED_DEAL_STAGE_IDS.includes(String(deal.properties.dealstage || ""))) continue;
-    const ae = pickAE(deal.id);
-    if (owners.size && !owners.has(ae.id)) {
-      log(`removed-owner: skip deal ${deal.id} roster owner ${ae.id} inactive/unknown`);
-      continue;
-    }
-    log(`removed-owner: deal ${deal.id} (${deal.properties.dealname || ""}) ${owners.get(from)?.name || from} -> ${ae.name}`);
-    if (!dryRun) {
-      const cur = await crm.hub("GET", `/crm/v3/objects/deals/${deal.id}?properties=hubspot_owner_id,dealstage`);
-      if (!isRemovedRoundRobinOwner(cur.properties.hubspot_owner_id)) continue;
-      if (cfg.CLOSED_DEAL_STAGE_IDS.includes(String(cur.properties.dealstage || ""))) continue;
-      await crm.hub("PATCH", `/crm/v3/objects/deals/${deal.id}`, { properties: { hubspot_owner_id: ae.id } });
-      await crm.sleep(150);
-    }
-    reassigned++;
-  }
-
   for (const contact of contacts) {
+    if (await protectContact(contact, demoRouter, { dryRun, isContactManaged })) continue;
     const from = String(contact.properties.hubspot_owner_id || "");
     const email = contact.properties.email || "";
     if (!isRemovedRoundRobinOwner(from)) continue;
@@ -237,11 +69,11 @@ async function reassignRemovedRoundRobinOwners(owners, { api = null, dryRun = cf
     reassigned++;
   }
 
-  return { checked: deals.length + contacts.length, reassigned };
+  return { checked: contacts.length, reassigned };
 }
 
 // ---------- Symptom #1: round-robin ownerless non-booker demo contacts ----------
-async function roundRobinNonBookers(owners) {
+async function roundRobinNonBookers(owners, { isContactManaged = async () => false, demoRouter = getDemoRouter() } = {}) {
   const now = Date.now();
   const minCreate = now - cfg.CONTACT_MAX_AGE_DAYS * 86400000;
   const maxCreate = now - cfg.CONTACT_MIN_AGE_MIN * 60000; // grace period to allow a booking to land first
@@ -253,7 +85,7 @@ async function roundRobinNonBookers(owners) {
       { propertyName: "hubspot_owner_id", operator: "NOT_HAS_PROPERTY" },
     ] }],
     sorts: [{ propertyName: "createdate", direction: "ASCENDING" }],
-    properties: ["email", "createdate", "hubspot_owner_id"],
+    properties: ["email", "createdate", "hubspot_owner_id", SUBMISSION_PROPERTY],
     limit: 100,
   });
   if (!contacts.length) { log("symptom#1: no ownerless demo contacts in window"); return { checked: 0, assigned: 0 }; }
@@ -263,6 +95,7 @@ async function roundRobinNonBookers(owners) {
 
   let assigned = 0;
   for (const c of contacts) {
+    if (await protectContact(c, demoRouter, { dryRun: cfg.DRY_RUN, isContactManaged })) continue;
     const id = String(c.id);
     const email = c.properties.email || "";
     if (cfg.INTERNAL_EMAIL_RE.test(email)) { log(`symptom#1: skip internal ${email}`); continue; }
@@ -284,11 +117,18 @@ async function roundRobinNonBookers(owners) {
 async function runCycle(overrideStore = null) {
   log(`reconciler start | DRY_RUN=${cfg.DRY_RUN} | pipeline=${cfg.ACTIVE_PIPELINE}`);
   const owners = await getOwners();
-  const s2 = await reconcileDealOwners(owners, { overrideStore });
-  const s1 = await roundRobinNonBookers(owners);
-  const removed = await reassignRemovedRoundRobinOwners(owners);
-  log(`reconciler done | symptom#2 checked=${s2.checked} fixed=${s2.fixed} contactChecked=${s2.contactChecked || 0} contactFixed=${s2.contactFixed || 0} | symptom#1 checked=${s1.checked} assigned=${s1.assigned} | removed-owner checked=${removed.checked} reassigned=${removed.reassigned}`);
-  return { s1, s2, removed };
+  const router = getDemoRouter();
+  const isContactManaged = async contactId => {
+    if (!overrideStore?.pool) throw new Error('demo_submission_assignment_guard_database_required');
+    const table = (await overrideStore.pool.query("SELECT to_regclass('public.demo_submission_lifecycle') AS name")).rows[0]?.name;
+    if (!table) return false; // notification worker has not been rolled out yet
+    return (await overrideStore.pool.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 LIMIT 1', [String(contactId)])).rows.length > 0;
+  };
+  const routed = await reconcileRoutedSubmissions(router, { searchAll }, { dryRun: cfg.DRY_RUN, isContactManaged });
+  const s1 = await roundRobinNonBookers(owners, { isContactManaged });
+  const removed = await reassignRemovedContactOwners(owners, { isContactManaged });
+  log(`reconciler done | routed checked=${routed.checked} protected=${routed.protected} | symptom#1 checked=${s1.checked} assigned=${s1.assigned} | removed-owner checked=${removed.checked} reassigned=${removed.reassigned}`);
+  return { s1, removed };
 }
 
-module.exports = { runCycle, reconcileDealOwners, reassignRemovedRoundRobinOwners, roundRobinNonBookers, pickAE, meetingTimestampMs, latestMeetingHost, latestMeetingHostDetails, isBookedDemoContact, bookedContactOwnerUpdates, log };
+module.exports = { runCycle, reassignRemovedContactOwners, roundRobinNonBookers, pickAE, log };

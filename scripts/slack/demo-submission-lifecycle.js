@@ -1,0 +1,604 @@
+const crypto = require('crypto');
+const { buildMessage, CHANNEL_ID } = require('./hubspot_demo');
+const { getOwnerSlackMap } = require('./slack-owner-map');
+const { CONFIG, ensureCalendlyOwnerMap, shouldProcessScheduledEvent, getOrganizerName } = require('./calendly_hubspot');
+const { DemoRequestDeals } = require('./demo-request-deals');
+const { ApolloCompanyEnricher } = require('./apollo-company-enrichment');
+
+const WINDOW_MS = 5 * 60 * 1000;
+const RANDOM_OWNER_IDS = ['84547076', '89305622']; // Sarah Elix, Xavier Marco
+const PROPERTIES = ['firstname', 'lastname', 'email', 'erp', 'jobtitle', 'how_did_you_hear_about_us', 'finance_team_size', 'phone', 'createdate', 'hubspot_owner_id'];
+const ms = value => /^\d+$/.test(String(value)) ? Number(value) : Date.parse(value);
+const normalizeEmail = value => String(value || '').trim().toLowerCase();
+const escape = value => String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+class DemoSubmissionLifecycle {
+  constructor({ pool, hubspotRequest, calendlyRequest, fetchImpl = fetch, env = process.env, logger = console, now = Date.now, randomInt = crypto.randomInt, refreshOwners = ensureCalendlyOwnerMap }) {
+    Object.assign(this, { pool, hubspotRequest, calendlyRequest, fetchImpl, env, logger, now, randomInt, refreshOwners });
+    this.ownerSlackMap = getOwnerSlackMap(env);
+    if (env.DEMO_REQUEST_DEALS_ENABLED === 'true') {
+      this.dealsActivatedAt = ms(env.DEMO_REQUEST_DEALS_ACTIVATED_AT);
+      if (!Number.isFinite(this.dealsActivatedAt) || this.dealsActivatedAt <= 0) throw new Error('demo_request_deals_activation_required');
+      this.requestDeals = new DemoRequestDeals({ request: hubspotRequest, logger });
+      if (env.APOLLO_API_KEY?.trim()) this.apolloEnricher = new ApolloCompanyEnricher({
+        request: hubspotRequest, apiKey: env.APOLLO_API_KEY.trim(), fetchImpl,
+      });
+    }
+  }
+
+  async initialize() {
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_submission_activation (
+      id INTEGER PRIMARY KEY CHECK (id = 1), activated_at BIGINT NOT NULL
+    )`);
+    await this.pool.query('INSERT INTO demo_submission_activation (id, activated_at) VALUES (1,$1) ON CONFLICT DO NOTHING', [this.now()]);
+    this.activatedAt = Number((await this.pool.query('SELECT activated_at FROM demo_submission_activation WHERE id = 1')).rows[0].activated_at);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_submission_lifecycle (
+      submission_key TEXT PRIMARY KEY, contact_id TEXT NOT NULL, submitted_at BIGINT NOT NULL,
+      email TEXT NOT NULL, assigned_owner TEXT, parent_ts TEXT, thread_root_key TEXT,
+      channel_id TEXT NOT NULL DEFAULT 'C066P0YFF6Z',
+      parent_state TEXT NOT NULL DEFAULT 'pending', parent_update_state TEXT NOT NULL DEFAULT 'pending', no_booking_state TEXT NOT NULL DEFAULT 'pending',
+      booked_state TEXT NOT NULL DEFAULT 'pending', booking_uri TEXT,
+      next_check BIGINT NOT NULL, last_error TEXT,
+      UNIQUE(contact_id, submitted_at)
+    )`);
+    await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS thread_root_key TEXT");
+    // Existing timestamps belong to slack-testing; new rows explicitly use the current destination.
+    await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS channel_id TEXT NOT NULL DEFAULT 'C066P0YFF6Z'");
+    await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS parent_update_state TEXT NOT NULL DEFAULT 'pending'");
+    await this.pool.query('ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS deal_id TEXT');
+    await this.pool.query('ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS company_name TEXT');
+    await this.pool.query("ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS deal_state TEXT NOT NULL DEFAULT 'pending'");
+    await this.pool.query('ALTER TABLE demo_submission_lifecycle ADD COLUMN IF NOT EXISTS deal_next_check BIGINT NOT NULL DEFAULT 0');
+    await this.pool.query('CREATE INDEX IF NOT EXISTS demo_submission_deal_due ON demo_submission_lifecycle(deal_next_check) WHERE deal_state = \'pending\'');
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS demo_submission_due ON demo_submission_lifecycle(next_check)
+      WHERE booked_state = 'pending' AND parent_state != 'needs_review'`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_submission_bookings (
+      invitee_uri TEXT PRIMARY KEY, email TEXT NOT NULL, booked_at BIGINT NOT NULL,
+      owner_id TEXT NOT NULL, details JSONB NOT NULL, canceled BOOLEAN NOT NULL DEFAULT false
+    )`);
+    await this.pool.query('CREATE INDEX IF NOT EXISTS demo_submission_booking_email ON demo_submission_bookings(email, booked_at)');
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_company_enrichment (
+      company_id TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'pending',
+      next_check BIGINT NOT NULL DEFAULT 0, checked_at BIGINT,
+      attempts INTEGER NOT NULL DEFAULT 0, cached_properties JSONB, last_status TEXT
+    )`);
+    await this.pool.query("CREATE INDEX IF NOT EXISTS demo_company_enrichment_due ON demo_company_enrichment(next_check) WHERE state = 'pending'");
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS demo_company_assignment (
+      company_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL
+    )`);
+    if (this.requestDeals) await this.requestDeals.initialize();
+    if (this.apolloEnricher) await this.apolloEnricher.initialize();
+  }
+
+  async enqueue(event) {
+    const submittedAt = ms(event.propertyValue);
+    if (!Number.isFinite(submittedAt)) throw new Error('invalid_submission_time');
+    const contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${event.objectId}?properties=email`);
+    const email = normalizeEmail(contact.properties?.email);
+    if (!email || String(contact.id) !== String(event.objectId)) throw new Error('submission_contact_unavailable');
+    // Serialize by normalized email, including Calendly-first delivery on a held DB client.
+    const client = typeof this.pool.release === 'function' ? this.pool : await this.pool.connect();
+    const borrowed = client !== this.pool;
+    try {
+      await client.query('BEGIN');
+      const locked = (await client.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked', [`demo-email:${email}`])).rows[0]?.locked;
+      if (!locked) throw new Error('submission_email_busy');
+      const existing = (await client.query(`SELECT * FROM demo_submission_lifecycle WHERE email = $1 AND channel_id = $2
+        AND thread_root_key IS NULL ORDER BY submitted_at, submission_key LIMIT 1`, [email, CHANNEL_ID])).rows[0];
+      const key = `${event.objectId}:${submittedAt}`;
+      let targetKey = key;
+      if (existing && !existing.parent_ts && existing.booked_state === 'pending') {
+        // Re-entering the form before the first notification must not restart its clock.
+        targetKey = existing.submission_key;
+      } else {
+        await client.query(`INSERT INTO demo_submission_lifecycle
+          (submission_key, contact_id, submitted_at, email, next_check, thread_root_key, assigned_owner, channel_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (contact_id, submitted_at) DO NOTHING`,
+        [key, String(event.objectId), submittedAt, email, submittedAt + WINDOW_MS,
+          existing && existing.submission_key !== key ? existing.submission_key : null, existing?.assigned_owner || null, CHANNEL_ID]);
+      }
+      await client.query(`UPDATE demo_submission_lifecycle SET next_check = $2 WHERE submission_key = $1
+        AND EXISTS (SELECT 1 FROM demo_submission_bookings b WHERE b.email = demo_submission_lifecycle.email
+          AND b.booked_at >= submitted_at AND b.canceled = false)`, [targetKey, this.now()]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { if (borrowed) client.release(); }
+    return 'queued';
+  }
+
+  async withContactLock(contactId, operation) {
+    const client = typeof this.pool.release === 'function' ? this.pool : await this.pool.connect();
+    const borrowed = client !== this.pool;
+    const key = `demo-submission:${contactId}`;
+    let locked = false;
+    try {
+      locked = (await client.query('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [key])).rows[0]?.locked === true;
+      if (!locked) return null;
+      return await operation(client);
+    } finally {
+      try { if (locked) await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [key]); }
+      finally { if (borrowed) client.release(); }
+    }
+  }
+
+  async saveBooking(payload, scheduledEvent, filter) {
+    const event = scheduledEvent.resource || scheduledEvent;
+    const bookedAt = ms(payload.created_at);
+    const email = normalizeEmail(payload.email);
+    if (!email || !Number.isFinite(bookedAt) || !payload.uri || !filter.ok || !filter.ownerId) return null;
+    if (!Number.isFinite(Date.parse(event.start_time)) || !Number.isFinite(Date.parse(event.end_time))) throw new Error('booking_meeting_times_unavailable');
+    const details = {
+      name: event.name || 'Calendly meeting', start: event.start_time, end: event.end_time,
+      host: getOrganizerName(filter.hostUserUri, scheduledEvent),
+      location: event.location?.join_url || event.location?.location || event.location?.type || '',
+    };
+    await this.pool.query(`INSERT INTO demo_submission_bookings (invitee_uri,email,booked_at,owner_id,details)
+      VALUES ($1,$2,$3,$4,$5::jsonb) ON CONFLICT (invitee_uri) DO UPDATE SET details = EXCLUDED.details, owner_id = EXCLUDED.owner_id`,
+    [payload.uri, email, bookedAt, String(filter.ownerId), JSON.stringify(details)]);
+    await this.pool.query(`UPDATE demo_submission_lifecycle SET next_check = $2, deal_next_check = 0
+      WHERE email = $1 AND submitted_at <= $3 AND booked_state = 'pending'`, [email, this.now(), bookedAt]);
+    return { email, bookedAt, ownerId: String(filter.ownerId), uri: payload.uri };
+  }
+
+  async observeBooking(eventName, payload, scheduledEvent, filter) {
+    if (eventName === 'invitee.canceled' || (scheduledEvent.resource || scheduledEvent).status === 'canceled') {
+      await this.saveBooking(payload, scheduledEvent, filter);
+      await this.pool.query('UPDATE demo_submission_bookings SET canceled = true WHERE invitee_uri = $1', [payload.uri]);
+      return null;
+    }
+    if (eventName !== 'invitee.created') return null;
+    const booking = await this.saveBooking(payload, scheduledEvent, filter);
+    if (!booking) return null;
+    const linked = await this.findBookingSubmission(booking);
+    if (linked) {
+      if (linked.bookedState === 'sent' && linked.bookingUri !== booking.uri) {
+        const delivered = (await this.pool.query(`SELECT 1 FROM demo_submission_lifecycle
+          WHERE email = $1 AND booking_uri = $2 AND booked_state = 'sent' LIMIT 1`, [booking.email, booking.uri])).rows.length;
+        if (!delivered) {
+          // A second Calendly booking can arrive without another HubSpot form event.
+          await this.enqueue({ objectId: linked.contactId, propertyValue: String(booking.bookedAt) });
+          const followup = await this.findBookingSubmission(booking);
+          if (!followup) throw new Error('submission_booking_correlation_unavailable');
+          return followup;
+        }
+      }
+      return linked;
+    }
+    // Calendly may arrive before the form webhook. Recover the form identity from HubSpot
+    // so the old standalone booking alert is suppressed for this submission as well.
+    const contacts = await this.hubspotRequest('/crm/v3/objects/contacts/search', {
+      method: 'POST', body: { filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: booking.email }] }],
+        properties: ['email', 'demo_form_submission_datetime'], limit: 2 },
+    });
+    if (!Array.isArray(contacts.results) || contacts.results.length > 1 || contacts.paging?.next) throw new Error('submission_contact_lookup_ambiguous');
+    const contact = contacts.results[0];
+    const submittedAt = ms(contact?.properties?.demo_form_submission_datetime);
+    if (!contact || !Number.isFinite(submittedAt) || submittedAt < this.activatedAt || submittedAt > booking.bookedAt) return null;
+    await this.enqueue({ objectId: contact.id, propertyValue: String(submittedAt) });
+    const recovered = await this.findBookingSubmission(booking);
+    if (!recovered) throw new Error('submission_booking_correlation_unavailable');
+    return recovered;
+  }
+
+  async findBookingSubmission(booking) {
+    const result = await this.pool.query(`SELECT contact_id, submitted_at, thread_root_key, booked_state, booking_uri FROM demo_submission_lifecycle
+      WHERE email = $1 AND submitted_at <= $2 ORDER BY submitted_at DESC LIMIT 1`, [booking.email, booking.bookedAt]);
+    if (result.rows[0]) return { ...booking, contactId: result.rows[0].contact_id, submittedAt: Number(result.rows[0].submitted_at), threadRootKey: result.rows[0].thread_root_key, bookedState: result.rows[0].booked_state, bookingUri: result.rows[0].booking_uri };
+    return null;
+  }
+
+  async hasContact(contactId) {
+    return (await this.pool.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 LIMIT 1', [String(contactId)])).rows.length > 0;
+  }
+
+  async prepareCompany(client, row) {
+    const contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}?properties=email,company,contact_type,lifecyclestage`);
+    if (String(contact.id) !== String(row.contact_id) || contact.archived || normalizeEmail(contact.properties?.email) !== row.email) throw new Error('submission_contact_identity_invalid');
+    contact.properties.company ||= row.company_name;
+    const company = await this.requestDeals.company(contact);
+    if (!company.id) throw new Error('submission_company_required');
+    await this.hubspotRequest(`/crm/v4/objects/contacts/${row.contact_id}/associations/default/companies/${company.id}`, { method: 'PUT' });
+    if (contact.properties.lifecyclestage !== 'customer' && contact.properties.contact_type !== 'Customer') {
+      await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}`, { method: 'PATCH', body: { properties: { contact_type: 'Prospective Customer' } } });
+    }
+    await this.enqueueCompanyEnrichment(client, company.id);
+    return company;
+  }
+
+  async assignCompany(client, row, companyId, booking) {
+    const lockKey = `demo-company:${companyId}`;
+    const locked = (await client.query('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [lockKey])).rows[0]?.locked;
+    if (!locked) throw new Error('submission_company_busy');
+    try {
+      const path = `/crm/v3/objects/companies/${companyId}`;
+      const company = await this.hubspotRequest(`${path}?properties=hubspot_owner_id`);
+      if (company.archived || String(company.id) !== String(companyId)) throw new Error('submission_company_unavailable');
+      // An existing or manually selected company owner is authoritative.
+      if (company.properties?.hubspot_owner_id) return String(company.properties.hubspot_owner_id);
+      const early = booking && Number(booking.booked_at) <= Number(row.submitted_at) + WINDOW_MS;
+      if (!early && this.now() < Number(row.submitted_at) + WINDOW_MS) return null;
+      let choice = (await client.query('SELECT owner_id FROM demo_company_assignment WHERE company_id = $1', [String(companyId)])).rows[0]?.owner_id;
+      if (!choice) {
+        choice = early ? String(booking.owner_id) : RANDOM_OWNER_IDS[this.randomInt(RANDOM_OWNER_IDS.length)];
+        await client.query('INSERT INTO demo_company_assignment(company_id,owner_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [String(companyId), choice]);
+      }
+      const owner = await this.hubspotRequest(`/crm/v3/owners/${choice}`);
+      if (owner.archived !== false || String(owner.id) !== choice) throw new Error('company_owner_inactive_or_unverified');
+      await this.hubspotRequest(path, { method: 'PATCH', body: { properties: { hubspot_owner_id: choice } } });
+      const verified = await this.hubspotRequest(`${path}?properties=hubspot_owner_id`);
+      if (String(verified.properties?.hubspot_owner_id || '') !== choice) throw new Error('company_owner_verification_failed');
+      return choice;
+    } finally {
+      await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [lockKey]);
+    }
+  }
+
+  async processDealRow(key) {
+    if (!this.requestDeals) return null;
+    const initial = (await this.pool.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
+    if (!initial || Number(initial.submitted_at) < this.dealsActivatedAt) return null;
+    const result = await this.withContactLock(initial.email, async client => {
+      const row = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
+      // Prepare CRM identities immediately; no meeting means no opportunity.
+      const company = await this.prepareCompany(client, row);
+      const scoped = Object.create(this);
+      scoped.pool = client;
+      if (this.now() >= Number(row.submitted_at) + WINDOW_MS) await scoped.discoverBookings(row);
+      const booking = (await client.query(`SELECT b.* FROM demo_submission_bookings b
+        WHERE b.email = $1 AND b.booked_at >= $2 AND b.canceled = false
+        AND NOT EXISTS (SELECT 1 FROM demo_submission_lifecycle s WHERE s.email = $1
+          AND s.submitted_at > $2 AND s.submitted_at <= b.booked_at)
+        ORDER BY b.booked_at, b.invitee_uri LIMIT 1`, [row.email, row.submitted_at])).rows[0];
+      const ownerId = await this.assignCompany(client, row, company.id, booking);
+      if (ownerId) await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, ownerId]);
+      if (!booking) {
+        await client.query('UPDATE demo_submission_lifecycle SET deal_next_check = $2 WHERE submission_key = $1',
+          [key, Math.max(this.now() + 30000, Number(row.submitted_at) + WINDOW_MS)]);
+        return null;
+      }
+      const saved = row.deal_id || (await client.query(`SELECT deal_id FROM demo_submission_lifecycle
+        WHERE contact_id = $1 AND deal_id IS NOT NULL ORDER BY submitted_at LIMIT 1`, [row.contact_id])).rows[0]?.deal_id;
+      const deal = await this.requestDeals.ensure({ contactId: row.contact_id, email: row.email, dealId: saved,
+        companyName: row.company_name, ownerId: booking.owner_id, bookingUri: booking.invitee_uri,
+        saveDeal: async id => client.query('UPDATE demo_submission_lifecycle SET deal_id = $2 WHERE submission_key = $1', [key, id]),
+      });
+      if (deal.company?.id) await this.enqueueCompanyEnrichment(client, deal.company.id);
+      await client.query("UPDATE demo_submission_lifecycle SET deal_state = 'ready' WHERE submission_key = $1", [key]);
+      this.logger.info?.('demo_deal_decision', { contactId: row.contact_id, dealId: deal.id, reason: 'confirmed_website_booking' });
+      return deal;
+    });
+    return result;
+  }
+
+  async ensureDealForBooking(contactId, companyName, bookingUri) {
+    if (!this.requestDeals) return null;
+    // Correlate this delivery to its booking time. A later, unbooked form
+    // must not take over an older confirmed booking when webhooks arrive late.
+    const row = (await this.pool.query(`SELECT s.submission_key FROM demo_submission_lifecycle s
+      JOIN demo_submission_bookings b ON b.email = s.email
+      WHERE s.contact_id = $1 AND s.submitted_at >= $2
+        AND b.invitee_uri = $3 AND b.canceled = false AND s.submitted_at <= b.booked_at
+      ORDER BY s.submitted_at DESC LIMIT 1`, [String(contactId), this.dealsActivatedAt, bookingUri])).rows[0];
+    if (row && String(companyName || '').trim()) await this.pool.query(`UPDATE demo_submission_lifecycle
+      SET company_name = COALESCE(company_name, $2), deal_state = 'pending' WHERE submission_key = $1`, [row.submission_key, String(companyName).trim()]);
+    if (!row) return null;
+    const deal = await this.processDealRow(row.submission_key);
+    if (!deal) throw new Error('demo_request_confirmed_booking_pending');
+    return deal;
+  }
+
+  async hasRequestDeal(dealId) {
+    return (await this.pool.query('SELECT 1 FROM demo_submission_lifecycle WHERE deal_id = $1 LIMIT 1', [String(dealId)])).rows.length > 0;
+  }
+
+  async enqueueCompanyEnrichment(client, companyId) {
+    const stale = "demo_company_enrichment.state = 'ready' AND demo_company_enrichment.checked_at <= $3";
+    await client.query(`INSERT INTO demo_company_enrichment (company_id, next_check) VALUES ($1,$2)
+      ON CONFLICT (company_id) DO UPDATE SET
+        state = CASE WHEN ${stale} THEN 'pending' ELSE demo_company_enrichment.state END,
+        cached_properties = CASE WHEN ${stale} THEN NULL ELSE demo_company_enrichment.cached_properties END,
+        attempts = CASE WHEN ${stale} THEN 0 ELSE demo_company_enrichment.attempts END,
+        next_check = CASE WHEN ${stale} THEN $2 ELSE demo_company_enrichment.next_check END`,
+    [String(companyId), this.now(), this.now() - 30 * 86400000]);
+  }
+
+  async tickCompanyEnrichment() {
+    if (!this.apolloEnricher) return;
+    const due = (await this.pool.query(`SELECT company_id FROM demo_company_enrichment
+      WHERE state = 'pending' AND next_check <= $1 ORDER BY next_check LIMIT 3`, [this.now()])).rows;
+    for (const item of due) {
+      await this.withContactLock(`apollo-company:${item.company_id}`, async client => {
+        const row = (await client.query('SELECT * FROM demo_company_enrichment WHERE company_id = $1', [item.company_id])).rows[0];
+        if (!row || row.state !== 'pending' || Number(row.next_check) > this.now()) return;
+        try {
+          const status = await this.apolloEnricher.enrich(row.company_id, row.cached_properties,
+            async cached => client.query('UPDATE demo_company_enrichment SET cached_properties = $2::jsonb WHERE company_id = $1', [row.company_id, JSON.stringify(cached)]));
+          await client.query(`UPDATE demo_company_enrichment SET state = 'ready', checked_at = $2,
+            last_status = $3, next_check = $4 WHERE company_id = $1`, [row.company_id, this.now(), status, this.now() + 30 * 86400000]);
+        } catch (error) {
+          const reason = /^apollo_company_[a-z0-9_]+$/.test(error.message) ? error.message : 'hubspot_company_enrichment_failed';
+          const delay = Math.min(3600000, Math.max(60000, error.retryAfterMs || 60000 * 2 ** Math.min(Number(row.attempts), 6)));
+          await client.query(`UPDATE demo_company_enrichment SET next_check = $2, attempts = attempts + 1,
+            last_status = $3, cached_properties = CASE WHEN $4 THEN NULL ELSE cached_properties END WHERE company_id = $1`,
+          [row.company_id, this.now() + delay, reason, ['apollo_company_identity_changed', 'apollo_company_cache_invalid'].includes(reason)]);
+          this.logger.error('demo_company_enrichment_retry_pending', { companyId: row.company_id, reason });
+        }
+      });
+    }
+  }
+
+  async reconcileBooking(booking) {
+    if (this.requestDeals || !booking || booking.threadRootKey || booking.bookedAt > booking.submittedAt + WINDOW_MS) return;
+    await this.withContactLock(booking.email, async client => {
+      const newer = (await client.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 AND submitted_at > $2 LIMIT 1', [booking.contactId, booking.bookedAt])).rows.length;
+      if (newer) return;
+      await this.assignOwner(booking.contactId, booking.ownerId);
+
+    });
+  }
+
+  async apiCollection(url) {
+    const rows = [];
+    const visited = new Set();
+    while (url) {
+      const target = new URL(url);
+      if (target.origin !== 'https://api.calendly.com' || visited.has(url)) throw new Error('invalid_calendly_pagination');
+      visited.add(url);
+      const page = await this.calendlyRequest(url);
+      if (!Array.isArray(page.collection)) throw new Error('invalid_calendly_collection');
+      rows.push(...page.collection);
+      url = page.pagination?.next_page;
+    }
+    return rows;
+  }
+
+  async discoverBookings(row) {
+    // Ask Calendly directly before saying a lead did not book: webhook delivery can lag.
+    const me = await this.calendlyRequest('https://api.calendly.com/users/me');
+    const organization = me.resource?.current_organization;
+    if (!organization) throw new Error('calendly_organization_unavailable');
+    await this.refreshOwners();
+    const query = new URLSearchParams({ organization, invitee_email: row.email, status: 'active', count: '100' });
+    const events = await this.apiCollection(`https://api.calendly.com/scheduled_events?${query}`);
+    for (const event of events) {
+      const filter = shouldProcessScheduledEvent(event);
+      if (!filter.ok && CONFIG.allowedEventTypeUris.has(event.event_type)) throw new Error('calendly_host_unresolved');
+      if (!filter.ok) continue;
+      if (!/^https:\/\/api\.calendly\.com\/scheduled_events\/[\w-]+$/.test(event.uri)) throw new Error('invalid_calendly_event_uri');
+      const invitees = await this.apiCollection(`${event.uri}/invitees?status=active&count=100`);
+      for (const invitee of invitees) {
+        if (normalizeEmail(invitee.email) !== row.email) continue;
+        const createdAt = ms(invitee.created_at);
+        if (!Number.isFinite(createdAt)) throw new Error('booking_creation_time_unavailable');
+        if (createdAt >= Number(row.submitted_at)) await this.saveBooking(invitee, event, filter);
+      }
+    }
+  }
+
+  async assignOwner(contactId, ownerId) {
+    if (!this.ownerSlackMap[ownerId] && !RANDOM_OWNER_IDS.includes(ownerId)) throw new Error('contact_owner_slack_mapping_missing');
+    const owner = await this.hubspotRequest(`/crm/v3/owners/${ownerId}`);
+    if (owner.archived !== false || String(owner.id) !== ownerId) throw new Error('contact_owner_inactive_or_unverified');
+    await this.hubspotRequest(`/crm/v3/objects/contacts/${contactId}`, {
+      method: 'PATCH', body: { properties: { hubspot_owner_id: ownerId } },
+    });
+    const contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${contactId}?properties=${PROPERTIES.join(',')}`);
+    if (String(contact.id) !== String(contactId) || String(contact.properties?.hubspot_owner_id) !== ownerId) throw new Error('contact_owner_verification_failed');
+    return contact;
+  }
+
+  meetingText(booking) {
+    const d = booking.details;
+    const date = value => Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : 'unavailable';
+    return [`Meeting: ${escape(d.name)}`, `Host: ${escape(d.host)}`,
+      `Starts: ${date(d.start)} (UTC)`, `Ends: ${date(d.end)} (UTC)`,
+      ...(d.location ? [`Location: ${escape(d.location)}`] : [])].join('\n');
+  }
+
+  async send(client, row, stateColumn, message) {
+    if (!['parent_state', 'parent_update_state', 'no_booking_state', 'booked_state'].includes(stateColumn)) throw new Error('invalid_notification_phase');
+    // State is persisted before the external write, while holding the contact lock.
+    const claim = await client.query(`UPDATE demo_submission_lifecycle SET ${stateColumn} = 'sending'
+      WHERE submission_key = $1 AND ${stateColumn} = 'pending' RETURNING submission_key`, [row.submission_key]);
+    if (!claim.rows.length) return null;
+    const updating = stateColumn === 'parent_update_state';
+    const channel = row.channel_id || CHANNEL_ID;
+    let definitelyRejected = updating;
+    try {
+      const response = await this.fetchImpl(`https://slack.com/api/${updating ? 'chat.update' : 'chat.postMessage'}`, {
+        method: 'POST', signal: AbortSignal.timeout(15000),
+        headers: { authorization: `Bearer ${this.env.SLACK_BOT_TOKEN.replace(/\s+/g, '')}`, 'content-type': 'application/json' },
+        body: JSON.stringify(updating
+          ? { channel, ts: row.parent_ts, text: message.text, blocks: message.blocks }
+          : { unfurl_links: false, unfurl_media: false, ...message, channel }),
+      });
+      if (response.status === 429) { definitelyRejected = true; throw new Error('slack_rate_limited'); }
+      if (!response.ok) throw new Error('slack_http_delivery_unknown');
+      const result = await response.json();
+      if (result.ok === false) { definitelyRejected = true; throw new Error('slack_rejected'); }
+      if (result.ok !== true || !result.ts || result.channel !== channel) throw new Error('slack_delivery_unknown');
+      await client.query(`UPDATE demo_submission_lifecycle SET ${stateColumn} = 'sent'
+        ${stateColumn === 'parent_state' ? ', parent_ts = $2' : ''} WHERE submission_key = $1`,
+      stateColumn === 'parent_state' ? [row.submission_key, result.ts] : [row.submission_key]);
+      return result.ts;
+    } catch (error) {
+      await client.query(`UPDATE demo_submission_lifecycle SET ${stateColumn} = $2, last_error = $3
+        WHERE submission_key = $1`, [row.submission_key, definitelyRejected ? 'pending' : 'needs_review', definitelyRejected ? 'slack_rejected' : 'slack_delivery_unknown']);
+      this.logger.error(definitelyRejected ? 'demo_submission_delivery_rejected' : 'demo_submission_delivery_needs_review', { submissionKey: row.submission_key, phase: stateColumn });
+      throw error;
+    }
+  }
+
+  async processRow(key) {
+    const initial = (await this.pool.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
+    if (!initial) return;
+    await this.withContactLock(initial.email, async client => {
+      const row = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [key])).rows[0];
+      if (Number(row.next_check) > this.now() || row.parent_state === 'needs_review' || row.booked_state !== 'pending') return;
+      for (const column of ['parent_state', 'parent_update_state', 'no_booking_state', 'booked_state']) {
+        if (row[column] === 'sending') {
+          if (column === 'parent_update_state') {
+            await client.query("UPDATE demo_submission_lifecycle SET parent_update_state = 'pending' WHERE submission_key = $1", [key]);
+            row[column] = 'pending';
+            continue;
+          }
+          await client.query(`UPDATE demo_submission_lifecycle SET ${column} = 'needs_review', last_error = 'slack_delivery_unknown'
+            WHERE submission_key = $1`, [key]);
+          row[column] = 'needs_review';
+        }
+      }
+      if (row.parent_state === 'needs_review' || row.booked_state !== 'pending') return;
+      const repeat = Boolean(row.thread_root_key);
+      if (repeat) {
+        const root = (await client.query('SELECT * FROM demo_submission_lifecycle WHERE submission_key = $1', [row.thread_root_key])).rows[0];
+        if (!root?.parent_ts || root.parent_state !== 'sent') return;
+        if (root.channel_id !== row.channel_id) throw new Error('submission_thread_channel_mismatch');
+        row.parent_ts = root.parent_ts;
+        row.parent_state = 'sent';
+        row.no_booking_state = 'sent';
+        await client.query(`UPDATE demo_submission_lifecycle SET parent_ts = $2, parent_state = 'sent', no_booking_state = 'sent'
+          WHERE submission_key = $1`, [key, root.parent_ts]);
+      }
+      // Discover outside no state assumptions: this also recovers missed late webhooks.
+      const scoped = Object.create(this);
+      scoped.pool = client;
+      await scoped.discoverBookings(row);
+      const booking = (await client.query(`SELECT b.* FROM demo_submission_bookings b WHERE b.email = $1
+        AND b.booked_at >= $2 AND b.canceled = false
+        AND NOT EXISTS (SELECT 1 FROM demo_submission_lifecycle s WHERE s.email = $1
+          AND s.submitted_at > $2 AND s.submitted_at <= b.booked_at)
+        ORDER BY b.booked_at, b.invitee_uri LIMIT 1`, [row.email, row.submitted_at])).rows[0];
+      if (booking) {
+        const notified = (await client.query(`SELECT 1 FROM demo_submission_lifecycle
+          WHERE email = $1 AND booking_uri = $2 AND booked_state = 'sent' AND submission_key != $3 LIMIT 1`,
+        [row.email, booking.invitee_uri, key])).rows.length > 0;
+        if (notified) {
+          await client.query("UPDATE demo_submission_lifecycle SET booked_state = 'sent', booking_uri = $2 WHERE submission_key = $1", [key, booking.invitee_uri]);
+          return;
+        }
+      }
+      const early = !repeat && booking && Number(booking.booked_at) <= Number(row.submitted_at) + WINDOW_MS;
+      if (!booking && this.now() < Number(row.submitted_at) + WINDOW_MS) return;
+      const newer = (await client.query('SELECT 1 FROM demo_submission_lifecycle WHERE contact_id = $1 AND submitted_at > $2 AND thread_root_key IS NULL LIMIT 1', [row.contact_id, row.submitted_at])).rows.length > 0;
+      let ownerId, contact;
+      if (this.requestDeals) {
+        const company = await this.prepareCompany(client, row);
+        ownerId = await this.assignCompany(client, row, company.id, booking);
+        if (!ownerId) return;
+        await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, ownerId]);
+        // HubSpot's company-to-contact workflow owns contact inheritance.
+        contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}?properties=${PROPERTIES.join(',')}`);
+      } else {
+        ownerId = row.assigned_owner || (early ? booking.owner_id : null);
+        if (!ownerId) {
+          ownerId = RANDOM_OWNER_IDS[this.randomInt(RANDOM_OWNER_IDS.length)];
+          await client.query('UPDATE demo_submission_lifecycle SET assigned_owner = $2 WHERE submission_key = $1', [key, ownerId]);
+        }
+
+        if (newer || (row.parent_ts && !early)) {
+          contact = await this.hubspotRequest(`/crm/v3/objects/contacts/${row.contact_id}?properties=${PROPERTIES.join(',')}`);
+          ownerId = String(contact.properties?.hubspot_owner_id || '');
+          if (!this.ownerSlackMap[ownerId] && !RANDOM_OWNER_IDS.includes(ownerId)) throw new Error('contact_owner_slack_mapping_missing');
+        } else {
+          contact = await this.assignOwner(row.contact_id, ownerId);
+        }
+
+      }
+      const mention = this.ownerSlackMap[ownerId] ? `<@${this.ownerSlackMap[ownerId]}>` : (ownerId === '84547076' ? 'Sarah Elix' : ownerId === '89305622' ? 'Xavier Marco' : `HubSpot owner ${ownerId}`);
+      let parentTs = row.parent_ts;
+      if (row.parent_state === 'pending' || (early && row.parent_ts)) {
+        const message = buildMessage(contact, { slackUserId: this.ownerSlackMap[ownerId] });
+        if (!this.ownerSlackMap[ownerId]) {
+          message.text = `${mention}\n${message.text}`;
+          message.blocks[0].text.text = message.text;
+        }
+        if (early) {
+          message.text += `\n- Booked a meeting within five minutes.\n${this.meetingText(booking)}`;
+          message.blocks[0].text.text = message.text;
+        }
+        if (row.parent_ts) {
+          await this.send(client, row, 'parent_update_state', message);
+        } else {
+          parentTs = await this.send(client, row, 'parent_state', message);
+        }
+      }
+      if (!parentTs) return;
+      if (!early && row.no_booking_state === 'pending') {
+        await this.send(client, row, 'no_booking_state', {
+          thread_ts: parentTs, text: `${mention} This lead did NOT book a meeting within the first five minutes. Please follow up.`,
+        });
+      }
+      if (booking) {
+        const bookedOwner = early && !newer ? booking.owner_id : ownerId;
+        const bookedMention = `<@${this.ownerSlackMap[bookedOwner]}>`;
+        if (!early || row.parent_ts) {
+          await this.send(client, row, 'booked_state', {
+            thread_ts: parentTs, text: `${bookedMention} This lead booked a meeting${repeat ? '' : early ? ' within the first five minutes (booking confirmation arrived later)' : ' after the first five minutes'}.\n${this.meetingText(booking)}`,
+          });
+        } else {
+          await client.query("UPDATE demo_submission_lifecycle SET booked_state = 'sent' WHERE submission_key = $1", [key]);
+        }
+        await client.query('UPDATE demo_submission_lifecycle SET booking_uri = $2 WHERE submission_key = $1', [key, booking.invitee_uri]);
+        if (repeat) await client.query("UPDATE demo_submission_lifecycle SET booked_state = 'sent', booking_uri = COALESCE(booking_uri, $2) WHERE submission_key = $1", [row.thread_root_key, booking.invitee_uri]);
+      }
+      await client.query('UPDATE demo_submission_lifecycle SET next_check = $2, last_error = NULL WHERE submission_key = $1', [key, this.now() + WINDOW_MS]);
+    });
+  }
+
+  async tick() {
+    if (this.requestDeals) {
+      // Deal retries are independent of the notification deadline and continue
+      // even after a booking notification has already completed.
+      const due = (await this.pool.query(`SELECT submission_key FROM demo_submission_lifecycle
+        WHERE submitted_at >= $1 AND deal_state = 'pending' AND deal_next_check <= $2
+        ORDER BY submitted_at LIMIT 25`, [this.dealsActivatedAt, this.now()])).rows;
+      for (const row of due) {
+        try { await this.processDealRow(row.submission_key); }
+        catch {
+          await this.pool.query('UPDATE demo_submission_lifecycle SET deal_next_check = $2 WHERE submission_key = $1', [row.submission_key, this.now() + 30000]);
+          this.logger.error('demo_request_deal_retry_pending', { submissionKey: row.submission_key });
+        }
+      }
+    }
+    const rows = (await this.pool.query(`SELECT submission_key FROM demo_submission_lifecycle
+      WHERE next_check <= $1 AND booked_state = 'pending' AND parent_state != 'needs_review'
+      ORDER BY next_check LIMIT 25`, [this.now()])).rows;
+    for (const row of rows) {
+      try { await this.processRow(row.submission_key); }
+      catch {
+        await this.pool.query('UPDATE demo_submission_lifecycle SET next_check = $2 WHERE submission_key = $1', [row.submission_key, this.now() + 30000]);
+        this.logger.error('demo_submission_retry_pending', { submissionKey: row.submission_key });
+      }
+    }
+  }
+
+  start() {
+    let running = false;
+    const run = async () => {
+      if (running) return;
+      running = true;
+      try { await this.tick(); } catch { this.logger.error('demo_submission_worker_failed'); }
+      finally { running = false; }
+    };
+    const timer = setInterval(run, 15000);
+    timer.unref();
+    void run();
+    if (this.apolloEnricher) {
+      let enriching = false;
+      const enrich = async () => {
+        if (enriching) return;
+        enriching = true;
+        try { await this.tickCompanyEnrichment(); } catch { this.logger.error('demo_company_enrichment_worker_failed'); }
+        finally { enriching = false; }
+      };
+      this.enrichmentTimer = setInterval(enrich, 15000);
+      this.enrichmentTimer.unref();
+      void enrich();
+    }
+    return timer;
+  }
+}
+
+module.exports = { DemoSubmissionLifecycle, WINDOW_MS, RANDOM_OWNER_IDS, CHANNEL_ID };

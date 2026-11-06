@@ -1,0 +1,36 @@
+name: SDR verification
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdr-verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: agentwork-verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Prepare isolated Python environment
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -r cloud/sdr/requirements.txt
+      - name: Webhook and completion tests (mock providers)
+        run: |
+          .venv/bin/python -B -m unittest discover -s tests -p 'test_cloud_sdr.py' -v
+          .venv/bin/python -B -m unittest discover -s tests -p 'test_cloud_completion.py' -v
+      - name: Signed disposition acceptance scenarios (mock providers)
+        run: .venv/bin/python -B -m unittest discover -s tests -p 'test_cloud_dispositions.py' -v

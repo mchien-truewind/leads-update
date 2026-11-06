@@ -1,7 +1,7 @@
 // One-time historical backfill (DRY_RUN by default).
 //   Ownerless, non-booker demo-form contacts -> round-robin to the AE roster.
 //   Existing owners are not rewritten here. Removed roster members are reassigned
-//   by the reconciler (reassignRemovedRoundRobinOwners).
+//   by the reconciler (reassignRemovedContactOwners).
 // Re-reads each record immediately before writing.
 //
 // Ported from the retired gtm-ops repo. Run manually:  npm run gtm-ops:backfill[:live]

@@ -35,5 +35,8 @@
     "@slack/bolt": "^4.6.0",
     "googleapis": "^171.4.0",
     "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.10"
   }
 }

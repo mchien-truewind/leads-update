@@ -1,0 +1,11 @@
+{
+  "name": "truewind_demo_request_contact_id",
+  "label": "Truewind demo request contact ID",
+  "description": "Internal unique contact key for automatic demo-request deals. Prevents duplicate deals during webhook retries. Managed by the leads-update worker.",
+  "groupName": "dealinformation",
+  "type": "string",
+  "fieldType": "text",
+  "hasUniqueValue": true,
+  "hidden": true,
+  "formField": false
+}

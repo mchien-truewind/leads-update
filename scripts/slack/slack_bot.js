@@ -3,6 +3,8 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
+const { IssueLogStore } = require('./issue_log_store');
+const { ISSUE_SHEET, createIssueLogger, readIssueThread, analyzeIssue } = require('./issue_logger');
 
 // Load .env.local if it exists (local dev), otherwise use environment variables (Railway)
 const envPath = path.resolve(__dirname, '../../.env.local');
@@ -36,6 +38,7 @@ const Anthropic = require('@anthropic-ai/sdk').default;
 const { google } = require('googleapis');
 const {
   handleCalendlyHubSpotWebhook,
+  calendlyRequest,
 } = require('./calendly_hubspot');
 const {
   runLeadStatusSync,
@@ -43,6 +46,14 @@ const {
 const {
   createPostgresSlackStateStore,
 } = require('./slack_state_store');
+const { DemoNotificationStore, handleHubSpotDemoWebhook } = require('./hubspot_demo');
+const { createDemoRouter, routingEnabled } = require('./demo-routing');
+const { handleDemoRoutingRequest } = require('./demo-routing-http');
+const { DemoBookingStore } = require('./demo-booking-store');
+const { DemoSubmissionLifecycle } = require('./demo-submission-lifecycle');
+const { GoogleCalendarDealSync } = require('./google-calendar-deal-sync');
+const { startDemoRoutingRecovery } = require('./demo-routing-recovery');
+const { verifyOwnerRegistry } = require('./demo-routing-readiness');
 const {
   buildMqlDiscoveryReport,
   formatMqlDiscoveryReport,
@@ -90,6 +101,16 @@ oauth2Client.setCredentials({
   refresh_token: tokenData.refresh_token,
 });
 const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+// Keep the issue sheet's service account separate from existing Google OAuth tools.
+const issueLogCredentials = process.env.GOOGLE_ISSUE_LOG_SERVICE_ACCOUNT_JSON;
+const issueLogSheets = issueLogCredentials ? google.sheets({
+  version: 'v4',
+  auth: new google.auth.GoogleAuth({
+    credentials: JSON.parse(issueLogCredentials),
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  }),
+}) : null;
+let issueLogHandler;
 
 // ============================================================
 // HubSpot setup
@@ -171,17 +192,7 @@ const TRUEWIND_HUBSPOT = {
   },
 };
 
-const DEFAULT_SLACK_TO_HUBSPOT_OWNER = {
-  U0ATZSNCE5T: { id: '91143842', name: 'Jenilee Chen' },
-  U0AURH4KMRN: { id: '91143844', name: 'Brendan Moody' },
-  U0AKMHVCJMA: { id: '89305622', name: 'Xavier Marco' },
-  U09QC3B292R: { id: '84547076', name: 'Sarah Elix' },
-  U04BPMPR29G: { id: '559564379', name: 'Alex Lee' },
-  U0B4MRN83FE: { id: '92555980', name: 'Amy Vetter' },
-  U0BAMU9DYR4: { id: '93961770', name: 'Andrew Moyer' },
-  U0BARRLR6Q1: { id: '93961773', name: 'Ari Nachman' },
-  U0ABULY5TEK: { id: '91143842', name: 'Jenilee Chen' },
-};
+const { DEFAULT_SLACK_TO_HUBSPOT_OWNER } = require('./slack-owner-map');
 
 function parseSlackOwnerMap() {
   const raw = process.env.SLACK_TO_HUBSPOT_OWNER_JSON || process.env.SLACK_USER_TO_HUBSPOT_OWNER_JSON || '';
@@ -249,6 +260,12 @@ const slackHttpInteractionSeen = new Map();
 let slackStateStore = createPostgresSlackStateStore({
   connectionString: process.env.DEAL_OWNER_OVERRIDE_DATABASE_URL || process.env.SLACK_STATE_DATABASE_URL,
 });
+let demoNotificationStore = null;
+let demoLifecycle = null;
+let nooksDeals = null;
+const { NooksDeals, handleNooksDealRequest } = require('./nooks-deals');
+let demoRouter = null;
+let demoBookingStore = null;
 let slackBotUserIdPromise = null;
 
 function resolveSlackEventTransport(value = process.env.SLACK_EVENT_TRANSPORT) {
@@ -2724,6 +2741,14 @@ async function createStructuredDealNote({ dealId, contactId, companyId, body }) 
   return note;
 }
 
+function dealAssociations(contactId, companyId) {
+  if (!/^\d+$/.test(String(contactId || '')) || !/^\d+$/.test(String(companyId || ''))) throw new Error('Deal creation requires one contact_id and one company_id');
+  return [
+    { to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 3 }] },
+    { to: { id: String(companyId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 341 }] },
+  ];
+}
+
 async function runStructuredDealCreateWorkflow(input) {
   const email = normalizeEmail(input.email);
   if (!isValidEmail(email)) {
@@ -2782,7 +2807,7 @@ async function runStructuredDealCreateWorkflow(input) {
       hubspot_owner_id: dealOwner.id,
       deal_source: leadSource,
     }));
-    const dealRes = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: dealProps });
+    const dealRes = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: dealProps, associations: dealAssociations(contactId, companyId) });
     const dealId = requireHubSpotObjectId(dealRes, 'HubSpot deal create');
     partial.dealId = dealId;
 
@@ -2999,7 +3024,7 @@ async function runTruewindHubSpotProspectWorkflow(input) {
       if (duplicateDeal) return JSON.stringify(formatDuplicateDealError(duplicateDeal));
     }
     const existingDeal = await findExistingDeal(dealName);
-    const dealRes = existingDeal || await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedDealProps });
+    const dealRes = existingDeal || await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedDealProps, associations: dealAssociations(contactId, companyId) });
     const dealId = requireHubSpotObjectId(dealRes, 'HubSpot deal create');
     partial.dealId = dealId;
 
@@ -3318,7 +3343,7 @@ const TOOLS = [
   },
   {
     name: 'hubspot_create_deal',
-    description: 'Create a new deal in HubSpot. Requires explicit deal_source from the user. If the user did not provide a source, ask for it before calling this tool. Active Pipeline ID is 105321581. Stages: MQL=1307720553, SQL=190380582, Full Product Demo=190380583, POC=190380586, Proposal=190380584, Won=1166230571, Closed/Lost=190380587. The backend BLOCKS creation if an open deal already exists for the company in the active pipeline (stages MQL..Proposal); always pass company_name (and email/company_id/contact_id when known). If the result is duplicate_deal_exists, relay its message to the user and do NOT create the deal unless they reply with "override".',
+    description: 'Create a new deal in HubSpot with one required contact_id and one required company_id associated atomically. Resolve or create both records first. Requires explicit deal_source from the user. If the user did not provide a source, ask for it before calling this tool. Active Pipeline ID is 105321581. Stages: MQL=1307720553, SQL=190380582, Full Product Demo=190380583, POC=190380586, Proposal=190380584, Won=1166230571, Closed/Lost=190380587. The backend BLOCKS creation if an open deal already exists for the company in the active pipeline (stages MQL..Proposal); always pass company_name (and email/company_id/contact_id when known). If the result is duplicate_deal_exists, relay its message to the user and do NOT create the deal unless they reply with "override".',
     input_schema: {
       type: 'object',
       properties: {
@@ -3340,7 +3365,7 @@ const TOOLS = [
           description: 'Writable deal properties (e.g. hubspot_owner_id, closedate). Do not include deal_source here; pass it as the top-level required deal_source field. Do not include HubSpot read-only/system fields such as hs_deal_stage_probability_shadow, notes_last_updated, or hs_object_source_detail_1.',
         },
       },
-      required: ['dealname', 'dealstage', 'deal_source'],
+      required: ['dealname', 'dealstage', 'deal_source', 'contact_id', 'company_id'],
     },
   },
   {
@@ -3548,6 +3573,9 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
     }
 
     // --- Google Sheets ---
+    if (['append_rows', 'update_cells'].includes(name) && input.spreadsheet_id === ISSUE_SHEET) {
+      return 'Issue sheet writes must use the dedicated #leads issue logger, which checks clarification and retry safety.';
+    }
     if (name === 'read_spreadsheet') {
       const res = await sheets.spreadsheets.values.get({
         spreadsheetId: input.spreadsheet_id,
@@ -3682,8 +3710,9 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
         const dealOwner = resolveDealHubSpotOwner({ ...input }, requesterOwner);
         if (dealOwner?.id) props.hubspot_owner_id = dealOwner.id;
       }
+      const associations = dealAssociations(input.contact_id, input.company_id);
       const validatedProps = await validateHubSpotProperties('deals', props);
-      const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedProps });
+      const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedProps, associations });
       return JSON.stringify(formatHubSpotObjectResponse(res, 'deals'));
     }
     if (name === 'hubspot_update_deal') {
@@ -4525,6 +4554,19 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
     text_chars: cleanText.length,
     has_slack_user: Boolean(slackUserId),
   });
+
+  if (issueLogSheets && slackStateStore) {
+    if (!issueLogHandler) {
+      issueLogHandler = createIssueLogger({
+        store: new IssueLogStore(slackStateStore.pool),
+        sheets: issueLogSheets,
+        readThread: (channelId, ts) => readIssueThread(app.client,
+          [process.env.SLACK_USER_TOKEN, process.env.SLACK_BOT_TOKEN], channelId, ts),
+        analyze: input => analyzeIssue({ messages: { create: args => withRetry(() => anthropic.messages.create(args)) } }, CLAUDE_DEFAULT_MODEL, input),
+      });
+    }
+    if (await issueLogHandler({ channel, threadTs, userId: slackUserId, text: cleanText, say })) return;
+  }
 
   const structuredDeal = parseStructuredDealRequest(cleanText);
   if (structuredDeal) {
@@ -6177,6 +6219,20 @@ function startHttpServer() {
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = Number(process.env.PORT || 3000);
   const server = http.createServer(async (req, res) => {
+    if (req.url.split('?')[0] === '/internal/demo-routing/resolve') {
+      await handleDemoRoutingRequest(req, res, { router: demoRouter });
+      return;
+    }
+    if (req.url.split('?')[0] === '/internal/nooks/deals') {
+      await handleNooksDealRequest(req, res, { service: nooksDeals, token: process.env.NOOKS_FORWARD_TOKEN, readBody: readRawRequestBody });
+      return;
+    }
+    if (req.url.split('?')[0] === '/api/webhooks/hubspot') {
+      await handleHubSpotDemoWebhook(req, res, {
+        env: process.env, store: demoNotificationStore, hubspotRequest, logger: console, demoRouter, demoLifecycle,
+      });
+      return;
+    }
     if (req.method === 'POST' && req.url.split('?')[0] === '/slack/interactions') {
       let rawBody = '';
       try {
@@ -6316,6 +6372,7 @@ function startHttpServer() {
       try {
         await handleCalendlyHubSpotWebhook(req, res, {
           logger: console,
+          demoRouter, demoBookingStore, demoLifecycle,
           slackClient: app.client,
           slackToken: process.env.SLACK_BOT_TOKEN,
           slackChannel: process.env.CALENDLY_DEMO_SLACK_CHANNEL_ID || process.env.CALENDLY_DEMO_SLACK_CHANNEL,
@@ -6517,9 +6574,49 @@ async function startSlackBot() {
   }
   if (slackStateStore) {
     await slackStateStore.initialize();
+    if (issueLogSheets) {
+      await new IssueLogStore(slackStateStore.pool).initialize();
+      console.log('Leads issue logger ready: channel=C05MF0R662J');
+    }
     startSlackInteractionRecoveryLoop();
     console.log('Slack durable interaction state: ready');
   }
+
+  if (process.env.NOOKS_DEALS_ENABLED === 'true') {
+    if (!slackStateStore?.pool || !process.env.NOOKS_FORWARD_TOKEN || !process.env.NOOKS_WORKSPACE_ID || !process.env.NOOKS_MEETING_DISPOSITION_IDS) throw new Error('Nooks deals require durable state, forwarding token, workspace and disposition IDs');
+    nooksDeals = new NooksDeals({ request: hubspotRequestFromFetchOptions, pool: slackStateStore.pool });
+    await nooksDeals.deals.initialize();
+  }
+  if (process.env.HUBSPOT_DEMO_SLACK_ENABLED === 'true') {
+    if (!slackStateStore?.pool || !HUBSPOT_TOKEN || !process.env.HUBSPOT_CLIENT_SECRET || !process.env.SLACK_BOT_TOKEN) {
+      throw new Error('Demo webhooks require the Slack state database, HubSpot token and app secret, and Slack bot token');
+    }
+    demoNotificationStore = new DemoNotificationStore(slackStateStore.pool);
+    await demoNotificationStore.initialize();
+    if (!(process.env.CALENDLY_API || process.env.CALENDLY_API_KEY)) throw new Error('Demo submission notifications require the Calendly API token');
+    demoLifecycle = new DemoSubmissionLifecycle({ pool: slackStateStore.pool,
+      hubspotRequest: hubspotRequestFromFetchOptions, calendlyRequest });
+    await demoLifecycle.initialize();
+    console.log('HubSpot demo webhook ready: #leads (five-minute booking window)');
+  }
+
+  if (process.env.DEMO_ROUTING_ENABLED === 'true' || process.env.DEMO_ROUTING_ACTIVATED_AT) {
+    if (!slackStateStore?.pool) throw new Error('Demo routing requires the Slack state database');
+    if (process.env.DEMO_ROUTING_ENABLED === 'true' && (!routingEnabled(process.env) || !demoNotificationStore)) {
+      throw new Error('Demo routing requires a valid activation timestamp and enabled demo webhook');
+    }
+    demoRouter = createDemoRouter({ request: hubspotRequestFromFetchOptions });
+    await demoRouter.validateCoverage();
+    if (routingEnabled(process.env)) await verifyOwnerRegistry({ registry: demoRouter.registry,
+      hubspotRequest: hubspotRequestFromFetchOptions, calendlyRequest, slackClient: app.client,
+      trustedSlackOwnerMap: HUBSPOT_OWNER_TO_SLACK_USER });
+    demoBookingStore = new DemoBookingStore(slackStateStore.pool);
+    await demoBookingStore.initialize();
+    if (routingEnabled(process.env)) startDemoRoutingRecovery({ env: process.env, store: demoNotificationStore,
+      hubspotRequest, demoRouter, demoLifecycle, logger: console });
+  }
+
+  if (demoLifecycle) demoLifecycle.start();
 
   // HTTP server (health check + webhook routes) runs in every role. Webhook routes
   // only receive traffic on the service the public domain points at (the worker).
@@ -6545,6 +6642,14 @@ async function startSlackBot() {
   console.log(`  Firecrawl: ${FIRECRAWL_API_KEY ? 'ready' : 'NOT CONFIGURED'}`);
 
   if (runsWorker) {
+    if (process.env.GOOGLE_CALENDAR_DEAL_SYNC_ENABLED === 'true') {
+      if (!slackStateStore?.pool || !HUBSPOT_TOKEN) throw new Error('Calendar deal sync requires HubSpot and durable state');
+      const calendarSync = new GoogleCalendarDealSync({ pool: slackStateStore.pool,
+        request: hubspotRequestFromFetchOptions,
+        calendar: google.calendar({ version: 'v3', auth: createCalendarOAuthClient() }) });
+      await calendarSync.initialize();
+      calendarSync.start();
+    }
     // Scheduled jobs post via the Slack Web API (app.client), so they run without
     // Socket Mode. Keeping them in the worker (or single 'all') process means they
     // never block the dedicated 'bot' process's Socket Mode heartbeat.

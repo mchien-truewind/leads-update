@@ -1,0 +1,898 @@
+const assert = require('node:assert/strict');
+const { before, beforeEach, after, test } = require('node:test');
+const { PGlite } = require('@electric-sql/pglite');
+const { DemoSubmissionLifecycle, WINDOW_MS, CHANNEL_ID } = require('../demo-submission-lifecycle');
+const { CONFIG } = require('../calendly_hubspot');
+const { DemoNotificationStore, processEvent } = require('../hubspot_demo');
+
+const submittedAt = Date.parse('2026-10-30T12:00:00Z');
+const formEvent = { objectId: 123, propertyValue: String(submittedAt), occurredAt: submittedAt };
+const hostUri = 'https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01';
+const eventType = [...CONFIG.allowedEventTypeUris][0];
+let db, pool, lifecycle, time, posts, updates, assignments, contactOwner, bookings, discoverCalls, failDiscovery, failPost, companyOwner, companyAssignments;
+
+function booking(seconds = 100, ownerId = '84547076', id = 'one') {
+  return {
+    payload: { uri: `https://api.calendly.com/scheduled_events/${id}/invitees/i`, email: 'nik@squadtalent.xyz', created_at: new Date(submittedAt + seconds * 1000).toISOString() },
+    scheduledEvent: { uri: `https://api.calendly.com/scheduled_events/${id}`, name: 'Truewind Demo', status: 'active',
+      start_time: '2026-11-04T15:00:00Z', end_time: '2026-11-04T15:30:00Z', event_type: eventType,
+      event_memberships: [{ user: hostUri, user_name: 'Sarah Elix' }], location: { join_url: 'https://zoom.us/j/demo' } },
+    filter: { ok: true, ownerId, hostUserUri: hostUri },
+  };
+}
+
+before(async () => {
+  time = submittedAt;
+  db = new PGlite();
+  const query = async (sql, params) => {
+    if (/pg_try_advisory_lock/.test(sql)) return { rows: [{ locked: true }] };
+    if (/pg_advisory_unlock/.test(sql)) return { rows: [] };
+    const result = await db.query(sql, params);
+    return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length };
+  };
+  pool = { query, async connect() { return { query, release() {} }; } };
+  lifecycle = new DemoSubmissionLifecycle({ pool, refreshOwners: async () => {}, env: { SLACK_BOT_TOKEN: 'test', SLACK_TO_HUBSPOT_OWNER_JSON: JSON.stringify({ U0AKMHVCJMA: { id: '89305622' }, U09QC3B292R: { id: '84547076' } }) }, now: () => time, randomInt: () => 1,
+    logger: { error() {} },
+    async hubspotRequest(path, options) {
+      if (path.startsWith('/crm/v3/owners/')) return { id: path.split('/').pop(), archived: false };
+      if (path.startsWith('/crm/v3/objects/companies/200')) {
+        if (options?.method === 'PATCH') { companyOwner = options.body.properties.hubspot_owner_id; companyAssignments.push(companyOwner); }
+        return { id:'200', properties:{hubspot_owner_id:companyOwner} };
+      }
+      if (options?.method === 'PUT') return {};
+      if (path.endsWith('/search')) return { results: [] };
+      if (options?.method === 'PATCH') {
+        if ('hubspot_owner_id' in options.body.properties) { contactOwner = options.body.properties.hubspot_owner_id; assignments.push(contactOwner); }
+        return {};
+      }
+      return { id: '123', properties: { email: 'nik@squadtalent.xyz', firstname: 'Nikhil', lastname: 'Goel',
+        erp: 'QBO', jobtitle: 'Head of Operations', how_did_you_hear_about_us: 'Search engine (Google, Bing, etc.)',
+        createdate: '2026-10-30T12:00:00Z', hubspot_owner_id: contactOwner } };
+    },
+    async calendlyRequest(url) {
+      discoverCalls.push(url);
+      if (failDiscovery) throw new Error('provider unavailable');
+      if (url.endsWith('/users/me')) return { resource: { current_organization: 'https://api.calendly.com/organizations/org' } };
+      if (url.includes('/scheduled_events?')) return { collection: bookings.map(b => b.scheduledEvent) };
+      if (url.includes('/invitees?')) return { collection: bookings.filter(b => url.startsWith(b.scheduledEvent.uri + '/')).map(b => b.payload) };
+      throw new Error('unexpected Calendly URL');
+    },
+    async fetchImpl(url, options) {
+      assert.ok(['https://slack.com/api/chat.postMessage', 'https://slack.com/api/chat.update'].includes(url));
+      const message = JSON.parse(options.body);
+      if (url.endsWith('chat.update')) {
+        updates.push(message);
+        return Response.json({ ok: true, ts: message.ts, channel: message.channel });
+      }
+      posts.push(message);
+      if (failPost) throw new Error('connection reset after send');
+      return Response.json({ ok: true, ts: `${posts.length}.001`, channel: message.channel });
+    },
+  });
+  await lifecycle.initialize();
+});
+beforeEach(async () => {
+  await db.exec('TRUNCATE demo_submission_lifecycle, demo_submission_bookings, demo_company_enrichment, demo_company_assignment');
+  time = submittedAt;
+  posts = []; updates = []; assignments = []; bookings = []; discoverCalls = [];
+  companyOwner = ''; companyAssignments = [];
+  contactOwner = '91143842'; failDiscovery = false; failPost = false;
+  delete lifecycle.requestDeals;
+  delete lifecycle.dealsActivatedAt;
+  delete lifecycle.apolloEnricher;
+  // The lookup behavior is tested independently below; avoid real requests in lifecycle tests.
+  lifecycle.discoverBookings = async function (row) {
+    discoverCalls.push(row.email);
+    if (failDiscovery) throw new Error('provider unavailable');
+    for (const b of bookings) if (Date.parse(b.payload.created_at) >= Number(row.submitted_at)) await this.saveBooking(b.payload, b.scheduledEvent, b.filter);
+  };
+});
+after(async () => { await db.close(); });
+const row = async () => (await pool.query('SELECT * FROM demo_submission_lifecycle')).rows[0];
+
+test('five-minute deadline persists; random owner is assigned before parent and no-booking thread', async () => {
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  time += WINDOW_MS - 1;
+  await lifecycle.tick();
+  assert.equal(posts.length, 0);
+  time++;
+  await lifecycle.tick();
+  assert.equal(contactOwner, '89305622');
+  assert.deepEqual(assignments, ['89305622']);
+  assert.equal(posts.length, 2);
+  assert.ok(posts[0].text.startsWith('<@U0AKMHVCJMA>\nNew DEMO Submission\nNikhil Goel'));
+  for (const field of ['ERP: QBO', 'Job Title: Head of Operations', 'How did you hear about us?', 'Finance team size:', 'Phone:', 'Date Created: 10/30/26']) assert.ok(posts[0].text.includes(field));
+  assert.equal(posts[0].channel, CHANNEL_ID);
+  assert.equal(posts[1].thread_ts, '1.001');
+  assert.match(posts[1].text, /<@U0AKMHVCJMA>.*did NOT book/);
+  await lifecycle.enqueue({ ...formEvent, occurredAt: time });
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal(assignments.length, 1);
+});
+
+test('booking before five minutes assigns calendar host, tags host on parent, and has no unbooked reply', async () => {
+  await lifecycle.enqueue(formEvent);
+  const b = booking();
+  bookings.push(b);
+  time += 100000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(contactOwner, '84547076');
+  assert.equal(posts.length, 1);
+  assert.ok(posts[0].text.startsWith('<@U09QC3B292R>\nNew DEMO Submission'));
+  assert.match(posts[0].text, /within five minutes/);
+  assert.match(posts[0].text, /2026-11-04T15:00:00.000Z/);
+  assert.equal((await row()).booked_state, 'sent');
+});
+
+test('late booking replies on original thread with meeting details and verified current owner', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b = booking(400);
+  time = submittedAt + 400000;
+  bookings.push(b);
+  const observed = await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.reconcileBooking(observed);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.equal(posts[2].thread_ts, posts[1].thread_ts);
+  assert.match(posts[2].text, /<@U0AKMHVCJMA>.*after the first five minutes/);
+  assert.equal(contactOwner, '89305622');
+  for (const detail of ['Truewind Demo', 'Sarah Elix', '2026-11-04T15:00:00.000Z', '2026-11-04T15:30:00.000Z', 'https://zoom.us/j/demo']) assert.ok(posts[2].text.includes(detail));
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+});
+
+test('booking exactly at five minutes is early and uses booking creation time, not meeting time', async () => {
+  await lifecycle.enqueue(formEvent);
+  bookings.push(booking(300));
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].text, /within five minutes/);
+});
+
+test('out-of-order booking before form webhook is correlated without a second parent', async () => {
+  const b = booking();
+  time += 120000;
+  bookings.push(b);
+  assert.equal(await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter), null);
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  assert.equal(posts.length, 1);
+  assert.equal(contactOwner, '84547076');
+});
+
+test('restart recovers queued deadline and delayed late webhook retains random assignment then sends booked reply', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += 420000;
+  bookings.push(booking(400));
+  await lifecycle.initialize();
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.match(posts[0].text, /^<@U0AKMHVCJMA>/);
+  assert.match(posts[1].text, /^<@U0AKMHVCJMA>.*did NOT book/);
+  assert.match(posts[2].text, /^<@U0AKMHVCJMA>.*booked a meeting/);
+  assert.equal(contactOwner, '89305622');
+});
+
+test('provider errors never become a false no-booking alert', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  failDiscovery = true;
+  await lifecycle.tick();
+  assert.equal(posts.length, 0);
+  failDiscovery = false;
+  time += 30000;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+});
+
+test('ambiguous parent delivery is quarantined and never resent after restart', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  failPost = true;
+  await lifecycle.tick();
+  assert.equal((await row()).parent_state, 'needs_review');
+  failPost = false;
+  time += WINDOW_MS;
+  await lifecycle.initialize();
+  await lifecycle.tick();
+  assert.equal(posts.length, 1);
+});
+
+test('crash between Slack write and persistence is quarantined under the contact lock', async () => {
+  await lifecycle.enqueue(formEvent);
+  await pool.query("UPDATE demo_submission_lifecycle SET parent_state = 'sending'");
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal((await row()).parent_state, 'needs_review');
+  assert.equal(posts.length, 0);
+});
+
+test('unmapped booking owner fails closed before posting', async () => {
+  await lifecycle.enqueue(formEvent);
+  bookings.push(booking(100, '99999'));
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 0);
+});
+
+test('repeated forms before the first notification retain the original clock and one parent', async () => {
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(submittedAt + 60000) });
+  const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle')).rows;
+  assert.equal(rows.length, 1);
+  assert.equal(Number(rows[0].submitted_at), submittedAt);
+  time = submittedAt + WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].thread_ts, '1.001');
+});
+
+test('signed webhook processing queues rather than immediately posting when lifecycle is enabled', async () => {
+  const legacyStore = new DemoNotificationStore(pool);
+  await legacyStore.initialize();
+  const result = await processEvent(formEvent, { store: legacyStore, demoLifecycle: lifecycle });
+  assert.equal(result, 'queued');
+  assert.equal(posts.length, 0);
+});
+
+test('Calendly lookup filters invitee email and creation time and follows pagination', async () => {
+  delete lifecycle.discoverBookings;
+  const b = booking();
+  bookings.push(b);
+  {
+    await lifecycle.enqueue(formEvent);
+    await lifecycle.discoverBookings(await row());
+    const saved = (await pool.query('SELECT * FROM demo_submission_bookings')).rows;
+    assert.equal(saved.length, 1);
+    assert.ok(discoverCalls.some(url => url.includes('invitee_email=nik%40squadtalent.xyz')));
+    assert.ok(discoverCalls.some(url => url.includes('/invitees?status=active')));
+  }
+});
+
+test('Sarah is also an eligible random owner', async () => {
+  const pick = lifecycle.randomInt;
+  lifecycle.randomInt = () => 0;
+  try {
+    await lifecycle.enqueue(formEvent);
+    time += WINDOW_MS;
+    await lifecycle.tick();
+    assert.equal(contactOwner, '84547076');
+    assert.match(posts[0].text, /^<@U09QC3B292R>/);
+    assert.match(posts[1].text, /^<@U09QC3B292R>/);
+  } finally { lifecycle.randomInt = pick; }
+});
+
+test('booking webhook recovers the recent form from HubSpot before the form webhook arrives', async () => {
+  const request = lifecycle.hubspotRequest;
+  lifecycle.hubspotRequest = async (path, options) => path.endsWith('/search')
+    ? { results: [{ id: '123', properties: { demo_form_submission_datetime: String(submittedAt), email: 'nik@squadtalent.xyz' } }] }
+    : request(path, options);
+  try {
+    const b = booking();
+    time += 100000;
+    bookings.push(b);
+    const observed = await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+    assert.equal(observed.contactId, '123');
+    await lifecycle.tick();
+    assert.equal(posts.length, 1);
+    assert.equal((await row()).booked_state, 'sent');
+    await lifecycle.enqueue(formEvent);
+    await lifecycle.tick();
+    assert.equal(posts.length, 1);
+  } finally { lifecycle.hubspotRequest = request; }
+});
+
+test('historical form properties do not claim unrelated standalone bookings', async () => {
+  const request = lifecycle.hubspotRequest;
+  lifecycle.hubspotRequest = async (path, options) => path.endsWith('/search')
+    ? { results: [{ id: '123', properties: { demo_form_submission_datetime: String(submittedAt - 86400000) } }] }
+    : request(path, options);
+  try {
+    const b = booking();
+    assert.equal(await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter), null);
+    assert.equal(await row(), undefined);
+  } finally { lifecycle.hubspotRequest = request; }
+});
+
+test('a delayed early booking corrects the existing thread rather than creating another parent', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b = booking(299);
+  bookings.push(b);
+  time += 60000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.equal(posts[2].thread_ts, '1.001');
+  assert.match(posts[2].text, /within the first five minutes \(booking confirmation arrived later\)/);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].ts, '1.001');
+  assert.match(updates[0].text, /^<@U0AKMHVCJMA>/);
+  assert.match(updates[0].text, /within five minutes/);
+});
+
+test('definite Slack rejection retries without reassigning the random owner or repeating the parent', async () => {
+  const send = lifecycle.fetchImpl;
+  let reject = true;
+  lifecycle.fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (body.thread_ts && reject) return Response.json({ ok: false, error: 'ratelimited' });
+    return send(url, options);
+  };
+  try {
+    await lifecycle.enqueue(formEvent);
+    time += WINDOW_MS;
+    await lifecycle.tick();
+    assert.equal(posts.length, 1);
+    assert.equal((await row()).no_booking_state, 'pending');
+    reject = false;
+    time += 30000;
+    await lifecycle.tick();
+    assert.equal(posts.length, 2);
+    assert.equal(posts[1].thread_ts, '1.001');
+    assert.deepEqual(assignments, ['89305622']);
+  } finally { lifecycle.fetchImpl = send; }
+});
+
+test('cancellation before a delayed creation stays canceled and cannot produce a booked alert', async () => {
+  await lifecycle.enqueue(formEvent);
+  const b = booking();
+  await lifecycle.observeBooking('invitee.canceled', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.match(posts[1].text, /did NOT book/);
+  assert.equal((await row()).booked_state, 'pending');
+});
+
+test('an older delayed form does not overwrite the owner assigned by a newer booked submission', async () => {
+  const newerAt = submittedAt + 60000;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(newerAt) });
+  const b = booking(120);
+  bookings.push(b);
+  time += 180000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(contactOwner, '84547076');
+  assignments.length = 0;
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(contactOwner, '84547076');
+  assert.deepEqual(assignments, []);
+});
+
+test('API pagination is followed and rejects a non-Calendly continuation without fetching it', async () => {
+  const request = lifecycle.calendlyRequest;
+  const urls = [];
+  lifecycle.calendlyRequest = async url => {
+    urls.push(url);
+    return url.endsWith('/first') ? { collection: [1], pagination: { next_page: 'https://api.calendly.com/second' } }
+      : { collection: [2], pagination: { next_page: 'https://example.com/private' } };
+  };
+  try {
+    await assert.rejects(lifecycle.apiCollection('https://api.calendly.com/first'), /invalid_calendly_pagination/);
+    assert.deepEqual(urls, ['https://api.calendly.com/first', 'https://api.calendly.com/second']);
+  } finally { lifecycle.calendlyRequest = request; }
+});
+
+test('managed submissions are protected from background owner reassignment even without the old deal router', async () => {
+  const { protectContact } = require('../demo-routing-assignment');
+  await lifecycle.enqueue(formEvent);
+  assert.equal(await protectContact({ id: '123' }, null, { isContactManaged: id => lifecycle.hasContact(id) }), true);
+  assert.equal(await protectContact({ id: '456' }, null, { isContactManaged: id => lifecycle.hasContact(id) }), false);
+});
+
+test('a busy contact lock skips work without blocking the shared pool or unlocking another worker', async () => {
+  const original = lifecycle.pool;
+  const calls = [];
+  let released = false;
+  lifecycle.pool = { async connect() { return {
+    async query(sql) { calls.push(sql); return { rows: [{ locked: false }] }; },
+    release() { released = true; },
+  }; } };
+  try {
+    let ran = false;
+    await lifecycle.withContactLock('123', async () => { ran = true; });
+    assert.equal(ran, false);
+    assert.equal(released, true);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /pg_try_advisory_lock/);
+  } finally { lifecycle.pool = original; }
+});
+
+test('worker uses the held client for booking persistence, so it works with a one-client pool', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  const original = lifecycle.pool;
+  let held = false;
+  lifecycle.pool = {
+    async query(...args) { assert.equal(held, false, 'cannot request another pool client while contact lock is held'); return original.query(...args); },
+    async connect() {
+      const client = await original.connect();
+      held = true;
+      return { query: client.query, release() { held = false; client.release(); } };
+    },
+  };
+  bookings.push(booking(100));
+  try {
+    await lifecycle.processRow(`${formEvent.objectId}:${submittedAt}`);
+    assert.equal(posts.length, 1);
+    assert.equal(held, false);
+  } finally { lifecycle.pool = original; }
+});
+
+
+test('re-entering the same email to book replies in the original thread instead of posting another parent', async () => {
+  await lifecycle.enqueue(formEvent);
+  time = submittedAt + WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  const repeatAt = submittedAt + 16 * 60000;
+  time = repeatAt;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(repeatAt) });
+  const b = booking(16 * 60 + 1);
+  bookings.push(b);
+  time += 1000;
+  const observed = await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.reconcileBooking(observed);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.equal(posts[2].thread_ts, '1.001');
+  assert.match(posts[2].text, /This lead booked a meeting\./);
+  assert.match(posts[2].text, /Sarah Elix/);
+  assert.equal(posts.filter(m => !m.thread_ts).length, 1);
+  assert.equal(contactOwner, '89305622');
+  const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
+  assert.equal(rows[1].thread_root_key, rows[0].submission_key);
+  assert.equal(rows[1].parent_ts, rows[0].parent_ts);
+  assert.equal(rows[0].booked_state, 'sent');
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(repeatAt) });
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+});
+
+test('booking-first delivery followed by repeat form webhook keeps one original thread', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b = booking(600);
+  bookings.push(b);
+  time = submittedAt + 600000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time - 1000) });
+  await lifecycle.tick();
+  assert.equal(posts.filter(m => !m.thread_ts).length, 1);
+  // The already-notified booking must not be repeated for a delayed form webhook.
+  assert.equal(posts.length, 3);
+});
+
+test('a repeat form without a booking does not repeat the original unbooked alert', async () => {
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  time += WINDOW_MS;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+});
+
+test('later bookings and delayed old form webhooks keep one thread without repeating an earlier booking', async () => {
+  await lifecycle.enqueue(formEvent);
+  const first = booking(100);
+  bookings.push(first);
+  time = submittedAt + 100000;
+  await lifecycle.observeBooking('invitee.created', first.payload, first.scheduledEvent, first.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 1);
+  time = submittedAt + 600000;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  const second = booking(601, '84547076', 'two');
+  bookings.push(second);
+  time += 1000;
+  await lifecycle.observeBooking('invitee.created', second.payload, second.scheduledEvent, second.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].thread_ts, '1.001');
+  assert.equal((await row()).booking_uri, first.payload.uri);
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(submittedAt + 99000) });
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal(posts.filter(m => !m.thread_ts).length, 1);
+});
+
+
+test('a second Calendly booking without another form webhook also replies to the original email thread', async () => {
+  await lifecycle.enqueue(formEvent);
+  const first = booking(100);
+  bookings.push(first);
+  time = submittedAt + 100000;
+  await lifecycle.observeBooking('invitee.created', first.payload, first.scheduledEvent, first.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 1);
+  const second = booking(601, '84547076', 'direct-repeat');
+  bookings.push(second);
+  time = submittedAt + 601000;
+  await lifecycle.observeBooking('invitee.created', second.payload, second.scheduledEvent, second.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].thread_ts, '1.001');
+  assert.equal(posts.filter(m => !m.thread_ts).length, 1);
+});
+
+
+test('new demo notifications and their booking replies target leads', async () => {
+  assert.equal(CHANNEL_ID, 'C05MF0R662J');
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b = booking(400);
+  bookings.push(b);
+  time = submittedAt + 400000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.ok(posts.every(m => m.channel === 'C05MF0R662J'));
+  assert.equal(posts[2].thread_ts, '1.001');
+});
+
+test('migration retains slack-testing for existing message timestamps and followups', async () => {
+  await lifecycle.enqueue(formEvent);
+  await db.exec('ALTER TABLE demo_submission_lifecycle DROP COLUMN channel_id');
+  await lifecycle.initialize();
+  assert.equal((await row()).channel_id, 'C066P0YFF6Z');
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b = booking(400);
+  bookings.push(b);
+  time = submittedAt + 400000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.ok(posts.every(m => m.channel === 'C066P0YFF6Z'));
+  assert.equal(posts[2].thread_ts, '1.001');
+});
+
+test('a fresh form in leads does not reuse an old slack-testing thread', async () => {
+  await lifecycle.enqueue(formEvent);
+  await pool.query("UPDATE demo_submission_lifecycle SET channel_id = 'C066P0YFF6Z'");
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  time = submittedAt + 600000;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  const b = booking(601);
+  bookings.push(b);
+  time += 1000;
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  await lifecycle.tick();
+  assert.equal(posts.length, 3);
+  assert.equal(posts[2].channel, 'C05MF0R662J');
+  assert.equal(posts[2].thread_ts, undefined);
+  const rows = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
+  assert.equal(rows[1].thread_root_key, null);
+  assert.equal(rows[1].channel_id, 'C05MF0R662J');
+});
+
+async function enableDealFixture({ fail = false, booked = true } = {}) {
+  if (booked) {
+    const b = booking();
+    bookings.push(b);
+    await lifecycle.saveBooking(b.payload, b.scheduledEvent, b.filter);
+  }
+  const ensured = [], owners = [];
+  lifecycle.dealsActivatedAt = submittedAt;
+  lifecycle.requestDeals = {
+    async company() { return {id:'200',name:'Example'}; },
+    async ensure(input) {
+      ensured.push(input);
+      if (fail) throw new Error('CRM unavailable');
+      await input.saveDeal(input.dealId || '900');
+      return { id: input.dealId || '900', properties: {} };
+    },
+    async syncOwner(...args) { owners.push(args); },
+    async readDeal(id) { return { id, properties: {} }; },
+  };
+  return { ensured, owners, recover() { fail = false; } };
+}
+
+test('confirmed booking creates one deal before the Slack deadline and retries reuse it', async () => {
+  const f = await enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 1);
+  assert.equal((await row()).deal_id, '900');
+  assert.equal((await row()).deal_state, 'ready');
+  assert.equal(posts.length, 1);
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 1);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 1);
+  assert.equal(f.ensured[0].ownerId, '84547076');
+  assert.equal(companyOwner, '84547076');
+  assert.deepEqual(assignments, []);
+  assert.equal(f.owners.length, 0);
+});
+
+test('confirmed booking deal retry survives completed notification', async () => {
+  const f = await enableDealFixture({ fail: true });
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(posts.length, 1);
+  assert.equal((await row()).deal_state, 'pending');
+  await pool.query("UPDATE demo_submission_lifecycle SET booked_state = 'sent'");
+  f.recover();
+  time += 30000;
+  await lifecycle.tick();
+  assert.equal((await row()).deal_state, 'ready');
+  assert.equal(posts.length, 1);
+});
+
+test('Calendly-first processing ensures the form deal synchronously before the worker tick', async () => {
+  const f = await enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  assert.equal((await lifecycle.ensureDealForBooking('123', undefined, booking().payload.uri)).id, '900');
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 1);
+  assert.equal(await lifecycle.hasRequestDeal('900'), true);
+  delete lifecycle.requestDeals;
+  assert.equal(await lifecycle.hasRequestDeal('900'), true);
+});
+
+test('deal activation does not backfill historical submissions', async () => {
+  const f = await enableDealFixture();
+  lifecycle.dealsActivatedAt = submittedAt + 1;
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 0);
+  assert.equal(await lifecycle.ensureDealForBooking('123', undefined, booking().payload.uri), null);
+});
+
+test('repeat form reuses the previously saved deal ID', async () => {
+  const f = await enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  time += 1000;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  const second = booking(400, '84547076', 'repeat');
+  await lifecycle.saveBooking(second.payload, second.scheduledEvent, second.filter);
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 2);
+  assert.equal(f.ensured[1].dealId, '900');
+  assert.deepEqual((await pool.query('SELECT DISTINCT deal_id FROM demo_submission_lifecycle')).rows, [{ deal_id: '900' }]);
+});
+
+test('enabling deal creation requires an explicit activation timestamp', () => {
+  assert.throws(() => new DemoSubmissionLifecycle({ pool, env: { DEMO_REQUEST_DEALS_ENABLED: 'true' } }), /activation_required/);
+});
+
+test('booking reconciliation never changes a form deal owner', async () => {
+  const f = await enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  const b = booking();
+  await lifecycle.reconcileBooking({ email:b.payload.email, contactId:'123', submittedAt, bookedAt:submittedAt+1000, ownerId:'84547076' });
+  assert.equal(f.owners.length,0);
+  assert.equal((await row()).assigned_owner,'84547076');
+});
+
+
+test('booking company name is persisted before company work so background retries retain it', async () => {
+  const f = await enableDealFixture({ fail: true });
+  await lifecycle.enqueue(formEvent);
+  await assert.rejects(lifecycle.ensureDealForBooking('123', 'Booking Company', booking().payload.uri), /CRM unavailable/);
+  assert.equal((await row()).company_name, 'Booking Company');
+  f.recover();
+  await lifecycle.tick();
+  assert.equal(f.ensured.at(-1).companyName, 'Booking Company');
+  assert.equal((await row()).deal_state, 'ready');
+});
+
+
+test('company enrichment cache survives write failures and avoids repeated lookups for 30 days', async () => {
+  let calls = 0, fail = true;
+  const cached = { properties: { website: 'https://example.business' }, source: { domain: 'example.business', name: 'Example' } };
+  lifecycle.apolloEnricher = { async enrich(id, previous, save) {
+    calls++;
+    if (!previous) await save(cached); else assert.deepEqual(previous, cached);
+    if (fail) throw new Error('HubSpot unavailable');
+    return 'enriched';
+  } };
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await lifecycle.tickCompanyEnrichment();
+  let job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(job.state, 'pending');
+  assert.deepEqual(job.cached_properties, cached);
+  assert.equal(calls, 1);
+  fail = false; time += 60000;
+  await lifecycle.tickCompanyEnrichment();
+  job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(job.state, 'ready');
+  assert.equal(calls, 2);
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await lifecycle.tickCompanyEnrichment();
+  assert.equal(calls, 2);
+  time += 30 * 86400000 + 1;
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(job.state, 'pending');
+  assert.equal(job.cached_properties, null);
+});
+
+test('Apollo rate limits do not delay deal creation or five-minute Slack notifications', async () => {
+  await enableDealFixture();
+  lifecycle.apolloEnricher = { async enrich() { throw Object.assign(new Error('apollo_company_http_429'), { retryAfterMs: 120000 }); } };
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await lifecycle.tickCompanyEnrichment();
+  const job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(Number(job.next_check), submittedAt + 120000);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal((await row()).deal_state, 'ready');
+  assert.equal(posts.length, 1);
+});
+
+test('changed company identity discards stale enrichment cache for a fresh retry', async () => {
+  await lifecycle.enqueueCompanyEnrichment(pool, '200');
+  await pool.query("UPDATE demo_company_enrichment SET cached_properties = '{}'::jsonb");
+  lifecycle.apolloEnricher = { async enrich() { throw new Error('apollo_company_identity_changed'); } };
+  await lifecycle.tickCompanyEnrichment();
+  const job = (await pool.query('SELECT * FROM demo_company_enrichment')).rows[0];
+  assert.equal(job.cached_properties, null);
+  assert.equal(job.state, 'pending');
+});
+
+test('company metadata survives the owner refresh and enqueues only one enrichment job', async () => {
+  await enableDealFixture();
+  const ensure = lifecycle.requestDeals.ensure;
+  lifecycle.requestDeals.ensure = async input => ({ ...await ensure(input), company: { id: '200', name: 'Example' } });
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const deal = await lifecycle.ensureDealForBooking('123', undefined, booking().payload.uri);
+  assert.deepEqual(deal.company, { id: '200', name: 'Example' });
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM demo_company_enrichment')).rows[0].count, 1);
+});
+
+for (const email of ['test@trytruewind.com', 'prospect@example.com']) {
+  test(`form without a booking never creates a deal: ${email}`, async () => {
+    const f = await enableDealFixture({ booked: false });
+    await lifecycle.enqueue(formEvent);
+    await pool.query('UPDATE demo_submission_lifecycle SET email = $1', [email]);
+    await lifecycle.tick();
+    time += WINDOW_MS;
+    await lifecycle.tick();
+    assert.equal(f.ensured.length, 0);
+    assert.equal((await row()).deal_id, null);
+  });
+}
+
+test('canceled booking does not authorize deal creation', async () => {
+  const f = await enableDealFixture();
+  await lifecycle.enqueue(formEvent);
+  await pool.query('UPDATE demo_submission_bookings SET canceled = true');
+  bookings = [];
+  await lifecycle.tick();
+  assert.equal(f.ensured.length, 0);
+});
+
+test('booking delivery retries persist the same booking and deal', async () => {
+  const f = await enableDealFixture({ booked: false });
+  await lifecycle.enqueue(formEvent);
+  const b = booking();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+    assert.equal((await lifecycle.ensureDealForBooking('123', undefined, booking().payload.uri)).id, '900');
+  }
+  assert.deepEqual((await pool.query('SELECT count(*)::int AS count FROM demo_submission_bookings')).rows, [{ count: 1 }]);
+  assert.ok(f.ensured.slice(1).every(input => input.dealId === '900'));
+});
+
+test('late booking delivery selects its preceding form rather than a newer unbooked submission', async () => {
+  const f = await enableDealFixture({ booked: false });
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  time += 1000;
+  await lifecycle.enqueue({ ...formEvent, propertyValue: String(time) });
+  const b = booking(100);
+  await lifecycle.observeBooking('invitee.created', b.payload, b.scheduledEvent, b.filter);
+  assert.equal((await lifecycle.ensureDealForBooking('123', 'Booked Company', b.payload.uri)).id, '900');
+  const submissions = (await pool.query('SELECT * FROM demo_submission_lifecycle ORDER BY submitted_at')).rows;
+  assert.equal(submissions.length, 2);
+  assert.equal(submissions[0].deal_id, '900');
+  assert.equal(submissions[0].company_name, 'Booked Company');
+  assert.equal(submissions[1].deal_id, null);
+  assert.equal(f.ensured.length, 1);
+});
+
+test('form prepares company immediately, waits five minutes, then assigns company without creating a deal', async () => {
+  const f = await enableDealFixture({booked:false});
+  let companyLookups=0;
+  lifecycle.requestDeals.company = async () => { companyLookups++; return {id:'200',name:'Example'}; };
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  assert.equal(companyLookups,1);
+  assert.equal(companyOwner,'');
+  assert.equal(f.ensured.length,0);
+  assert.deepEqual(assignments,[]);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  assert.equal(companyOwner,'89305622');
+  assert.deepEqual(companyAssignments,['89305622']);
+  assert.equal(f.ensured.length,0);
+  assert.equal((await row()).deal_id,null);
+  assert.deepEqual(assignments,[], 'contact ownership is inherited by HubSpot workflow');
+});
+
+test('multiple contacts at a company reuse its owner rather than rerolling', async () => {
+  await enableDealFixture({booked:false});
+  time += WINDOW_MS;
+  const first={submitted_at:submittedAt};
+  assert.equal(await lifecycle.assignCompany(pool,first,'200',null),'89305622');
+  const random=lifecycle.randomInt;
+  lifecycle.randomInt=()=>{throw new Error('must not reroll');};
+  try {
+    assert.equal(await lifecycle.assignCompany(pool,{...first,contact_id:'another'},'200',null),'89305622');
+    assert.deepEqual(companyAssignments,['89305622']);
+  } finally {lifecycle.randomInt=random;}
+});
+
+test('manual company owner remains authoritative even for an immediate booking', async () => {
+  const f=await enableDealFixture();
+  companyOwner='559564379';
+  await lifecycle.enqueue(formEvent);
+  await lifecycle.tick();
+  assert.equal(companyOwner,'559564379');
+  assert.deepEqual(companyAssignments,[]);
+  assert.equal(f.ensured[0].ownerId,'84547076', 'new deal belongs to the booked host');
+  assert.equal((await row()).assigned_owner,'559564379');
+});
+
+test('late meeting creates a deal but does not change the previously assigned company owner', async () => {
+  const f=await enableDealFixture({booked:false});
+  await lifecycle.enqueue(formEvent);
+  time += WINDOW_MS;
+  await lifecycle.tick();
+  const b=booking(600,'84547076','late');
+  time=submittedAt+600000;
+  await lifecycle.observeBooking('invitee.created',b.payload,b.scheduledEvent,b.filter);
+  await lifecycle.ensureDealForBooking('123',undefined,b.payload.uri);
+  assert.equal(f.ensured.length,1);
+  assert.equal(f.ensured[0].ownerId,'84547076');
+  assert.equal(companyOwner,'89305622');
+  assert.deepEqual(companyAssignments,['89305622']);
+});
+
+test('failed company write retries the saved choice without rerolling', async () => {
+  await enableDealFixture({booked:false});
+  time += WINDOW_MS;
+  const original=lifecycle.hubspotRequest, random=lifecycle.randomInt;
+  lifecycle.hubspotRequest=async(path,options)=>{
+    if(path==='/crm/v3/objects/companies/200' && options?.method==='PATCH') throw new Error('CRM unavailable');
+    return original(path,options);
+  };
+  try {await assert.rejects(lifecycle.assignCompany(pool,{submitted_at:submittedAt},'200',null),/CRM unavailable/);}
+  finally {lifecycle.hubspotRequest=original;}
+  lifecycle.randomInt=()=>{throw new Error('must not reroll');};
+  try {assert.equal(await lifecycle.assignCompany(pool,{submitted_at:submittedAt},'200',null),'89305622');}
+  finally {lifecycle.randomInt=random;}
+});

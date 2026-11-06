@@ -610,6 +610,15 @@ function testDealNotesPromptAndTools() {
   assert.match(prompt, /You MUST call the relevant HubSpot API for every HubSpot question/);
   assert.match(prompt, /HubSpot record links/);
   assert.match(prompt, /Deal disambiguation/);
+  assert.match(prompt, /HubSpot deal lookup: multi-signal matching \(REQUIRED\)/);
+  assert.match(prompt, /CONTAINS_TOKEN on dealname for each distinct significant token/);
+  assert.match(prompt, /from_type=companies and to_type=deals/);
+  assert.match(prompt, /from_type=contacts and to_type=deals/);
+  assert.match(prompt, /Combine deal IDs from steps 1-3, dedupe/);
+  assert.match(prompt, /ALL of steps 1-3 complete successfully/);
+  assert.match(prompt, /do not present an incomplete lookup as proof that no deal exists/);
+  assert.match(prompt, /widen the signals, do not blame the cache/);
+  assert.match(prompt, /1\. Find the deal using the required HubSpot deal lookup: multi-signal matching process above/);
   assert.match(prompt, /Only ask for clarification if multiple open deals have similar recent activity/);
   assert.match(prompt, /hubspot_count_deals_entered_stage/);
   assert.match(prompt, /Do not use createdate, current dealstage only, or hs_date_entered_\{stageId\}/);

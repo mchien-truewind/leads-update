@@ -3953,6 +3953,19 @@ For no-show, ghosted, missed meeting, or prospect-did-not-attend questions acros
 ### HubSpot record links
 Use exact HubSpot record links in this format: https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/{objectTypeId}/{recordId}. The common object type IDs are contacts=0-1, companies=0-2, deals=0-3, tickets=0-5, tasks=0-27, notes=0-46, meetings=0-47, calls=0-48, emails=0-49, leads=0-136. For example, deal ID 60016351576 is https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/0-3/60016351576. Do not invent a HubSpot URL if you do not have the record ID and object type.
 
+### HubSpot deal lookup: multi-signal matching (REQUIRED)
+When asked whether a deal exists for a company/account, or to find/update/summarize a deal, you MUST NOT rely on deal-name search alone. HubSpot deal search is token-based, not fuzzy: "Freemasons" will not match "Masons", and "Masonic Homes of California" will not match "The Masons of California." Name-only search produces false negatives.
+
+Before concluding a deal does or does not exist, run ALL of these live queries and union the results:
+1. Deal name tokens: Use hubspot_search to search deals with CONTAINS_TOKEN on dealname for each distinct significant token and known variants/aliases of the account (e.g. "Masons", "Masonic", "Freemasons"), plus any parent/entity names the user supplied.
+2. Company then associations: Search companies by name/domain/aliases (and any entity names or Candid/legal names the user gave). For every matching company, call hubspot_get_associations with from_type=companies and to_type=deals and retrieve those deals.
+3. Contact then associations: Search contacts by the named people and emails the user supplied (e.g. first/last name, email, email domain). For every matching contact, call hubspot_get_associations with from_type=contacts and to_type=deals and retrieve those deals.
+4. Union + dedupe: Combine deal IDs from steps 1-3, dedupe, then fetch each with hubspot_get requesting dealname, dealstage, hs_is_closed, hs_lastmodifieddate, pipeline, hubspot_owner_id. Apply the existing Deal disambiguation rules to pick the primary deal.
+
+Follow pagination for searches and associations so all matches are included. Only state "no deal exists" if ALL of steps 1-3 complete successfully and return zero deals across name-token results and company/contact associations. When reporting a "not found," briefly note which signals you checked (name tokens, company associations, contact associations) so the gap is visible. If a signal lacks supplied identifiers or a query fails, explicitly state that limitation; do not present an incomplete lookup as proof that no deal exists.
+
+Never excuse a miss with "the record was just created" or data freshness. Every HubSpot question already triggers a fresh live query; a miss means the search was too narrow, so widen the signals, do not blame the cache.
+
 ### Deal disambiguation
 When multiple deals match a search query, automatically select the deal with the most recent activity unless a specific deal ID is provided. Use this priority order:
 1. Open deals over closed deals
@@ -3977,7 +3990,7 @@ When someone asks you to add a note to an existing HubSpot deal/contact/company,
 When someone asks for "deal notes", "summarize the deal", "deal recap", or a similar recap for a company/deal, you are responsible for creating a comprehensive synthesis from available systems. Do not expect manual AE documentation, and do not say "no notes available" if Grain recordings or HubSpot activities exist.
 
 Required process:
-1. Find the deal in HubSpot by company/deal name using hubspot_search. If multiple deals match, choose only if unambiguous; otherwise ask a concise clarification.
+1. Find the deal using the required HubSpot deal lookup: multi-signal matching process above, including name tokens, company associations, and contact associations. Union and dedupe all matches, then apply the existing Deal disambiguation rules.
 2. Get the deal details, including dealname, dealstage, amount, closedate, hubspot_owner_id, pipeline, hs_lastmodifieddate, createdate, and days-in-stage fields when available.
 3. Get all associated contacts with hubspot_get_associations, then hubspot_get each contact for firstname, lastname, email, jobtitle, company, phone, lastmodifieddate, and recent conversion/engagement fields when available.
 4. Get all associated HubSpot activity with hubspot_get_associated_activities for meetings, calls, emails, notes, and tasks. Even when a meeting has no internal notes, use participant, timing, title, and outcome context.

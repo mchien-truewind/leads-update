@@ -1,10 +1,10 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { NooksCalls } = require('../nooks-calls');
+const { NooksCalls, preservesCallDetails } = require('../nooks-calls');
 const { NooksDeals } = require('../nooks-deals');
 function fixture() {
   const rows = new Map(), records = new Map(), requests = [];
-  let creates = 0, uncertain = false, rejection = false, associationFails = false, native = false;
+  let creates = 0, uncertain = false, rejection = false, associationFails = false, native = false, normalize = false;
   const client = {release(){},async query(sql,args=[]) {
     if (sql.includes('advisory')) return {rows:[{locked:true}]};
     const key = args.slice(0,2).join(':');
@@ -40,11 +40,13 @@ function fixture() {
     if(path.startsWith('/crm/v3/objects/calls/')) {
       const id=path.split('/')[5].split('?')[0];
       if(options.method==='PATCH') records.set(id,{...options.body.properties});
-      return {id,properties:records.get(id),associations:{contacts:{results:[{id:'10'}]}}};
+      const properties={...records.get(id)};
+      if(normalize && properties.hs_call_body) properties.hs_call_body=properties.hs_call_body.replace(/<pre>([\s\S]*?)<\/pre>/,(_,json)=>'<pre>'+json.replace(/\n +/g,'')+'</pre>');
+      return {id,properties,associations:{contacts:{results:[{id:'10'}]}}};
     }
     throw new Error(`Unexpected ${path}`);
   }});
-  return {event,service,rows,records,requests,get creates(){return creates;},set uncertain(x){uncertain=x;},set rejection(x){rejection=x;},set associationFails(x){associationFails=x;},set native(x){native=x;}};
+  return {event,service,rows,records,requests,get creates(){return creates;},set uncertain(x){uncertain=x;},set rejection(x){rejection=x;},set associationFails(x){associationFails=x;},set native(x){native=x;},set normalize(x){normalize=x;}};
 }
 test('all outcomes sync as calls with full details, correct units and associations; retries do not duplicate',async()=>{
   const f=fixture(); await f.service.initialize();
@@ -103,4 +105,17 @@ test('ambiguous native activities and conflicting native metadata remain pending
 test('verified HubSpot GUID works without a custom mapping and missing duration stays blank',async()=>{
   const f=fixture();f.event.callData.disposition.id='hs-vm';delete f.event.callData.durationSeconds;
   await f.service.process(f.event);assert.equal(f.records.get('30').hs_call_disposition,'hs-vm');assert.equal(f.records.get('30').hs_call_duration,undefined);
+});
+
+test('HubSpot rich text normalization confirms the same call without duplicate creation',async()=>{
+  const f=fixture();f.normalize=true;await f.service.process(f.event);
+  assert.ok(f.rows.get('w:call').digest);await f.service.process(f.event);assert.equal(f.creates,1);
+});
+test('body verification preserves escaped notes and rejects changed or missing metadata',()=>{
+  const call={notes:'a < b &amp; \"quoted\" \n apostrophe: \'',nested:{step:'Call 2'}};
+  const escaped=JSON.stringify(call).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  assert.equal(preservesCallDetails('<pre>'+escaped+'</pre>',call),true);
+  assert.equal(preservesCallDetails('<pre>'+escaped.replace('Call 2','Call 3')+'</pre>',call),false);
+  assert.equal(preservesCallDetails('<pre>{}</pre>',call),false);
+  assert.equal(preservesCallDetails('<p>missing details</p>',call),false);
 });

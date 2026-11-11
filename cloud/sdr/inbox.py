@@ -71,7 +71,8 @@ class Forwarder:
             return
         try:
             async with httpx.AsyncClient(timeout=30, follow_redirects=False, trust_env=False, transport=self.transport) as client:
-                response = await client.post(self.url, content=row[1], headers={'Authorization':'Bearer '+self.token,'Content-Type':'application/json'})
+                payload = {**json.loads(row[1]), 'ingressSequence': str(row[0])}
+                response = await client.post(self.url, json=payload, headers={'Authorization':'Bearer '+self.token,'Content-Type':'application/json'})
                 response.raise_for_status()
                 if response.json().get('status') not in ('processed','ignored'):
                     raise ValueError('unconfirmed delivery')

@@ -387,3 +387,21 @@ Enabling forwarding also replays the existing pending inbox. Verify a controlled
 call end to end before releasing the full backlog. Monitor `/ready` pending count
 and consumer `nooks_sync_retry` codes; retain unresolved receipts and investigate
 identity conflicts or ambiguous native activities instead of discarding them.
+
+### Webhook-only scope
+
+This sync logs the call details actually supplied by the signed Nooks webhook:
+call date/time, direction, duration, verified outcome and rep, prospect phone,
+notes, sequence/account details, recording URL and Nooks transcript link. Notes
+retain an AI summary if Nooks includes one in the notes; this integration does
+not generate a summary. Missing fields remain blank, and unmatched disposition
+IDs remain visible in the call details without an invented HubSpot outcome.
+
+Native HubSpot transcription, AI-generated summary panels, conversation
+analytics and a separate recording/transcription pipeline are outside this
+scope. A transcript link is not an imported HubSpot transcript. Recording URLs
+are saved when supplied; in-app playback depends on the recording endpoint's
+accessibility and format and has not yet been verified. The documented webhook
+does not provide the rep's calling number, so only the available prospect number
+is mapped. Existing native Nooks transcripts and analytics are preserved when
+an existing call activity is reused.

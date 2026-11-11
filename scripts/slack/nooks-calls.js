@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const email = value => String(value || '').trim().toLowerCase();
@@ -8,6 +9,22 @@ const httpsUrl = value => {
   if (url.protocol !== 'https:' || url.username || url.password) throw new Error('nooks_url_invalid');
   return url.href;
 };
+
+// HubSpot collapses whitespace in rich-text HTML. Compare the preserved JSON
+// details instead of requiring the server's HTML serialization to be identical.
+function preservesCallDetails(body, call) {
+  if (typeof body !== 'string') return false;
+  const block = /<pre(?:\s[^>]*)?>([\s\S]*?)<\/pre>/i.exec(body);
+  if (!block) return false;
+  const entities = {quot:'"',apos:"'",lt:'<',gt:'>',amp:'&',nbsp:'\u00a0'};
+  try {
+    const text = block[1].replace(/&(#x[0-9a-f]+|#[0-9]+|quot|apos|lt|gt|amp|nbsp);/gi, (whole, value) => {
+      if (value[0] !== '#') return entities[value.toLowerCase()];
+      return String.fromCodePoint(value[1].toLowerCase() === 'x' ? parseInt(value.slice(2),16) : parseInt(value.slice(1),10));
+    });
+    return isDeepStrictEqual(JSON.parse(text), call);
+  } catch { return false; }
+}
 
 class NooksCalls {
   constructor({ request, pool, env = process.env }) {
@@ -182,7 +199,9 @@ class NooksCalls {
       const check = await this.request(`/crm/v3/objects/calls/${id}?properties=${Object.keys(properties).join(',')}`);
       for (const [name,value] of Object.entries(properties)) {
         const actual = check.properties?.[name];
-        if (name === 'hs_timestamp' ? Date.parse(actual) !== Date.parse(value) : String(actual) !== value) throw new Error('nooks_call_readback_mismatch');
+        const matches = name === 'hs_call_body' ? preservesCallDetails(actual, call)
+          : name === 'hs_timestamp' ? Date.parse(actual) === Date.parse(value) : String(actual) === value;
+        if (!matches) throw new Error('nooks_call_readback_mismatch');
       }
       await client.query('UPDATE nooks_call_sync SET digest=$3,ingress_sequence=$4,updated_at=NOW() WHERE workspace_id=$1 AND call_id=$2', [...key,digest,sequence]);
       return {status:'processed',callId:id};
@@ -192,4 +211,4 @@ class NooksCalls {
     }
   }
 }
-module.exports = { NooksCalls };
+module.exports = { NooksCalls, preservesCallDetails };

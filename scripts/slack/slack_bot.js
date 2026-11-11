@@ -6582,10 +6582,18 @@ async function startSlackBot() {
     console.log('Slack durable interaction state: ready');
   }
 
-  if (process.env.NOOKS_DEALS_ENABLED === 'true') {
-    if (!slackStateStore?.pool || !process.env.NOOKS_FORWARD_TOKEN || !process.env.NOOKS_WORKSPACE_ID || !process.env.NOOKS_MEETING_DISPOSITION_IDS) throw new Error('Nooks deals require durable state, forwarding token, workspace and disposition IDs');
+  if (process.env.NOOKS_DEALS_ENABLED === 'true' || process.env.NOOKS_CALLS_ENABLED === 'true') {
+    if (!slackStateStore?.pool || !HUBSPOT_TOKEN || !process.env.NOOKS_FORWARD_TOKEN || !process.env.NOOKS_WORKSPACE_ID) throw new Error('Nooks sync requires durable state, HubSpot, forwarding token and workspace');
     nooksDeals = new NooksDeals({ request: hubspotRequestFromFetchOptions, pool: slackStateStore.pool });
-    await nooksDeals.deals.initialize();
+    if (process.env.NOOKS_DEALS_ENABLED === 'true') {
+      if (!process.env.NOOKS_MEETING_DISPOSITION_IDS) throw new Error('Nooks deals require disposition IDs');
+      await nooksDeals.deals.initialize();
+    }
+    if (process.env.NOOKS_CALLS_ENABLED === 'true') {
+      const { NooksCalls } = require('./nooks-calls');
+      nooksDeals.calls = new NooksCalls({ request: hubspotRequestFromFetchOptions, pool: slackStateStore.pool });
+      await nooksDeals.calls.initialize();
+    }
   }
   if (process.env.HUBSPOT_DEMO_SLACK_ENABLED === 'true') {
     if (!slackStateStore?.pool || !HUBSPOT_TOKEN || !process.env.HUBSPOT_CLIENT_SECRET || !process.env.SLACK_BOT_TOKEN) {

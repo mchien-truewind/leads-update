@@ -340,3 +340,50 @@ each slot. Deploy the private service first, then the receiver with identical
 configuration; retain the same value on recovery. Do not reset a journal to grant
 another window. This is an explicitly approved supervised-test extension, not a
 rolling renewal or a production scheduling mechanism.
+
+## HubSpot call activity forwarding
+
+The permanent inbox can deliver every finalized call to the existing authenticated
+`/internal/nooks/deals` consumer. Enable `NOOKS_CALLS_ENABLED=true` on the
+leads-update service, set `NOOKS_WORKSPACE_ID` to the verified capture workspace,
+and provision a dedicated random `NOOKS_FORWARD_TOKEN` on both services. On the
+receiver set `NOOKS_FORWARD_URL=https://leads-update-production.up.railway.app/internal/nooks/deals`.
+Deploy the consumer first and the updated receiver second, then enable forwarding.
+The receiver must include its stable `ingressSequence` for revision ordering.
+Keep `NOOKS_DEALS_ENABLED` unchanged: call logging does not grant deal creation or
+sequence/task completion. Do not change verifier keys, scope or existing volumes.
+
+The consumer uses the existing HubSpot credential and durable PostgreSQL pool.
+Verify portal identity, calls read/write, contacts/company read and owner access
+before activation. It resolves an existing contact by HubSpot prospect ID and/or
+email, refuses conflicting identities, and associates the activity with that
+contact and its returned company associations. It does not create contacts or
+change contact owners/statuses. Missing contacts remain pending for correction.
+
+Native call fields contain timestamp, direction, duration in milliseconds,
+recording URL, prospect phone number, owner and outcome where supported. The body
+preserves the provider's full callData (including notes, disposition ID/name,
+rep, account and sequence metadata), escapes HTML, and links the transcript.
+The payload does not supply the rep's calling number; that field stays blank.
+Unknown rep/outcome mappings stay blank with an explanation in the body.
+`NOOKS_CALL_DISPOSITION_MAP` optionally maps Nooks disposition IDs to verified
+HubSpot disposition GUIDs. IDs already present in the live HubSpot disposition
+list work without a mapping; labels are never guessed and new outcomes are not
+created automatically.
+
+A PostgreSQL journal and advisory lock serialize each workspace/call. Existing
+external IDs are reused. Native Nooks activities without external IDs are matched
+by Nooks source, provider start time (within one second), exact contact association,
+direction and duration; ambiguous/conflicting candidates are held for correction.
+Source field writes require readback before delivery is acknowledged. Duplicate
+receipts do not create calls, revisions update the same activity, and older
+receipt revisions cannot overwrite a newer delivery. Associations are retried
+against the saved call ID. An uncertain create is reconciled through HubSpot
+search; if no record can be found, the event remains pending rather than risking
+a second create. Inspect the journal and HubSpot before any manual recovery of
+`create_claimed` rows; never clear claims blindly.
+
+Enabling forwarding also replays the existing pending inbox. Verify a controlled
+call end to end before releasing the full backlog. Monitor `/ready` pending count
+and consumer `nooks_sync_retry` codes; retain unresolved receipts and investigate
+identity conflicts or ambiguous native activities instead of discarding them.

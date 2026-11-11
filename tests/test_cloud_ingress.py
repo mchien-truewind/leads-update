@@ -79,3 +79,6 @@ class PermanentTests(CloudTests):
         asyncio.run(worker.tick(self.now+5))
         self.assertEqual(inbox.summary()['pending_events'],0)
         self.assertEqual(requests[0].headers['authorization'],'Bearer dummy-token')
+        import json
+        self.assertEqual(json.loads(requests[0].content)['ingressSequence'], '1')
+        self.assertEqual(json.loads(requests[1].content)['ingressSequence'], '1')

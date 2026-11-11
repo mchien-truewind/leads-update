@@ -9,6 +9,10 @@ class NooksDeals {
   }
 
   async process(event) {
+    if (this.calls) {
+      const result = await this.calls.process(event);
+      if (this.env.NOOKS_DEALS_ENABLED !== 'true') return result;
+    }
     if (!this.dispositions.size) throw new Error('nooks_meeting_dispositions_required');
     const call = event.callData;
     if (event.event !== 'call.logged' || !call?.callId || call.workspaceId !== this.env.NOOKS_WORKSPACE_ID) throw new Error('nooks_event_identity_invalid');
@@ -67,7 +71,9 @@ async function handleNooksDealRequest(req, res, { service, token, readBody }) {
     if (!service) throw new Error('nooks_processing_unavailable');
     const result = await service.process(JSON.parse(await readBody(req)));
     res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(result));
-  } catch {
+  } catch (error) {
+    const code = /^nooks_[a-z_]+$/.test(error.message || '') ? error.message : 'nooks_crm_or_storage_unavailable';
+    console.warn(JSON.stringify({ event: 'nooks_sync_retry', code }));
     // The receiver keeps the durable event and retries; no false success.
     res.writeHead(503); res.end(JSON.stringify({ status: 'retry' }));
   }

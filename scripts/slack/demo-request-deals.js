@@ -201,7 +201,29 @@ class DemoRequestDeals {
         deal.properties = { ...deal.properties, ...properties };
       }
     }
+    await this.verifyAssociations({contactId,companyId:company.id,dealId:deal.id});
     return { ...deal, id: String(deal.id), company: company.id ? company : null };
+  }
+
+  async verifyAssociations({ contactId, companyId, dealId }) {
+    for (const [fromType, fromId, toType, toId] of [
+      ['contacts',contactId,'companies',companyId], ['companies',companyId,'contacts',contactId],
+      ['contacts',contactId,'deals',dealId], ['deals',dealId,'contacts',contactId],
+      ['companies',companyId,'deals',dealId], ['deals',dealId,'companies',companyId],
+    ]) {
+      if (!/^[1-9][0-9]*$/.test(String(fromId || '')) || !/^[1-9][0-9]*$/.test(String(toId || ''))) throw new Error('demo_request_association_identity_required');
+      let after, found = false;
+      const seen = new Set();
+      do {
+        const page = await this.request(`/crm/v4/objects/${fromType}/${fromId}/associations/${toType}?limit=500${after != null ? `&after=${encodeURIComponent(after)}` : ''}`);
+        if (!Array.isArray(page.results)) throw new Error('demo_request_association_readback_invalid');
+        found ||= page.results.some(row => String(row.toObjectId) === String(toId));
+        after = page.paging?.next?.after;
+        if (after != null && seen.has(String(after))) throw new Error('demo_request_association_cursor_repeated');
+        if (after != null) seen.add(String(after));
+      } while (after != null);
+      if (!found) throw new Error('demo_request_association_readback_missing');
+    }
   }
 
   async classify(contact, companyId) {

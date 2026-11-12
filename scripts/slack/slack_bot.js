@@ -6587,7 +6587,7 @@ async function startSlackBot() {
     nooksDeals = new NooksDeals({ request: hubspotRequestFromFetchOptions, pool: slackStateStore.pool });
     if (process.env.NOOKS_DEALS_ENABLED === 'true') {
       if (!process.env.NOOKS_MEETING_DISPOSITION_IDS) throw new Error('Nooks deals require disposition IDs');
-      await nooksDeals.deals.initialize();
+      await nooksDeals.initialize();
     }
     if (process.env.NOOKS_CALLS_ENABLED === 'true') {
       const { NooksCalls } = require('./nooks-calls');

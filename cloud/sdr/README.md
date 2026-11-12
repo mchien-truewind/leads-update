@@ -405,3 +405,36 @@ accessibility and format and has not yet been verified. The documented webhook
 does not provide the rep's calling number, so only the available prospect number
 is mapped. Existing native Nooks transcripts and analytics are preserved when
 an existing call activity is reused.
+
+## Nooks Meeting Booked deals
+
+After deploying the reviewed consumer, enable Nooks meeting deals on the existing
+`leads-update` service with `NOOKS_DEALS_ENABLED=true`,
+`NOOKS_MEETING_DISPOSITION_IDS=6ace719d28ac2c000dbd3c71,887a2c18-be90-404f-8984-5611ca3655a6`,
+and `NOOKS_DEALS_ACTIVATED_AT` set to the actual UTC activation time in ISO format.
+Both disposition IDs were verified from received calls: Nooks Meeting Booked and
+HubSpot Meeting booked. Labels alone never trigger a deal. Preserve the existing
+call-sync, workspace, mapping and forwarding settings. Initialization validates
+the shared unique properties, Discovery stage, disabled competing workflow and
+one immutable activation timestamp in PostgreSQL. Keep that timestamp unchanged
+across restarts. Calls started before it continue to sync but do not create deals;
+this switch does not replay historical Meeting Booked events.
+
+New eligible meetings reuse the inbound demo record helper, selecting the
+contact's primary company (or its sole associated company), searching existing
+company/contact deals across all association pages, and creating a Discovery
+opportunity only when no reusable deal exists. The source is
+`Outbound - Sales Sourced List`, with the Nooks rep resolved by verified HubSpot
+owner email for a new deal. Existing deal owners are preserved. Missing companies
+can be resolved/created using the same business-domain/name rules as inbound
+demos; ambiguous company or contact identities remain pending for correction.
+
+Both inbound confirmed demo bookings and Nooks meetings now read back all three
+links in both directions: contact↔company, contact↔deal and company↔deal. Every
+association page is checked, and missing/failed readbacks leave work retryable.
+Existing unrelated links are preserved. A per-workspace/call journal stores the
+selected deal ID before association verification, so retries keep that deal even
+if an existing opportunity closes before readback succeeds. The shared unique
+contact key protects uncertain creates. Superseded call revisions cannot trigger
+a new meeting deal. Enablement requires a controlled post-activation meeting and
+readback of its deal and all associations before considering live rollout verified.

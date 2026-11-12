@@ -1,57 +1,123 @@
 const crypto = require('node:crypto');
+const { NooksMeetingOwnerJobs } = require('./nooks-meeting-owner-jobs');
 const { DemoRequestDeals } = require('./demo-request-deals');
 
 class NooksDeals {
-  constructor({ request, pool, env = process.env }) {
-    Object.assign(this, { request, pool, env });
+  constructor({ request, pool, resolveMeetingOwner, notifyOwnerIssue, now = Date.now, env = process.env }) {
+    Object.assign(this, { request, pool, env, resolveMeetingOwner });
+    this.ownerJobs = new NooksMeetingOwnerJobs({ pool, request, resolveMeetingOwner, notify: notifyOwnerIssue, now });
     this.dispositions = new Set((env.NOOKS_MEETING_DISPOSITION_IDS || '').split(',').map(x => x.trim()).filter(Boolean));
     this.deals = new DemoRequestDeals({ request, sourceLabel: 'Outbound - Sales Sourced List' });
   }
 
-  async process(event) {
-    if (this.calls) {
-      const result = await this.calls.process(event);
-      if (this.env.NOOKS_DEALS_ENABLED !== 'true') return result;
-    }
+  async initialize() {
+    const activation = Date.parse(this.env.NOOKS_DEALS_ACTIVATED_AT || '');
+    if (!Number.isFinite(activation) || activation <= 0) throw new Error('nooks_deal_activation_required');
     if (!this.dispositions.size) throw new Error('nooks_meeting_dispositions_required');
+    await this.deals.initialize();
+    await this.ownerJobs.initialize();
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS nooks_meeting_deals (
+      workspace_id TEXT NOT NULL, call_id TEXT NOT NULL, contact_id TEXT NOT NULL,
+      deal_id TEXT, verified_at TIMESTAMPTZ,
+      PRIMARY KEY(workspace_id,call_id)
+    )`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS nooks_deal_activation (
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1), activated_at BIGINT NOT NULL
+    )`);
+    await this.pool.query('INSERT INTO nooks_deal_activation(singleton,activated_at) VALUES(1,$1) ON CONFLICT DO NOTHING', [activation]);
+    const saved = (await this.pool.query('SELECT activated_at FROM nooks_deal_activation WHERE singleton=1')).rows[0];
+    if (Number(saved?.activated_at) !== activation) throw new Error('nooks_deal_activation_changed');
+  }
+
+  async process(event) {
     const call = event.callData;
-    if (event.event !== 'call.logged' || !call?.callId || call.workspaceId !== this.env.NOOKS_WORKSPACE_ID) throw new Error('nooks_event_identity_invalid');
-    if (call.status !== 'completed' || !this.dispositions.has(String(call.disposition?.id))) return { status: 'ignored' };
+    if (event.event !== 'call.logged' || typeof call?.callId !== 'string' || !call.callId || call.workspaceId !== this.env.NOOKS_WORKSPACE_ID) throw new Error('nooks_event_identity_invalid');
+    const dealsEnabled = this.env.NOOKS_DEALS_ENABLED === 'true';
+    let eligible = false;
+    if (dealsEnabled) {
+      const activation = Date.parse(this.env.NOOKS_DEALS_ACTIVATED_AT || '');
+      if (!Number.isFinite(activation) || activation <= 0) throw new Error('nooks_deal_activation_required');
+      if (!this.dispositions.size) throw new Error('nooks_meeting_dispositions_required');
+      if (call.status === 'completed' && this.dispositions.has(String(call.disposition?.id))) {
+        const startedAt = Date.parse(call.startedAt || '');
+        if (!Number.isFinite(startedAt)) throw new Error('nooks_meeting_time_required');
+        eligible = startedAt >= activation;
+      }
+    }
+    let logged;
+    if (this.calls) {
+      try { logged = await this.calls.process(event); }
+      catch (error) {
+        // An eligible meeting can create a missing contact before logging its
+        // call. All other call failures keep the original durable receipt pending.
+        if (!eligible || error.message !== 'nooks_contact_unresolved') throw error;
+      }
+    }
+    if (logged?.stale || !eligible) return logged || {status:'ignored'};
+    const result = await this.processMeeting(call);
+    if (this.calls && !logged) logged = await this.calls.process(event);
+    return { ...logged, ...result };
+  }
+
+  async processMeeting(call) {
     const email = String(call.prospectData?.email || '').trim().toLowerCase();
-    const repEmail = String(call.userData?.email || '').trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !repEmail) throw new Error('nooks_contact_or_owner_email_missing');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('nooks_contact_or_owner_email_missing');
     const client = await this.pool.connect();
     let locked = false;
     try {
       locked = (await client.query('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [`demo-submission:${email}`])).rows[0]?.locked;
       if (!locked) throw new Error('nooks_contact_busy');
-      const owners = [];
-      let after;
-      const cursors = new Set();
-      do {
-        const page = await this.request(`/crm/v3/owners?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`);
-        owners.push(...page.results);
-        after = page.paging?.next?.after;
-        if (after && cursors.has(String(after))) throw new Error('nooks_owner_pagination_invalid');
-        if (after) cursors.add(String(after));
-      } while (after);
-      const matches = owners.filter(x => x.archived === false && String(x.email).toLowerCase() === repEmail);
-      if (matches.length !== 1) throw new Error('nooks_owner_unresolved');
+      let repOwner;
+      const resolveRepOwner = async () => {
+        if (repOwner) return repOwner;
+        const repEmail = String(call.userData?.email || '').trim().toLowerCase();
+        const owners = [];
+        const cursors = new Set();
+        let after;
+        do {
+          const page = await this.request(`/crm/v3/owners?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`);
+          if (!Array.isArray(page.results)) throw new Error('nooks_owner_response_invalid');
+          owners.push(...page.results);
+          after = page.paging?.next?.after;
+          if (after && cursors.has(String(after))) throw new Error('nooks_owner_pagination_invalid');
+          if (after) cursors.add(String(after));
+        } while (after);
+        const reps = owners.filter(owner => owner.archived === false && String(owner.email).trim().toLowerCase() === repEmail);
+        if (reps.length !== 1 || !/^[1-9][0-9]*$/.test(String(reps[0].id))) throw new Error('nooks_owner_unresolved');
+        return (repOwner = String(reps[0].id));
+      };
       const lookup = async () => {
         try { return await this.request(`/crm/v3/objects/contacts/${encodeURIComponent(email)}?idProperty=email&properties=email,company`); }
         catch (error) { if (error.statusCode === 404) return null; throw error; }
       };
       let contact = await lookup();
       if (!contact) {
+        if (/^[1-9][0-9]*$/.test(String(call.prospectData?.prospectId || ''))) throw new Error('nooks_contact_identity_conflict');
+        // Keep the existing new-contact assignment to the booking SDR. Calendar
+        // ownership changes apply to the new deal only.
         try {
           contact = await this.request('/crm/v3/objects/contacts', { method: 'POST', body: { properties: {
             email, ...(call.accountData?.name ? { company: call.accountData.name } : {}),
-            contact_type: 'Prospective Customer', hs_lead_status: 'MQL', hubspot_owner_id: String(matches[0].id),
+            contact_type: 'Prospective Customer', hs_lead_status: 'MQL', hubspot_owner_id: await resolveRepOwner(),
           } } });
         } catch (error) { contact = await lookup(); if (!contact) throw error; }
       }
+      if (contact.archived || !/^[1-9][0-9]*$/.test(String(contact.id))
+        || String(contact.properties?.email || '').trim().toLowerCase() !== email) throw new Error('nooks_contact_identity_invalid');
+      const prospectId = String(call.prospectData?.prospectId || '');
+      if (/^[1-9][0-9]*$/.test(prospectId) && prospectId !== String(contact.id)) throw new Error('nooks_contact_identity_conflict');
+      const key = [call.workspaceId,call.callId];
+      await client.query('INSERT INTO nooks_meeting_deals(workspace_id,call_id,contact_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [...key,String(contact.id)]);
+      const saved = (await client.query('SELECT * FROM nooks_meeting_deals WHERE workspace_id=$1 AND call_id=$2', key)).rows[0];
+      if (saved?.contact_id !== String(contact.id)) throw new Error('nooks_meeting_contact_changed');
       const deal = await this.deals.ensure({ contactId: contact.id, email, companyName: call.accountData?.name,
-        ownerId: String(matches[0].id), saveDeal: async () => {} });
+        resolveOwner: resolveRepOwner,
+        creationDescription: `Created from a Nooks booked meeting. Nooks ${call.workspaceId}/${call.callId}`, dealId: saved.deal_id || undefined,
+        saveDeal: async (id, evidence = {}) => {
+          if (evidence.created) await this.ownerJobs.schedule(client, { dealId:id, workspaceId:call.workspaceId, callId:call.callId, contactId:contact.id, email, repEmail:call.userData?.email, initialOwner:await resolveRepOwner() });
+          await client.query('UPDATE nooks_meeting_deals SET deal_id=$3,verified_at=NULL WHERE workspace_id=$1 AND call_id=$2', [...key,String(id)]);
+        } });
+      await client.query('UPDATE nooks_meeting_deals SET verified_at=NOW() WHERE workspace_id=$1 AND call_id=$2', key);
       return { status: 'processed', dealId: deal.id };
     } finally {
       try { if (locked) await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [`demo-submission:${email}`]); }

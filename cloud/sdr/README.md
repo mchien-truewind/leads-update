@@ -405,3 +405,59 @@ accessibility and format and has not yet been verified. The documented webhook
 does not provide the rep's calling number, so only the available prospect number
 is mapped. Existing native Nooks transcripts and analytics are preserved when
 an existing call activity is reused.
+
+## Nooks Meeting Booked deals
+
+After deploying the reviewed consumer, enable Nooks meeting deals on the existing
+`leads-update` service with `NOOKS_DEALS_ENABLED=true`,
+`NOOKS_MEETING_DISPOSITION_IDS=6ace719d28ac2c000dbd3c71,887a2c18-be90-404f-8984-5611ca3655a6`,
+and `NOOKS_DEALS_ACTIVATED_AT` set to the actual UTC activation time in ISO format.
+Both disposition IDs were verified from received calls: Nooks Meeting Booked and
+HubSpot Meeting booked. Labels alone never trigger a deal. Preserve the existing
+call-sync, workspace, mapping and forwarding settings. Initialization validates
+the shared unique properties, Discovery stage, disabled competing workflow and
+one immutable activation timestamp in PostgreSQL. Keep that timestamp unchanged
+across restarts. Calls started before it continue to sync but do not create deals;
+this switch does not replay historical Meeting Booked events.
+
+New eligible meetings reuse the inbound demo record helper, selecting the
+contact's primary company (or its sole associated company), searching existing
+company/contact deals across all association pages, and creating a Discovery
+opportunity only when no reusable deal exists. The source is
+`Outbound - Sales Sourced List`. New Nooks deals are initially owned by the
+booking SDR. A durable job waits at least five minutes after creation before
+searching the calendar and switching the deal owner to the AE. A worker checks
+due jobs every minute; the first lookup normally occurs five to six minutes
+after creation. Restarts and duplicate deliveries preserve the original deadline.
+Only new Nooks deals resolve their final owner from
+the prospect's next eligible Google Calendar meeting, reusing the calendar sync's
+attendee/occurrence rules. Registered AEs come from `DEMO_ROUTING_OWNERS_JSON`;
+the existing Google Calendar OAuth credentials must read every registered AE
+calendar. The AE organizer is preferred; an SDR-organized meeting requires one
+unambiguous AE attendee. The Nooks rep is excluded from the final AE selection. Missing,
+private, cancelled, declined or ambiguous meetings, incomplete calendar access
+and conflicting calendar copies leave owner reassignment pending for retry
+every minute. After the first failed lookup, the existing Slack bot posts to
+`#gtm-general`, tagging Mercedes (`U0ABULY5TEK`) with the contact, deal link and
+call ID. The database records successful delivery to suppress repeat alerts per
+deal; failed Slack sends retry. An uncertain Slack response may still duplicate
+a post, mitigated by a stable message ID. A manual owner change is preserved,
+alerted and stops automatic reassignment. Owner writes are read back, and a
+persisted target owner recovers uncertain writes. New-contact SDR ownership is
+unchanged; only the deal moves to the AE.
+The next meeting is the earliest future eligible event with the prospect's exact
+email; simultaneous distinct matches remain pending. Existing deal owners are
+preserved without requiring a calendar lookup, and inbound owner selection is
+unchanged. Missing companies
+can be resolved/created using the same business-domain/name rules as inbound
+demos; ambiguous company or contact identities remain pending for correction.
+
+Both inbound confirmed demo bookings and Nooks meetings now read back all three
+links in both directions: contact↔company, contact↔deal and company↔deal. Every
+association page is checked, and missing/failed readbacks leave work retryable.
+Existing unrelated links are preserved. A per-workspace/call journal stores the
+selected deal ID before association verification, so retries keep that deal even
+if an existing opportunity closes before readback succeeds. The shared unique
+contact key protects uncertain creates. Superseded call revisions cannot trigger
+a new meeting deal. Enablement requires a controlled post-activation meeting and
+readback of its deal and all associations before considering live rollout verified.

@@ -123,7 +123,7 @@ class DemoRequestDeals {
     return matches[0].value;
   }
 
-  async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri, ownerId }) {
+  async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri, ownerId, resolveOwner, creationDescription }) {
     if ((this.sourceLabel === 'Inbound - Website' || bookingUri) && !/^https:\/\/api\.calendly\.com\/scheduled_events\/[\w-]+\/invitees\/[\w-]+$/.test(bookingUri || '')) throw new Error('demo_request_confirmed_booking_required');
     const inboundSource = await this.inboundSourceValue();
     const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id,lead_source,contact_type,hs_lead_status,lifecyclestage`);
@@ -146,6 +146,8 @@ class DemoRequestDeals {
     if (!deal) deal = await findOpenDemoDeal({ request: this.request, contactId, companyId: company.id, pipelineId: PIPELINE_ID });
     let action = 'reused_existing_deal';
     if (!deal) {
+      // Resolve initial ownership only for a new deal; reused deals retain their owner.
+      if (resolveOwner) ownerId = await resolveOwner();
       if (!/^\d+$/.test(String(ownerId || ''))) throw new Error('demo_request_owner_required');
       action = 'created';
       const name = company.name || [contact.properties.firstname, contact.properties.lastname].filter(Boolean).join(' ') || email;
@@ -155,7 +157,7 @@ class DemoRequestDeals {
         pipeline: PIPELINE_ID, dealstage: STAGE_ID,
         deal_source: inboundSource, ...(bookingUri ? { calendly_invitee_uri: bookingUri } : {}),
         [CONTACT_KEY_PROPERTY]: String(contactId),
-        description: this.sourceLabel === 'Inbound - Website' ? 'Created from a confirmed website demo booking.' : 'Created from a Nooks booked meeting.',
+        description: creationDescription || (this.sourceLabel === 'Inbound - Website' ? 'Created from a confirmed website demo booking.' : 'Created from a Nooks booked meeting.'),
       };
       try {
         deal = await this.request('/crm/v3/objects/deals', {
@@ -175,7 +177,7 @@ class DemoRequestDeals {
     }
     if (!/^\d+$/.test(String(deal.id)) || deal.archived) throw new Error('demo_request_deal_unavailable');
     this.logger.info?.('demo_deal_creation', { action, contactId: String(contactId), dealId: String(deal.id), bookingUri, reason: this.sourceLabel === 'Inbound - Website' ? 'confirmed_website_booking' : 'nooks_booked_meeting' });
-    await saveDeal(String(deal.id));
+    await saveDeal(String(deal.id), { created: action === 'created' || Boolean(creationDescription && deal.properties?.description === creationDescription) });
     // Only repair attribution on this automation's own opportunity, with the
     // booking evidence that authorized this run. Preserve manually set sources.
     if (deal.properties?.[CONTACT_KEY_PROPERTY] === String(contactId)) {
@@ -201,7 +203,29 @@ class DemoRequestDeals {
         deal.properties = { ...deal.properties, ...properties };
       }
     }
+    await this.verifyAssociations({contactId,companyId:company.id,dealId:deal.id});
     return { ...deal, id: String(deal.id), company: company.id ? company : null };
+  }
+
+  async verifyAssociations({ contactId, companyId, dealId }) {
+    for (const [fromType, fromId, toType, toId] of [
+      ['contacts',contactId,'companies',companyId], ['companies',companyId,'contacts',contactId],
+      ['contacts',contactId,'deals',dealId], ['deals',dealId,'contacts',contactId],
+      ['companies',companyId,'deals',dealId], ['deals',dealId,'companies',companyId],
+    ]) {
+      if (!/^[1-9][0-9]*$/.test(String(fromId || '')) || !/^[1-9][0-9]*$/.test(String(toId || ''))) throw new Error('demo_request_association_identity_required');
+      let after, found = false;
+      const seen = new Set();
+      do {
+        const page = await this.request(`/crm/v4/objects/${fromType}/${fromId}/associations/${toType}?limit=500${after != null ? `&after=${encodeURIComponent(after)}` : ''}`);
+        if (!Array.isArray(page.results)) throw new Error('demo_request_association_readback_invalid');
+        found ||= page.results.some(row => String(row.toObjectId) === String(toId));
+        after = page.paging?.next?.after;
+        if (after != null && seen.has(String(after))) throw new Error('demo_request_association_cursor_repeated');
+        if (after != null) seen.add(String(after));
+      } while (after != null);
+      if (!found) throw new Error('demo_request_association_readback_missing');
+    }
   }
 
   async classify(contact, companyId) {

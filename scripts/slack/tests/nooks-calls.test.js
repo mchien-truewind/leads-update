@@ -58,7 +58,7 @@ test('all outcomes sync as calls with full details, correct units and associatio
 test('revisions update one call and a late older receipt cannot overwrite it',async()=>{
   const f=fixture();await f.service.process(f.event);
   const old=structuredClone(f.event);f.event.ingressSequence='3';f.event.callData.notes='latest';await f.service.process(f.event);
-  await f.service.process(old);assert.match(f.records.get('30').hs_call_body,/latest/);assert.equal(f.creates,1);
+  assert.equal((await f.service.process(old)).stale,true);assert.match(f.records.get('30').hs_call_body,/latest/);assert.equal(f.creates,1);
 });
 test('uncertain successful create is reconciled, and an absent uncertain create is never repeated',async()=>{
   const f=fixture();f.uncertain=true;await assert.rejects(f.service.process(f.event));

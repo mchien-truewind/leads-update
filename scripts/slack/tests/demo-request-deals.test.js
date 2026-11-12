@@ -21,7 +21,10 @@ function fixture({ company = true, openDeal = false, timeout = false, companyLin
     if (path === '/automation/v4/flows/1901925124') return { isEnabled: false };
     if (path.startsWith('/crm/v4/objects/contacts/1/associations/companies?')) return { results: company ? [{ toObjectId: '2', associationTypes: [{ category: 'HUBSPOT_DEFINED', typeId: 279 }] }] : [] };
     if (path.startsWith('/crm/v3/objects/companies/2?')) return { id: '2', properties: { name: 'Fixture Company', domain: 'fixture.example' } };
-    if (/\/associations\/deals\?/.test(path)) return { results: openDeal ? [{ toObjectId: '90' }] : [] };
+    if (path.startsWith('/crm/v4/objects/companies/2/associations/contacts?')) return {results:[{toObjectId:'1'}]};
+    if (path.startsWith('/crm/v4/objects/deals/') && path.includes('/associations/contacts?')) return {results:[{toObjectId:'1'}]};
+    if (path.startsWith('/crm/v4/objects/deals/') && path.includes('/associations/companies?')) return {results:[{toObjectId:'2'}]};
+    if (/\/associations\/deals\?/.test(path)) return { results: [...deals.keys()].map(toObjectId=>({toObjectId})) };
     if (path === '/crm/v3/objects/deals/batch/read') return { results: options.body.inputs.map(x => deals.get(x.id)) };
     if (path === '/crm/v3/objects/deals' && options.method === 'POST') {
       const props = options.body.properties;
@@ -171,7 +174,10 @@ test('newly created company is linked to both the contact and the newly created 
     }
     if (path.startsWith('/crm/v3/objects/companies/200?')) return company;
     if (path === '/crm/v3/objects/companies/200' && options.method === 'PATCH') return {};
-    if (path.startsWith('/crm/v4/objects/companies/200/associations/deals?')) return { results: [] };
+    if (path.startsWith('/crm/v4/objects/companies/200/associations/deals?')) return { results: [...f.deals.keys()].map(toObjectId=>({toObjectId})) };
+    if (path.startsWith('/crm/v4/objects/companies/200/associations/contacts?')) return {results:[{toObjectId:'1'}]};
+    if (path.startsWith('/crm/v4/objects/contacts/1/associations/companies?')) return {results:company?[{toObjectId:'200'}]:[]};
+    if (path.startsWith('/crm/v4/objects/deals/100/associations/companies?')) return {results:[{toObjectId:'200'}]};
     return request(path, options);
   };
   const deal = await f.service.ensure({ ownerId: '102500801', bookingUri: 'https://api.calendly.com/scheduled_events/fixture/invitees/fixture', contactId: '1', email: 'lead@example.business', saveDeal: async id => f.saved.push(id) });
@@ -305,4 +311,25 @@ test('company resolution retains a primary label across paginated duplicate asso
     return { id: '3', properties: { name: 'Primary Company' } };
   } });
   assert.equal((await service.company({ id: '1', properties: {} })).id, '3');
+});
+
+test('confirmed inbound booking reads back every contact/company/deal link in both directions',async()=>{
+  const f=fixture();await f.ensure();
+  for(const path of ['/contacts/1/associations/companies?','/companies/2/associations/contacts?','/contacts/1/associations/deals?','/deals/100/associations/contacts?','/companies/2/associations/deals?','/deals/100/associations/companies?'])assert.ok(f.calls.some(x=>x.path.includes(path)),path);
+});
+test('success response on association write is insufficient; failed readback retries the saved deal',async()=>{
+  const f=fixture();const request=f.service.request;let visible=false;
+  f.service.request=(path,options)=>path.startsWith('/crm/v4/objects/companies/2/associations/contacts?')&&!visible?{results:[]}:request(path,options);
+  await assert.rejects(f.ensure(),/association_readback_missing/);assert.deepEqual(f.saved,['100']);visible=true;
+  assert.equal((await f.ensure(f.saved[0])).id,'100');assert.equal(f.calls.filter(x=>x.path==='/crm/v3/objects/deals'&&x.method==='POST').length,1);
+});
+test('association verification follows pagination in every direction and rejects repeated cursors',async()=>{
+  const paths=[];let repeat=false;
+  const service=new DemoRequestDeals({request:async path=>{
+    paths.push(path);const url=new URL('https://example.test'+path);const type=url.pathname.split('/').pop();const id={contacts:'1',companies:'2',deals:'3'}[type];
+    if(url.searchParams.has('after'))return {results:[{toObjectId:id}],...(repeat?{paging:{next:{after:'next'}}}:{})};
+    return {results:[],paging:{next:{after:'next'}}};
+  }});
+  await service.verifyAssociations({contactId:'1',companyId:'2',dealId:'3'});assert.equal(paths.length,12);
+  repeat=true;await assert.rejects(service.verifyAssociations({contactId:'1',companyId:'2',dealId:'3'}),/cursor_repeated/);
 });

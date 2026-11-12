@@ -52,6 +52,8 @@ const { handleDemoRoutingRequest } = require('./demo-routing-http');
 const { DemoBookingStore } = require('./demo-booking-store');
 const { DemoSubmissionLifecycle } = require('./demo-submission-lifecycle');
 const { GoogleCalendarDealSync } = require('./google-calendar-deal-sync');
+const { createNooksOwnerNotifier } = require('./nooks-owner-notification');
+const { createNooksMeetingOwnerResolver } = require('./nooks-meeting-owner');
 const { startDemoRoutingRecovery } = require('./demo-routing-recovery');
 const { verifyOwnerRegistry } = require('./demo-routing-readiness');
 const {
@@ -6584,10 +6586,15 @@ async function startSlackBot() {
 
   if (process.env.NOOKS_DEALS_ENABLED === 'true' || process.env.NOOKS_CALLS_ENABLED === 'true') {
     if (!slackStateStore?.pool || !HUBSPOT_TOKEN || !process.env.NOOKS_FORWARD_TOKEN || !process.env.NOOKS_WORKSPACE_ID) throw new Error('Nooks sync requires durable state, HubSpot, forwarding token and workspace');
-    nooksDeals = new NooksDeals({ request: hubspotRequestFromFetchOptions, pool: slackStateStore.pool });
+    nooksDeals = new NooksDeals({ request: hubspotRequestFromFetchOptions, pool: slackStateStore.pool,
+      notifyOwnerIssue: createNooksOwnerNotifier({ client: app.client, resolveChannelId }),
+      resolveMeetingOwner: process.env.NOOKS_DEALS_ENABLED === 'true' ? createNooksMeetingOwnerResolver({
+        request: hubspotRequestFromFetchOptions,
+        calendar: google.calendar({ version: 'v3', auth: createCalendarOAuthClient() }),
+      }) : undefined });
     if (process.env.NOOKS_DEALS_ENABLED === 'true') {
-      if (!process.env.NOOKS_MEETING_DISPOSITION_IDS) throw new Error('Nooks deals require disposition IDs');
-      await nooksDeals.deals.initialize();
+      if (!process.env.NOOKS_MEETING_DISPOSITION_IDS || !process.env.SLACK_BOT_TOKEN) throw new Error('Nooks deals require disposition IDs and the existing Slack bot token');
+      await nooksDeals.initialize();
     }
     if (process.env.NOOKS_CALLS_ENABLED === 'true') {
       const { NooksCalls } = require('./nooks-calls');
@@ -6650,6 +6657,7 @@ async function startSlackBot() {
   console.log(`  Firecrawl: ${FIRECRAWL_API_KEY ? 'ready' : 'NOT CONFIGURED'}`);
 
   if (runsWorker) {
+    if (process.env.NOOKS_DEALS_ENABLED === 'true') nooksDeals.ownerJobs.start();
     if (process.env.GOOGLE_CALENDAR_DEAL_SYNC_ENABLED === 'true') {
       if (!slackStateStore?.pool || !HUBSPOT_TOKEN) throw new Error('Calendar deal sync requires HubSpot and durable state');
       const calendarSync = new GoogleCalendarDealSync({ pool: slackStateStore.pool,

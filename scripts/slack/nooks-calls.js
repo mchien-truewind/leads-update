@@ -154,7 +154,7 @@ class NooksCalls {
       if (!locked) throw new Error('nooks_call_busy');
       await client.query('INSERT INTO nooks_call_sync(workspace_id,call_id) VALUES($1,$2) ON CONFLICT DO NOTHING', key);
       const row = (await client.query('SELECT * FROM nooks_call_sync WHERE workspace_id=$1 AND call_id=$2', key)).rows[0];
-      if (row.hubspot_call_id && BigInt(sequence) < BigInt(row.ingress_sequence)) return {status:'processed',callId:row.hubspot_call_id};
+      if (row.hubspot_call_id && BigInt(sequence) < BigInt(row.ingress_sequence)) return {status:'processed',callId:row.hubspot_call_id,stale:true};
       if (row.hubspot_call_id && row.digest === digest) {
         await client.query('UPDATE nooks_call_sync SET ingress_sequence=$3 WHERE workspace_id=$1 AND call_id=$2', [...key,sequence]);
         return {status:'processed',callId:row.hubspot_call_id};

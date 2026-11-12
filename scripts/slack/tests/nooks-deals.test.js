@@ -27,10 +27,10 @@ function fixture() {
   const event={event:'call.logged',callData:{workspaceId:'workspace',callId:'call',startedAt:'2026-11-11T01:00:00Z',status:'completed',disposition:{id:'meeting'},prospectData:{email:'lead@example.test'},userData:{email:'ae@example.test'},accountData:{name:'Example'}}};
   return {service,event,queries,ensured,rows,contactCreates,set missingContact(value){existing=!value;}};
 }
-test('booked meeting resolves calendar AE, uses shared inbound helper with outbound source and saves verified receipt',async()=>{
+test('booked meeting initially resolves booking SDR, uses shared inbound helper with outbound source and saves verified receipt',async()=>{
   const f=fixture();await f.service.initialize();
   assert.deepEqual(await f.service.process(f.event),{status:'processed',dealId:'20'});
-  assert.equal(f.service.deals.sourceLabel,'Outbound - Sales Sourced List');assert.equal(f.ensured[0].ownerId,'456');assert.equal(f.ensured[0].companyName,'Example');assert.equal(f.rows.get('workspace:call').verified,true);assert.equal(f.queries.at(-1),'released');
+  assert.equal(f.service.deals.sourceLabel,'Outbound - Sales Sourced List');assert.equal(f.ensured[0].ownerId,'123');assert.equal(f.ensured[0].companyName,'Example');assert.equal(f.rows.get('workspace:call').verified,true);assert.equal(f.queries.at(-1),'released');
 });
 test('both actual Nooks and HubSpot meeting IDs trigger; names alone never trigger',async()=>{
   for(const id of ['meeting','hubspot-meeting']){const f=fixture();f.event.callData.disposition.id=id;assert.equal((await f.service.process(f.event)).dealId,'20');}
@@ -87,4 +87,4 @@ test('a superseded Meeting Booked revision cannot create a deal after a newer ca
   assert.equal((await f.service.process(f.event)).stale,true);assert.equal(f.ensured.length,0);
 });
 
-test('new contact stays owned by SDR while only the new deal gets the AE',async()=>{const f=fixture();f.missingContact=true;await f.service.process(f.event);assert.equal(f.contactCreates[0].hubspot_owner_id,'123');assert.equal(f.ensured[0].ownerId,'456');});
+test('new contact stays owned by SDR while new deal initially waits under SDR ownership',async()=>{const f=fixture();f.missingContact=true;await f.service.process(f.event);assert.equal(f.contactCreates[0].hubspot_owner_id,'123');assert.equal(f.ensured[0].ownerId,'123');});

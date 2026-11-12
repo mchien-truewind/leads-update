@@ -424,14 +424,27 @@ New eligible meetings reuse the inbound demo record helper, selecting the
 contact's primary company (or its sole associated company), searching existing
 company/contact deals across all association pages, and creating a Discovery
 opportunity only when no reusable deal exists. The source is
-`Outbound - Sales Sourced List`. Only new Nooks deals resolve their owner from
+`Outbound - Sales Sourced List`. New Nooks deals are initially owned by the
+booking SDR. A durable job waits at least five minutes after creation before
+searching the calendar and switching the deal owner to the AE. A worker checks
+due jobs every minute; the first lookup normally occurs five to six minutes
+after creation. Restarts and duplicate deliveries preserve the original deadline.
+Only new Nooks deals resolve their final owner from
 the prospect's next eligible Google Calendar meeting, reusing the calendar sync's
 attendee/occurrence rules. Registered AEs come from `DEMO_ROUTING_OWNERS_JSON`;
 the existing Google Calendar OAuth credentials must read every registered AE
 calendar. The AE organizer is preferred; an SDR-organized meeting requires one
-unambiguous AE attendee. The Nooks rep is excluded from ownership. Missing,
+unambiguous AE attendee. The Nooks rep is excluded from the final AE selection. Missing,
 private, cancelled, declined or ambiguous meetings, incomplete calendar access
-and conflicting calendar copies leave creation pending for durable retry.
+and conflicting calendar copies leave owner reassignment pending for retry
+every minute. After the first failed lookup, the existing Slack bot posts to
+`#gtm-general`, tagging Mercedes (`U0ABULY5TEK`) with the contact, deal link and
+call ID. The database records successful delivery to suppress repeat alerts per
+deal; failed Slack sends retry. An uncertain Slack response may still duplicate
+a post, mitigated by a stable message ID. A manual owner change is preserved,
+alerted and stops automatic reassignment. Owner writes are read back, and a
+persisted target owner recovers uncertain writes. New-contact SDR ownership is
+unchanged; only the deal moves to the AE.
 The next meeting is the earliest future eligible event with the prospect's exact
 email; simultaneous distinct matches remain pending. Existing deal owners are
 preserved without requiring a calendar lookup, and inbound owner selection is

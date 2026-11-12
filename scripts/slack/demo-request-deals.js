@@ -123,7 +123,7 @@ class DemoRequestDeals {
     return matches[0].value;
   }
 
-  async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri, ownerId, resolveOwner }) {
+  async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri, ownerId, resolveOwner, creationDescription }) {
     if ((this.sourceLabel === 'Inbound - Website' || bookingUri) && !/^https:\/\/api\.calendly\.com\/scheduled_events\/[\w-]+\/invitees\/[\w-]+$/.test(bookingUri || '')) throw new Error('demo_request_confirmed_booking_required');
     const inboundSource = await this.inboundSourceValue();
     const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id,lead_source,contact_type,hs_lead_status,lifecyclestage`);
@@ -146,7 +146,7 @@ class DemoRequestDeals {
     if (!deal) deal = await findOpenDemoDeal({ request: this.request, contactId, companyId: company.id, pipelineId: PIPELINE_ID });
     let action = 'reused_existing_deal';
     if (!deal) {
-      // Resolve calendar ownership only for a new Nooks deal; reused deals retain their owner.
+      // Resolve initial ownership only for a new deal; reused deals retain their owner.
       if (resolveOwner) ownerId = await resolveOwner();
       if (!/^\d+$/.test(String(ownerId || ''))) throw new Error('demo_request_owner_required');
       action = 'created';
@@ -157,7 +157,7 @@ class DemoRequestDeals {
         pipeline: PIPELINE_ID, dealstage: STAGE_ID,
         deal_source: inboundSource, ...(bookingUri ? { calendly_invitee_uri: bookingUri } : {}),
         [CONTACT_KEY_PROPERTY]: String(contactId),
-        description: this.sourceLabel === 'Inbound - Website' ? 'Created from a confirmed website demo booking.' : 'Created from a Nooks booked meeting.',
+        description: creationDescription || (this.sourceLabel === 'Inbound - Website' ? 'Created from a confirmed website demo booking.' : 'Created from a Nooks booked meeting.'),
       };
       try {
         deal = await this.request('/crm/v3/objects/deals', {
@@ -177,7 +177,7 @@ class DemoRequestDeals {
     }
     if (!/^\d+$/.test(String(deal.id)) || deal.archived) throw new Error('demo_request_deal_unavailable');
     this.logger.info?.('demo_deal_creation', { action, contactId: String(contactId), dealId: String(deal.id), bookingUri, reason: this.sourceLabel === 'Inbound - Website' ? 'confirmed_website_booking' : 'nooks_booked_meeting' });
-    await saveDeal(String(deal.id));
+    await saveDeal(String(deal.id), { created: action === 'created' || Boolean(creationDescription && deal.properties?.description === creationDescription) });
     // Only repair attribution on this automation's own opportunity, with the
     // booking evidence that authorized this run. Preserve manually set sources.
     if (deal.properties?.[CONTACT_KEY_PROPERTY] === String(contactId)) {

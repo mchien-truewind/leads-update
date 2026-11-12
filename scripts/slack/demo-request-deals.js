@@ -123,7 +123,7 @@ class DemoRequestDeals {
     return matches[0].value;
   }
 
-  async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri, ownerId }) {
+  async ensure({ contactId, email, dealId, saveDeal, companyName, bookingUri, ownerId, resolveOwner }) {
     if ((this.sourceLabel === 'Inbound - Website' || bookingUri) && !/^https:\/\/api\.calendly\.com\/scheduled_events\/[\w-]+\/invitees\/[\w-]+$/.test(bookingUri || '')) throw new Error('demo_request_confirmed_booking_required');
     const inboundSource = await this.inboundSourceValue();
     const contact = await this.request(`/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname,company,hubspot_owner_id,lead_source,contact_type,hs_lead_status,lifecyclestage`);
@@ -146,6 +146,8 @@ class DemoRequestDeals {
     if (!deal) deal = await findOpenDemoDeal({ request: this.request, contactId, companyId: company.id, pipelineId: PIPELINE_ID });
     let action = 'reused_existing_deal';
     if (!deal) {
+      // Resolve calendar ownership only for a new Nooks deal; reused deals retain their owner.
+      if (resolveOwner) ownerId = await resolveOwner();
       if (!/^\d+$/.test(String(ownerId || ''))) throw new Error('demo_request_owner_required');
       action = 'created';
       const name = company.name || [contact.properties.firstname, contact.properties.lastname].filter(Boolean).join(' ') || email;

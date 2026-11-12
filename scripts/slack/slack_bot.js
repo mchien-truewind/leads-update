@@ -52,6 +52,7 @@ const { handleDemoRoutingRequest } = require('./demo-routing-http');
 const { DemoBookingStore } = require('./demo-booking-store');
 const { DemoSubmissionLifecycle } = require('./demo-submission-lifecycle');
 const { GoogleCalendarDealSync } = require('./google-calendar-deal-sync');
+const { createNooksMeetingOwnerResolver } = require('./nooks-meeting-owner');
 const { startDemoRoutingRecovery } = require('./demo-routing-recovery');
 const { verifyOwnerRegistry } = require('./demo-routing-readiness');
 const {
@@ -6584,7 +6585,11 @@ async function startSlackBot() {
 
   if (process.env.NOOKS_DEALS_ENABLED === 'true' || process.env.NOOKS_CALLS_ENABLED === 'true') {
     if (!slackStateStore?.pool || !HUBSPOT_TOKEN || !process.env.NOOKS_FORWARD_TOKEN || !process.env.NOOKS_WORKSPACE_ID) throw new Error('Nooks sync requires durable state, HubSpot, forwarding token and workspace');
-    nooksDeals = new NooksDeals({ request: hubspotRequestFromFetchOptions, pool: slackStateStore.pool });
+    nooksDeals = new NooksDeals({ request: hubspotRequestFromFetchOptions, pool: slackStateStore.pool,
+      resolveMeetingOwner: process.env.NOOKS_DEALS_ENABLED === 'true' ? createNooksMeetingOwnerResolver({
+        request: hubspotRequestFromFetchOptions,
+        calendar: google.calendar({ version: 'v3', auth: createCalendarOAuthClient() }),
+      }) : undefined });
     if (process.env.NOOKS_DEALS_ENABLED === 'true') {
       if (!process.env.NOOKS_MEETING_DISPOSITION_IDS) throw new Error('Nooks deals require disposition IDs');
       await nooksDeals.initialize();

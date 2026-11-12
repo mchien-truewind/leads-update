@@ -55,21 +55,23 @@ function fixture({existingDeal=false}={}){
     }
     throw new Error('Unexpected '+path);
   };
-  const service=new NooksDeals({request,pool:{query,connect:async()=>({query,release(){}})},env:{NOOKS_DEALS_ENABLED:'true',NOOKS_DEALS_ACTIVATED_AT:'2026-11-11T00:00:00Z',NOOKS_WORKSPACE_ID:'w',NOOKS_MEETING_DISPOSITION_IDS:'6ace719d28ac2c000dbd3c71,887a2c18-be90-404f-8984-5611ca3655a6'}});
+  const service=new NooksDeals({request,resolveMeetingOwner:async()=> '456',pool:{query,connect:async()=>({query,release(){}})},env:{NOOKS_DEALS_ENABLED:'true',NOOKS_DEALS_ACTIVATED_AT:'2026-11-11T00:00:00Z',NOOKS_WORKSPACE_ID:'w',NOOKS_MEETING_DISPOSITION_IDS:'6ace719d28ac2c000dbd3c71,887a2c18-be90-404f-8984-5611ca3655a6'}});
   const event={event:'call.logged',callData:{workspaceId:'w',callId:'call',startedAt:'2026-11-11T01:00:00Z',status:'completed',disposition:{id:'6ace719d28ac2c000dbd3c71',name:'Meeting Booked'},prospectData:{email:'lead@example.test'},userData:{email:'rep@example.test'}}};
   return{service,event,calls,receipts,deals,get creates(){return creates;},set hideReverse(x){hideReverse=x;}};
 }
 test('real Nooks flow creates one Discovery deal and verifies all reciprocal links to the selected primary company',async()=>{
   const f=fixture();await f.service.initialize();const result=await f.service.process(f.event);
-  assert.equal(result.dealId,'100');const deal=f.deals.get('100');assert.equal(deal.properties.dealstage,STAGE_ID);assert.equal(deal.properties.hubspot_owner_id,'123');assert.equal(deal.properties.deal_source,'Outbound');
+  assert.equal(result.dealId,'100');const deal=f.deals.get('100');assert.equal(deal.properties.dealstage,STAGE_ID);assert.equal(deal.properties.hubspot_owner_id,'456');assert.equal(deal.properties.deal_source,'Outbound');
   assert.equal(f.receipts.get('w:call').verified,true);await f.service.process(f.event);assert.equal(f.creates,1);
   for(const path of ['/contacts/10/associations/companies?','/companies/30/associations/contacts?','/contacts/10/associations/deals?','/deals/100/associations/contacts?','/companies/30/associations/deals?','/deals/100/associations/companies?'])assert.ok(f.calls.some(x=>x.path.includes(path)),path);
 });
 test('open-deal lookup includes all contact company associations and preserves the existing deal owner',async()=>{
-  const f=fixture({existingDeal:true});await f.service.initialize();assert.equal((await f.service.process(f.event)).dealId,'90');assert.equal(f.creates,0);assert.equal(f.deals.get('90').properties.hubspot_owner_id,'555');
+  const f=fixture({existingDeal:true});f.service.resolveMeetingOwner=async()=>{throw new Error('must not resolve existing deal');};await f.service.initialize();assert.equal((await f.service.process(f.event)).dealId,'90');assert.equal(f.creates,0);assert.equal(f.deals.get('90').properties.hubspot_owner_id,'555');
   assert.ok(f.calls.some(x=>x.path.includes('/companies/40/associations/deals?')));assert.ok(f.calls.some(x=>x.path.includes('/companies/30/associations/deals?')));
 });
 test('a missing reciprocal link leaves receipt pending; retry repairs the same saved deal',async()=>{
   const f=fixture();await f.service.initialize();f.hideReverse=true;await assert.rejects(f.service.process(f.event),/association_readback_missing/);assert.equal(f.receipts.get('w:call').deal_id,'100');assert.equal(f.receipts.get('w:call').verified,undefined);
   f.hideReverse=false;assert.equal((await f.service.process(f.event)).dealId,'100');assert.equal(f.creates,1);assert.equal(f.receipts.get('w:call').verified,true);
 });
+
+test('missing calendar match prevents new deal and remains retryable',async()=>{const f=fixture();f.service.resolveMeetingOwner=async()=>{throw new Error('nooks_meeting_not_found');};await assert.rejects(f.service.process(f.event),/meeting_not_found/);assert.equal(f.creates,0);assert.equal(f.receipts.get('w:call').verified,undefined);});

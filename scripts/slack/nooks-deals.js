@@ -2,8 +2,8 @@ const crypto = require('node:crypto');
 const { DemoRequestDeals } = require('./demo-request-deals');
 
 class NooksDeals {
-  constructor({ request, pool, env = process.env }) {
-    Object.assign(this, { request, pool, env });
+  constructor({ request, pool, resolveMeetingOwner, env = process.env }) {
+    Object.assign(this, { request, pool, env, resolveMeetingOwner });
     this.dispositions = new Set((env.NOOKS_MEETING_DISPOSITION_IDS || '').split(',').map(x => x.trim()).filter(Boolean));
     this.deals = new DemoRequestDeals({ request, sourceLabel: 'Outbound - Sales Sourced List' });
   }
@@ -58,25 +58,12 @@ class NooksDeals {
 
   async processMeeting(call) {
     const email = String(call.prospectData?.email || '').trim().toLowerCase();
-    const repEmail = String(call.userData?.email || '').trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !repEmail) throw new Error('nooks_contact_or_owner_email_missing');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('nooks_contact_or_owner_email_missing');
     const client = await this.pool.connect();
     let locked = false;
     try {
       locked = (await client.query('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [`demo-submission:${email}`])).rows[0]?.locked;
       if (!locked) throw new Error('nooks_contact_busy');
-      const owners = [];
-      let after;
-      const cursors = new Set();
-      do {
-        const page = await this.request(`/crm/v3/owners?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`);
-        owners.push(...page.results);
-        after = page.paging?.next?.after;
-        if (after && cursors.has(String(after))) throw new Error('nooks_owner_pagination_invalid');
-        if (after) cursors.add(String(after));
-      } while (after);
-      const matches = owners.filter(x => x.archived === false && String(x.email).toLowerCase() === repEmail);
-      if (matches.length !== 1) throw new Error('nooks_owner_unresolved');
       const lookup = async () => {
         try { return await this.request(`/crm/v3/objects/contacts/${encodeURIComponent(email)}?idProperty=email&properties=email,company`); }
         catch (error) { if (error.statusCode === 404) return null; throw error; }
@@ -87,7 +74,7 @@ class NooksDeals {
         try {
           contact = await this.request('/crm/v3/objects/contacts', { method: 'POST', body: { properties: {
             email, ...(call.accountData?.name ? { company: call.accountData.name } : {}),
-            contact_type: 'Prospective Customer', hs_lead_status: 'MQL', hubspot_owner_id: String(matches[0].id),
+            contact_type: 'Prospective Customer', hs_lead_status: 'MQL',
           } } });
         } catch (error) { contact = await lookup(); if (!contact) throw error; }
       }
@@ -100,7 +87,10 @@ class NooksDeals {
       const saved = (await client.query('SELECT * FROM nooks_meeting_deals WHERE workspace_id=$1 AND call_id=$2', key)).rows[0];
       if (saved?.contact_id !== String(contact.id)) throw new Error('nooks_meeting_contact_changed');
       const deal = await this.deals.ensure({ contactId: contact.id, email, companyName: call.accountData?.name,
-        ownerId: String(matches[0].id), dealId: saved.deal_id || undefined,
+        resolveOwner: async () => {
+          if (!this.resolveMeetingOwner) throw new Error('nooks_meeting_owner_unavailable');
+          return this.resolveMeetingOwner({ email, repEmail: call.userData?.email });
+        }, dealId: saved.deal_id || undefined,
         saveDeal: async id => {
           await client.query('UPDATE nooks_meeting_deals SET deal_id=$3,verified_at=NULL WHERE workspace_id=$1 AND call_id=$2', [...key,String(id)]);
         } });

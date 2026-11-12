@@ -424,8 +424,18 @@ New eligible meetings reuse the inbound demo record helper, selecting the
 contact's primary company (or its sole associated company), searching existing
 company/contact deals across all association pages, and creating a Discovery
 opportunity only when no reusable deal exists. The source is
-`Outbound - Sales Sourced List`, with the Nooks rep resolved by verified HubSpot
-owner email for a new deal. Existing deal owners are preserved. Missing companies
+`Outbound - Sales Sourced List`. Only new Nooks deals resolve their owner from
+the prospect's next eligible Google Calendar meeting, reusing the calendar sync's
+attendee/occurrence rules. Registered AEs come from `DEMO_ROUTING_OWNERS_JSON`;
+the existing Google Calendar OAuth credentials must read every registered AE
+calendar. The AE organizer is preferred; an SDR-organized meeting requires one
+unambiguous AE attendee. The Nooks rep is excluded from ownership. Missing,
+private, cancelled, declined or ambiguous meetings, incomplete calendar access
+and conflicting calendar copies leave creation pending for durable retry.
+The next meeting is the earliest future eligible event with the prospect's exact
+email; simultaneous distinct matches remain pending. Existing deal owners are
+preserved without requiring a calendar lookup, and inbound owner selection is
+unchanged. Missing companies
 can be resolved/created using the same business-domain/name rules as inbound
 demos; ambiguous company or contact identities remain pending for correction.
 

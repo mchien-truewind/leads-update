@@ -16,21 +16,21 @@ function fixture() {
     return {rows:[]};
   },release(){queries.push('released');}};
   const env={NOOKS_DEALS_ENABLED:'true',NOOKS_WORKSPACE_ID:'workspace',NOOKS_MEETING_DISPOSITION_IDS:'meeting,hubspot-meeting',NOOKS_DEALS_ACTIVATED_AT:'2026-11-11T00:00:00Z'};
-  const service=new NooksDeals({env,pool:{connect:async()=>client,query:(...args)=>client.query(...args)},async request(path,options={}){
+  const service=new NooksDeals({env,resolveMeetingOwner:async()=> '456',pool:{connect:async()=>client,query:(...args)=>client.query(...args)},async request(path,options={}){
     if(path.startsWith('/crm/v3/owners?'))return {results:[{id:'123',email:'ae@example.test',archived:false}]};
     if(path.includes('idProperty=email')){if(!existing)throw Object.assign(new Error('not found'),{statusCode:404});return {id:'10',properties:{email:'lead@example.test'}};}
     if(path==='/crm/v3/objects/contacts'&&options.method==='POST'){existing=true;return {id:'10',properties:{email:'lead@example.test'}};}
     throw new Error('Unexpected request '+path);
   }});
   service.deals.initialize=async()=>{};
-  service.deals.ensure=async input=>{ensured.push(input);await input.saveDeal('20');return {id:'20',company:{id:'30'}};};
+  service.deals.ensure=async input=>{input.ownerId=await input.resolveOwner();ensured.push(input);await input.saveDeal('20');return {id:'20',company:{id:'30'}};};
   const event={event:'call.logged',callData:{workspaceId:'workspace',callId:'call',startedAt:'2026-11-11T01:00:00Z',status:'completed',disposition:{id:'meeting'},prospectData:{email:'lead@example.test'},userData:{email:'ae@example.test'},accountData:{name:'Example'}}};
   return {service,event,queries,ensured,rows,set missingContact(value){existing=!value;}};
 }
-test('booked meeting resolves rep, uses shared inbound helper with outbound source and saves verified receipt',async()=>{
+test('booked meeting resolves calendar AE, uses shared inbound helper with outbound source and saves verified receipt',async()=>{
   const f=fixture();await f.service.initialize();
   assert.deepEqual(await f.service.process(f.event),{status:'processed',dealId:'20'});
-  assert.equal(f.service.deals.sourceLabel,'Outbound - Sales Sourced List');assert.equal(f.ensured[0].ownerId,'123');assert.equal(f.ensured[0].companyName,'Example');assert.equal(f.rows.get('workspace:call').verified,true);assert.equal(f.queries.at(-1),'released');
+  assert.equal(f.service.deals.sourceLabel,'Outbound - Sales Sourced List');assert.equal(f.ensured[0].ownerId,'456');assert.equal(f.ensured[0].companyName,'Example');assert.equal(f.rows.get('workspace:call').verified,true);assert.equal(f.queries.at(-1),'released');
 });
 test('both actual Nooks and HubSpot meeting IDs trigger; names alone never trigger',async()=>{
   for(const id of ['meeting','hubspot-meeting']){const f=fixture();f.event.callData.disposition.id=id;assert.equal((await f.service.process(f.event)).dealId,'20');}
@@ -51,8 +51,8 @@ test('activation and disposition configuration are required and activation canno
   f.service.env.NOOKS_DEALS_ACTIVATED_AT='';await assert.rejects(f.service.process(f.event),/activation_required/);
   f.service.env.NOOKS_DEALS_ACTIVATED_AT='2026-11-11T00:00:00Z';f.service.dispositions.clear();await assert.rejects(f.service.process(f.event),/dispositions_required/);
 });
-test('missing timestamps, mismatched workspace, missing email and unknown owner fail without deal writes',async()=>{
-  for(const mutate of [e=>delete e.callData.startedAt,e=>e.callData.workspaceId='other',e=>e.callData.prospectData.email=null,e=>e.callData.userData.email='unknown@example.test']){
+test('missing timestamps, mismatched workspace and missing email fail without deal writes',async()=>{
+  for(const mutate of [e=>delete e.callData.startedAt,e=>e.callData.workspaceId='other',e=>e.callData.prospectData.email=null]){
     const f=fixture();mutate(f.event);await assert.rejects(f.service.process(f.event));assert.equal(f.ensured.length,0);
   }
 });

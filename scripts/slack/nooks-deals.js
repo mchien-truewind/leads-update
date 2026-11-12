@@ -71,10 +71,26 @@ class NooksDeals {
       let contact = await lookup();
       if (!contact) {
         if (/^[1-9][0-9]*$/.test(String(call.prospectData?.prospectId || ''))) throw new Error('nooks_contact_identity_conflict');
+        // Keep the existing new-contact assignment to the booking SDR. Calendar
+        // ownership changes apply to the new deal only.
+        const repEmail = String(call.userData?.email || '').trim().toLowerCase();
+        const owners = [];
+        const cursors = new Set();
+        let after;
+        do {
+          const page = await this.request(`/crm/v3/owners?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`);
+          if (!Array.isArray(page.results)) throw new Error('nooks_owner_response_invalid');
+          owners.push(...page.results);
+          after = page.paging?.next?.after;
+          if (after && cursors.has(String(after))) throw new Error('nooks_owner_pagination_invalid');
+          if (after) cursors.add(String(after));
+        } while (after);
+        const reps = owners.filter(owner => owner.archived === false && String(owner.email).trim().toLowerCase() === repEmail);
+        if (reps.length !== 1 || !/^[1-9][0-9]*$/.test(String(reps[0].id))) throw new Error('nooks_owner_unresolved');
         try {
           contact = await this.request('/crm/v3/objects/contacts', { method: 'POST', body: { properties: {
             email, ...(call.accountData?.name ? { company: call.accountData.name } : {}),
-            contact_type: 'Prospective Customer', hs_lead_status: 'MQL',
+            contact_type: 'Prospective Customer', hs_lead_status: 'MQL', hubspot_owner_id: String(reps[0].id),
           } } });
         } catch (error) { contact = await lookup(); if (!contact) throw error; }
       }

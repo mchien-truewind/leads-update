@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { NooksDeals, handleNooksDealRequest } = require('../nooks-deals');
 
 function fixture() {
-  const queries=[],ensured=[],rows=new Map();let activation;let existing=true;
+  const queries=[],ensured=[],rows=new Map(),contactCreates=[];let activation;let existing=true;
   const client={async query(sql,args=[]){
     queries.push(sql);
     if(sql.includes('advisory'))return {rows:[{locked:true}]};
@@ -19,13 +19,13 @@ function fixture() {
   const service=new NooksDeals({env,resolveMeetingOwner:async()=> '456',pool:{connect:async()=>client,query:(...args)=>client.query(...args)},async request(path,options={}){
     if(path.startsWith('/crm/v3/owners?'))return {results:[{id:'123',email:'ae@example.test',archived:false}]};
     if(path.includes('idProperty=email')){if(!existing)throw Object.assign(new Error('not found'),{statusCode:404});return {id:'10',properties:{email:'lead@example.test'}};}
-    if(path==='/crm/v3/objects/contacts'&&options.method==='POST'){existing=true;return {id:'10',properties:{email:'lead@example.test'}};}
+    if(path==='/crm/v3/objects/contacts'&&options.method==='POST'){contactCreates.push(options.body.properties);existing=true;return {id:'10',properties:{email:'lead@example.test'}};}
     throw new Error('Unexpected request '+path);
   }});
   service.deals.initialize=async()=>{};
   service.deals.ensure=async input=>{input.ownerId=await input.resolveOwner();ensured.push(input);await input.saveDeal('20');return {id:'20',company:{id:'30'}};};
   const event={event:'call.logged',callData:{workspaceId:'workspace',callId:'call',startedAt:'2026-11-11T01:00:00Z',status:'completed',disposition:{id:'meeting'},prospectData:{email:'lead@example.test'},userData:{email:'ae@example.test'},accountData:{name:'Example'}}};
-  return {service,event,queries,ensured,rows,set missingContact(value){existing=!value;}};
+  return {service,event,queries,ensured,rows,contactCreates,set missingContact(value){existing=!value;}};
 }
 test('booked meeting resolves calendar AE, uses shared inbound helper with outbound source and saves verified receipt',async()=>{
   const f=fixture();await f.service.initialize();
@@ -86,3 +86,5 @@ test('a superseded Meeting Booked revision cannot create a deal after a newer ca
   const f=fixture();f.service.calls={process:async()=>({status:'processed',callId:'99',stale:true})};
   assert.equal((await f.service.process(f.event)).stale,true);assert.equal(f.ensured.length,0);
 });
+
+test('new contact stays owned by SDR while only the new deal gets the AE',async()=>{const f=fixture();f.missingContact=true;await f.service.process(f.event);assert.equal(f.contactCreates[0].hubspot_owner_id,'123');assert.equal(f.ensured[0].ownerId,'456');});

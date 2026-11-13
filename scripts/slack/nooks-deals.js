@@ -4,15 +4,15 @@ const { DemoRequestDeals } = require('./demo-request-deals');
 
 class NooksDeals {
   constructor({ request, pool, resolveMeetingOwner, notifyOwnerIssue, now = Date.now, env = process.env }) {
-    Object.assign(this, { request, pool, env, resolveMeetingOwner });
+    Object.assign(this, { request, pool, env, resolveMeetingOwner, now });
     this.ownerJobs = new NooksMeetingOwnerJobs({ pool, request, resolveMeetingOwner, notify: notifyOwnerIssue, now });
     this.dispositions = new Set((env.NOOKS_MEETING_DISPOSITION_IDS || '').split(',').map(x => x.trim()).filter(Boolean));
     this.deals = new DemoRequestDeals({ request, sourceLabel: 'Outbound - SDR' });
   }
 
   async initialize() {
-    const activation = Date.parse(this.env.NOOKS_DEALS_ACTIVATED_AT || '');
-    if (!Number.isFinite(activation) || activation <= 0) throw new Error('nooks_deal_activation_required');
+    const configured = Date.parse(this.env.NOOKS_DEALS_ACTIVATED_AT || '');
+    const explicit = Number.isFinite(configured) && configured > 0;
     if (!this.dispositions.size) throw new Error('nooks_meeting_dispositions_required');
     await this.deals.initialize();
     await this.ownerJobs.initialize();
@@ -24,9 +24,12 @@ class NooksDeals {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS nooks_deal_activation (
       singleton INTEGER PRIMARY KEY CHECK(singleton=1), activated_at BIGINT NOT NULL
     )`);
-    await this.pool.query('INSERT INTO nooks_deal_activation(singleton,activated_at) VALUES(1,$1) ON CONFLICT DO NOTHING', [activation]);
+    await this.pool.query('INSERT INTO nooks_deal_activation(singleton,activated_at) VALUES(1,$1) ON CONFLICT DO NOTHING', [explicit ? configured : this.now()]);
     const saved = (await this.pool.query('SELECT activated_at FROM nooks_deal_activation WHERE singleton=1')).rows[0];
-    if (Number(saved?.activated_at) !== activation) throw new Error('nooks_deal_activation_changed');
+    const activation = Number(saved?.activated_at);
+    if (!Number.isSafeInteger(activation) || activation <= 0) throw new Error('nooks_deal_activation_required');
+    if (explicit && activation !== configured) throw new Error('nooks_deal_activation_changed');
+    this.activation = activation;
   }
 
   async process(event) {
@@ -35,13 +38,12 @@ class NooksDeals {
     const dealsEnabled = this.env.NOOKS_DEALS_ENABLED === 'true';
     let eligible = false;
     if (dealsEnabled) {
-      const activation = Date.parse(this.env.NOOKS_DEALS_ACTIVATED_AT || '');
-      if (!Number.isFinite(activation) || activation <= 0) throw new Error('nooks_deal_activation_required');
+      if (!this.activation) throw new Error('nooks_deal_activation_required');
       if (!this.dispositions.size) throw new Error('nooks_meeting_dispositions_required');
       if (call.status === 'completed' && this.dispositions.has(String(call.disposition?.id))) {
         const startedAt = Date.parse(call.startedAt || '');
         if (!Number.isFinite(startedAt)) throw new Error('nooks_meeting_time_required');
-        eligible = startedAt >= activation;
+        eligible = startedAt >= this.activation;
       }
     }
     let logged;

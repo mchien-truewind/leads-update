@@ -76,4 +76,4 @@ test('a missing reciprocal link leaves receipt pending; retry repairs the same s
   f.hideReverse=false;assert.equal((await f.service.process(f.event)).dealId,'100');assert.equal(f.creates,1);assert.equal(f.receipts.get('w:call').verified,true);
 });
 
-test('new deal is created under SDR ownership without a calendar lookup',async()=>{const f=fixture();f.service.resolveMeetingOwner=async()=>{throw new Error('must wait five minutes');};f.service.ownerJobs.resolveMeetingOwner=f.service.resolveMeetingOwner;await f.service.process(f.event);assert.equal(f.creates,1);assert.equal(f.deals.get('100').properties.hubspot_owner_id,'123');});
+test('new deal is created under SDR ownership without a calendar lookup',async()=>{const f=fixture();f.service.resolveMeetingOwner=async()=>{throw new Error('must wait five minutes');};f.service.ownerJobs.resolveMeetingOwner=f.service.resolveMeetingOwner;await f.service.initialize();await f.service.process(f.event);assert.equal(f.creates,1);assert.equal(f.deals.get('100').properties.hubspot_owner_id,'123');});

@@ -33,47 +33,47 @@ test('booked meeting initially resolves booking SDR, uses shared inbound helper 
   assert.equal(f.service.deals.sourceLabel,'Outbound - SDR');assert.equal(f.ensured[0].ownerId,'123');assert.equal(f.ensured[0].companyName,'Example');assert.equal(f.rows.get('workspace:call').verified,true);assert.equal(f.queries.at(-1),'released');
 });
 test('both actual Nooks and HubSpot meeting IDs trigger; names alone never trigger',async()=>{
-  for(const id of ['meeting','hubspot-meeting']){const f=fixture();f.event.callData.disposition.id=id;assert.equal((await f.service.process(f.event)).dealId,'20');}
-  const f=fixture();f.event.callData.disposition={id:'not-meeting',name:'Meeting Booked'};assert.deepEqual(await f.service.process(f.event),{status:'ignored'});assert.equal(f.ensured.length,0);
+  for(const id of ['meeting','hubspot-meeting']){const f=fixture();await f.service.initialize();f.event.callData.disposition.id=id;assert.equal((await f.service.process(f.event)).dealId,'20');}
+  const f=fixture();await f.service.initialize();f.event.callData.disposition={id:'not-meeting',name:'Meeting Booked'};assert.deepEqual(await f.service.process(f.event),{status:'ignored'});assert.equal(f.ensured.length,0);
 });
 test('historical receipts and incomplete calls do not create deals; call logging still runs',async()=>{
   for(const mutate of [e=>e.callData.startedAt='2026-11-10T23:59:59Z',e=>e.callData.status='in-progress',e=>e.callData.disposition.id='no-answer']){
-    const f=fixture();mutate(f.event);let logged=0;f.service.calls={process:async()=>{logged++;return {status:'processed',callId:'99'};}};
+    const f=fixture();await f.service.initialize();mutate(f.event);let logged=0;f.service.calls={process:async()=>{logged++;return {status:'processed',callId:'99'};}};
     assert.equal((await f.service.process(f.event)).callId,'99');assert.equal(f.ensured.length,0);assert.equal(logged,1);
   }
 });
 test('disabled deals preserve call-only mode',async()=>{
-  const f=fixture();f.service.env.NOOKS_DEALS_ENABLED='false';f.service.calls={process:async()=>({status:'processed',callId:'99'})};
+  const f=fixture();await f.service.initialize();f.service.env.NOOKS_DEALS_ENABLED='false';f.service.calls={process:async()=>({status:'processed',callId:'99'})};
   assert.deepEqual(await f.service.process(f.event),{status:'processed',callId:'99'});assert.equal(f.ensured.length,0);
 });
 test('activation and disposition configuration are required and activation cannot move on restart',async()=>{
   const f=fixture();await f.service.initialize();f.service.env.NOOKS_DEALS_ACTIVATED_AT='2026-11-12T00:00:00Z';await assert.rejects(f.service.initialize(),/activation_changed/);
-  f.service.env.NOOKS_DEALS_ACTIVATED_AT='';await assert.rejects(f.service.process(f.event),/activation_required/);
+  f.service.env.NOOKS_DEALS_ACTIVATED_AT='';await f.service.initialize();assert.equal(f.service.activation,Date.parse('2026-11-11T00:00:00Z'));
   f.service.env.NOOKS_DEALS_ACTIVATED_AT='2026-11-11T00:00:00Z';f.service.dispositions.clear();await assert.rejects(f.service.process(f.event),/dispositions_required/);
 });
 test('missing timestamps, mismatched workspace and missing email fail without deal writes',async()=>{
   for(const mutate of [e=>delete e.callData.startedAt,e=>e.callData.workspaceId='other',e=>e.callData.prospectData.email=null]){
-    const f=fixture();mutate(f.event);await assert.rejects(f.service.process(f.event));assert.equal(f.ensured.length,0);
+    const f=fixture();await f.service.initialize();mutate(f.event);await assert.rejects(f.service.process(f.event));assert.equal(f.ensured.length,0);
   }
 });
 test('a lost response after deal save recovers the same saved deal on retry',async()=>{
-  const f=fixture();let first=true;const ensure=f.service.deals.ensure;
+  const f=fixture();await f.service.initialize();let first=true;const ensure=f.service.deals.ensure;
   f.service.deals.ensure=async input=>{const deal=await ensure(input);if(first){first=false;throw new Error('association readback failed');}return deal;};
   await assert.rejects(f.service.process(f.event),/readback failed/);assert.equal(f.rows.get('workspace:call').deal_id,'20');assert.equal(f.rows.get('workspace:call').verified,undefined);
   assert.equal((await f.service.process(f.event)).dealId,'20');assert.equal(f.ensured[1].dealId,'20');
 });
 test('changed contact identity cannot reuse a saved meeting receipt',async()=>{
-  const f=fixture();f.rows.set('workspace:call',{contact_id:'other',deal_id:'20'});await assert.rejects(f.service.process(f.event),/contact_changed/);assert.equal(f.ensured.length,0);
+  const f=fixture();await f.service.initialize();f.rows.set('workspace:call',{contact_id:'other',deal_id:'20'});await assert.rejects(f.service.process(f.event),/contact_changed/);assert.equal(f.ensured.length,0);
 });
 test('eligible missing contact is created before call-log retry; other call errors do not create deals',async()=>{
-  const f=fixture();f.missingContact=true;let attempts=0;
+  const f=fixture();await f.service.initialize();f.missingContact=true;let attempts=0;
   f.service.calls={process:async()=>{if(!attempts++)throw new Error('nooks_contact_unresolved');return {status:'processed',callId:'99'};}};
   assert.deepEqual(await f.service.process(f.event),{status:'processed',callId:'99',dealId:'20'});assert.equal(attempts,2);
-  const g=fixture();g.service.calls={process:async()=>{throw new Error('hubspot unavailable');}};
+  const g=fixture();await g.service.initialize();g.service.calls={process:async()=>{throw new Error('hubspot unavailable');}};
   await assert.rejects(g.service.process(g.event),/unavailable/);assert.equal(g.ensured.length,0);
 });
 test('explicit numeric prospect IDs must agree with the existing contact; missing IDs never create replacement contacts',async()=>{
-  const f=fixture();f.event.callData.prospectData.prospectId='999';await assert.rejects(f.service.process(f.event),/identity_conflict/);assert.equal(f.ensured.length,0);
+  const f=fixture();await f.service.initialize();f.event.callData.prospectData.prospectId='999';await assert.rejects(f.service.process(f.event),/identity_conflict/);assert.equal(f.ensured.length,0);
   f.missingContact=true;await assert.rejects(f.service.process(f.event),/identity_conflict/);assert.equal(f.ensured.length,0);
 });
 test('internal forwarding authenticates and retains a failed deal receipt for retry',async()=>{
@@ -83,8 +83,20 @@ test('internal forwarding authenticates and retains a failed deal receipt for re
 });
 
 test('a superseded Meeting Booked revision cannot create a deal after a newer call revision',async()=>{
-  const f=fixture();f.service.calls={process:async()=>({status:'processed',callId:'99',stale:true})};
+  const f=fixture();await f.service.initialize();f.service.calls={process:async()=>({status:'processed',callId:'99',stale:true})};
   assert.equal((await f.service.process(f.event)).stale,true);assert.equal(f.ensured.length,0);
 });
 
-test('new contact stays owned by SDR while new deal initially waits under SDR ownership',async()=>{const f=fixture();f.missingContact=true;await f.service.process(f.event);assert.equal(f.contactCreates[0].hubspot_owner_id,'123');assert.equal(f.ensured[0].ownerId,'123');});
+test('new contact stays owned by SDR while new deal initially waits under SDR ownership',async()=>{const f=fixture();await f.service.initialize();f.missingContact=true;await f.service.process(f.event);assert.equal(f.contactCreates[0].hubspot_owner_id,'123');assert.equal(f.ensured[0].ownerId,'123');});
+
+test('first startup with an invalid cutoff persists startup time and skips older bookings', async () => {
+  const f = fixture();
+  f.service.env.NOOKS_DEALS_ACTIVATED_AT = 'invalid';
+  f.service.now = () => Date.parse('2026-11-11T02:00:00Z');
+  await f.service.initialize();
+  assert.deepEqual(await f.service.process(f.event), { status: 'ignored' });
+  f.service.now = () => Date.parse('2026-11-12T00:00:00Z');
+  await f.service.initialize();
+  f.event.callData.startedAt = '2026-11-11T02:01:00Z';
+  assert.equal((await f.service.process(f.event)).dealId, '20');
+});

@@ -26,7 +26,7 @@ function fixture({existingDeal=false}={}){
     if(path===`/crm/v3/properties/companies/${COMPANY_KEY_PROPERTY}`)return{name:COMPANY_KEY_PROPERTY,type:'string',hasUniqueValue:true};
     if(path===`/crm/v3/pipelines/deals/${PIPELINE_ID}`)return{stages:[{id:STAGE_ID,metadata:{isClosed:false}}]};
     if(path.startsWith('/automation/'))return{isEnabled:false};
-    if(path.startsWith('/crm/v3/properties/deals/deal_source'))return{options:[{label:'Outbound - Sales Sourced List',value:'Outbound'}]};
+    if(path.startsWith('/crm/v3/properties/deals/deal_source'))return{options:[{label:'Outbound - Sales Sourced List',value:'Outbound'},{label:'outbound - SDR',value:'sdr_internal_value'}]};
     if(path.startsWith('/crm/v3/owners?'))return{results:[{id:'123',email:'rep@example.test',archived:false}]};
     if(path.startsWith('/crm/v3/objects/contacts/')&&options.method!=='PATCH')return{id:'10',properties:{email:'lead@example.test',firstname:'Lead',company:'Primary Co'}};
     if(path.startsWith('/crm/v3/objects/companies/30?'))return{id:'30',properties:{name:'Primary Co'}};
@@ -62,7 +62,7 @@ function fixture({existingDeal=false}={}){
 }
 test('real Nooks flow creates one Discovery deal and verifies all reciprocal links to the selected primary company',async()=>{
   const f=fixture();await f.service.initialize();const result=await f.service.process(f.event);
-  assert.equal(result.dealId,'100');const deal=f.deals.get('100');assert.equal(deal.properties.dealstage,STAGE_ID);assert.equal(deal.properties.hubspot_owner_id,'123');assert.equal(deal.properties.deal_source,'Outbound');
+  assert.equal(result.dealId,'100');const deal=f.deals.get('100');assert.equal(deal.properties.dealstage,STAGE_ID);assert.equal(deal.properties.hubspot_owner_id,'123');assert.equal(deal.properties.deal_source,'sdr_internal_value');
   assert.ok(f.calls.some(x=>x.path.startsWith('/crm/v3/owners?')));assert.equal(f.scheduled.length,1);assert.equal(f.scheduled[0][0],'100');assert.equal(f.scheduled[0][6],'123');
   assert.equal(f.receipts.get('w:call').verified,true);await f.service.process(f.event);assert.equal(f.creates,1);
   for(const path of ['/contacts/10/associations/companies?','/companies/30/associations/contacts?','/contacts/10/associations/deals?','/deals/100/associations/contacts?','/companies/30/associations/deals?','/deals/100/associations/companies?'])assert.ok(f.calls.some(x=>x.path.includes(path)),path);

@@ -7,7 +7,7 @@ class NooksDeals {
     Object.assign(this, { request, pool, env, resolveMeetingOwner });
     this.ownerJobs = new NooksMeetingOwnerJobs({ pool, request, resolveMeetingOwner, notify: notifyOwnerIssue, now });
     this.dispositions = new Set((env.NOOKS_MEETING_DISPOSITION_IDS || '').split(',').map(x => x.trim()).filter(Boolean));
-    this.deals = new DemoRequestDeals({ request, sourceLabel: 'Outbound - Sales Sourced List' });
+    this.deals = new DemoRequestDeals({ request, sourceLabel: 'Outbound - SDR' });
   }
 
   async initialize() {

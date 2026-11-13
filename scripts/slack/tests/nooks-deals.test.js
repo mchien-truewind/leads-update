@@ -30,7 +30,7 @@ function fixture() {
 test('booked meeting initially resolves booking SDR, uses shared inbound helper with outbound source and saves verified receipt',async()=>{
   const f=fixture();await f.service.initialize();
   assert.deepEqual(await f.service.process(f.event),{status:'processed',dealId:'20'});
-  assert.equal(f.service.deals.sourceLabel,'Outbound - Sales Sourced List');assert.equal(f.ensured[0].ownerId,'123');assert.equal(f.ensured[0].companyName,'Example');assert.equal(f.rows.get('workspace:call').verified,true);assert.equal(f.queries.at(-1),'released');
+  assert.equal(f.service.deals.sourceLabel,'Outbound - SDR');assert.equal(f.ensured[0].ownerId,'123');assert.equal(f.ensured[0].companyName,'Example');assert.equal(f.rows.get('workspace:call').verified,true);assert.equal(f.queries.at(-1),'released');
 });
 test('both actual Nooks and HubSpot meeting IDs trigger; names alone never trigger',async()=>{
   for(const id of ['meeting','hubspot-meeting']){const f=fixture();f.event.callData.disposition.id=id;assert.equal((await f.service.process(f.event)).dealId,'20');}

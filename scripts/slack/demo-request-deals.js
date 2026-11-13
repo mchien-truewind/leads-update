@@ -118,7 +118,7 @@ class DemoRequestDeals {
     // value so an administrator's option change cannot leave a stale code value.
     const property = await this.request(`/crm/v3/properties/${objectType}/${propertyName}`);
     const matches = (property.options || []).filter(option =>
-      option.label === this.sourceLabel && option.hidden !== true && String(option.value || '').trim());
+      normalize(option.label) === normalize(this.sourceLabel) && option.hidden !== true && String(option.value || '').trim());
     if (matches.length !== 1) throw new Error('demo_request_inbound_source_unavailable');
     return matches[0].value;
   }
